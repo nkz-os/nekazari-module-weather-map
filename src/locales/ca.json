@@ -4,7 +4,7 @@
   "metrics": {
     "temperature_avg": "Temperatura Mitjana",
     "temperature_min": "Temperatura Mínima",
-    "solar_radiation": "Radació Solar",
+    "solar_radiation": "Radiació Solar",
     "eto": "ET de Referència",
     "water_balance": "Balanç Hídric",
     "frost_risk": "Risc de Gelada",

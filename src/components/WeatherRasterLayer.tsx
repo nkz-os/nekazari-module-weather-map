@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo } from 'react';
-import { useConfig } from '@nekazari/sdk';
-import { useViewer } from '@nekazari/viewer-kit';
+import { useViewer } from '@nekazari/sdk';
 
 interface Props {
   metric: string;
@@ -8,16 +7,17 @@ interface Props {
   opacity?: number;
 }
 
+const API_BASE = (import.meta as any).env?.VITE_API_URL || 'https://nkz.robotika.cloud';
+
 const WeatherRasterLayer: React.FC<Props> = ({ metric, date, opacity = 0.7 }) => {
-  const { baseUrl } = useConfig();
-  const viewer = useViewer();
+  const { cesiumViewer: viewer } = useViewer();
 
   const url = useMemo(() => {
     const params = new URLSearchParams();
     if (date) params.set('date', date);
     const qs = params.toString();
-    return `${baseUrl}/api/weather-map/tiles/${metric}/{z}/{x}/{y}.png${qs ? '?' + qs : ''}`;
-  }, [baseUrl, metric, date]);
+    return `${API_BASE}/api/weather-map/tiles/${metric}/{z}/{x}/{y}.png${qs ? '?' + qs : ''}`;
+  }, [metric, date]);
 
   useEffect(() => {
     if (!viewer) return;

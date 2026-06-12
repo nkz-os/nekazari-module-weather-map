@@ -14,5 +14,7 @@ if (typeof window !== 'undefined') {
     nkzSdk.i18n.addResources('fr', 'weather-map', fr);
     nkzSdk.i18n.addResources('pt', 'weather-map', pt);
     nkzSdk.i18n.addResources('ca', 'weather-map', ca);
+  } else {
+    console.warn('[weather-map] __NKZ_SDK__ bridge not available — i18n resources not registered');
   }
 }
