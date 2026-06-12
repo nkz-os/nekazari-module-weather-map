@@ -1,0 +1,182 @@
+"""HTTP clients for external services: eu-elevation, weather-api, Orion-LD.
+
+Provides async functions that fetch DEM tiles, station weather, AgriSoil
+entities from Orion-LD, and a stub for tenant parcels.  Every function
+returns ``None`` on error — callers check for ``None`` rather than catching.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from typing import Any
+
+import httpx
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def tms_tile_to_bbox(z: int, x: int, y: int) -> dict[str, float]:
+    """Convert TMS tile coordinates to a geographic bounding box (EPSG:4326).
+
+    Parameters
+    ----------
+    z : int
+        Zoom level.
+    x : int
+        Tile column (0 … 2**z − 1).
+    y : int
+        Tile row (0 … 2**z − 1), origin at 85°N.
+
+    Returns
+    -------
+    dict[str, float]
+        ``{min_lon, min_lat, max_lon, max_lat}`` in decimal degrees.
+    """
+    n = 2.0 ** z
+    min_lon = x / n * 360.0 - 180.0
+    max_lon = (x + 1) / n * 360.0 - 180.0
+
+    min_lat = math.degrees(
+        math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n)))
+    )
+    max_lat = math.degrees(
+        math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
+    )
+
+    return {
+        "min_lon": min_lon,
+        "min_lat": min_lat,
+        "max_lon": max_lon,
+        "max_lat": max_lat,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+async def fetch_dem_tile(z: int, x: int, y: int) -> dict[str, Any] | None:
+    """Fetch a DEM elevation grid for a TMS tile from the eu-elevation service.
+
+    Returns the JSON response (e.g. a 2-D height array / GeoTIFF metadata)
+    or ``None`` on any error (network, HTTP error, parse issue).
+    """
+    bbox = tms_tile_to_bbox(z, x, y)
+    params: dict[str, Any] = {
+        "min_lon": bbox["min_lon"],
+        "min_lat": bbox["min_lat"],
+        "max_lon": bbox["max_lon"],
+        "max_lat": bbox["max_lat"],
+        "resolution_m": 10,
+        "purpose": "weather",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{settings.elevation_service_url}/raster",
+                params=params,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        logger.exception(
+            "fetch_dem_tile(z=%d, x=%d, y=%d) failed", z, x, y
+        )
+        return None
+
+
+async def fetch_station_weather(
+    tenant_id: str,
+    lat: float,
+    lon: float,
+    date_from: str,
+    date_to: str,
+) -> dict[str, Any] | None:
+    """Fetch weather data from the nearest station to (lat, lon).
+
+    Returns
+    -------
+    dict or None
+        JSON payload from the weather API, or ``None`` on failure.
+    """
+    params: dict[str, Any] = {
+        "lat": lat,
+        "lon": lon,
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+    headers = {"X-Tenant-ID": tenant_id}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{settings.weather_api_url}/api/coordinates/weather",
+                params=params,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        logger.exception(
+            "fetch_station_weather(tenant=%s, lat=%f, lon=%f) failed",
+            tenant_id,
+            lat,
+            lon,
+        )
+        return None
+
+
+async def fetch_agri_soil(
+    tenant_id: str, parcel_id: str
+) -> dict[str, float | None] | None:
+    """Fetch the ``AgriSoil`` NGSI-LD entity from Orion-LD.
+
+    Returns a dict with ``sand_pct``, ``silt_pct``, ``clay_pct`` keys,
+    or ``None`` if the entity does not exist or the request fails.
+    """
+    entity_id = f"urn:ngsi-ld:AgriSoil:{parcel_id}"
+    params = {"options": "keyValues"}
+    headers = {
+        "NGSILD-Tenant": tenant_id,
+        "Fiware-Service": tenant_id,
+        "Fiware-ServicePath": "/",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{settings.orion_url}/ngsi-ld/v1/entities/{entity_id}",
+                params=params,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "sand_pct": data.get("sandPct") or data.get("sand_pct"),
+                "silt_pct": data.get("siltPct") or data.get("silt_pct"),
+                "clay_pct": data.get("clayPct") or data.get("clay_pct"),
+            }
+    except Exception:
+        logger.exception(
+            "fetch_agri_soil(tenant=%s, parcel=%s) failed",
+            tenant_id,
+            parcel_id,
+        )
+        return None
+
+
+async def fetch_tenant_parcels(tenant_id: str) -> list[dict[str, Any]]:
+    """Fetch active parcels for a tenant.
+
+    .. note::
+
+        Currently returns a hard-coded demo parcel.  Replace with a real
+        entity-manager query when the integration is built.
+    """
+    return [{"id": "demo", "lon": -1.65, "lat": 42.8}]
