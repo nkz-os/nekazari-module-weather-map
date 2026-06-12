@@ -16,6 +16,8 @@ from rasterio.windows import Window
 from app.config import settings
 from app.minio_io import download_cog, get_latest_date
 from app.color_scales import apply_color_scale
+from app.stats import compute_zonal_stats
+from app.sources import fetch_agri_parcel
 
 logger = logging.getLogger(__name__)
 
@@ -128,3 +130,102 @@ async def serve_tile(
         media_type="image/png",
         headers={"Cache-Control": "public, max-age=432000"},
     )
+
+
+@router.get("/stats/{parcel_id}")
+async def parcel_zonal_stats(
+    parcel_id: str,
+    metrics: str = Query(
+        ...,
+        description="Comma-separated metric names (e.g. temperature_avg,water_balance)",
+    ),
+    date: Optional[str] = Query(
+        None, description="COG date (YYYY-MM-DD). Defaults to latest."
+    ),
+    tenant_id: str = Query("default"),
+    geometry: Optional[str] = Query(
+        None,
+        description=(
+            "Optional GeoJSON geometry override as JSON string. When provided, "
+            "bypasses the Orion-LD parcel lookup. Useful for testing or when "
+            "the caller already has the parcel geometry."
+        ),
+    ),
+):
+    """Compute zonal statistics for a parcel across one or more metrics.
+
+    Fetches the parcel geometry from Orion-LD (or uses an explicit geometry
+    override), intersects it with the precomputed COG tiles, and returns
+    per-metric aggregates (mean, min, max, std, percentile, histogram, and
+    metric-specific indicators such as deficit percentage for water balance).
+
+    Parameters
+    ----------
+    parcel_id : str
+        AgriParcel ID (``urn:ngsi-ld:AgriParcel:XXX`` or just ``XXX``).
+    metrics : str
+        Comma-separated list of metric names (e.g. ``temperature_avg,
+        water_balance``).
+    date : str, optional
+        COG date.  Omit to use the latest available.
+    tenant_id : str, optional
+        Tenant namespace.
+    geometry : str, optional
+        **Experimental.**  Direct GeoJSON geometry as a JSON string (e.g.
+        ``{\"type\": \"Polygon\", ...}``).  When provided the Orion-LD
+        lookup is skipped and this geometry is used as-is.
+
+    Returns
+    -------
+    dict
+        Zonal statistics per metric, plus the parcel GeoJSON geometry.
+    """
+    import json
+
+    # 1. Parse metrics
+    metric_list = [m.strip() for m in metrics.split(",") if m.strip()]
+    invalid = [m for m in metric_list if m not in settings.metrics]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown metrics: {', '.join(invalid)}",
+        )
+
+    # 2a. Resolve geometry: explicit override vs Orion-LD lookup
+    if geometry:
+        try:
+            geom = json.loads(geometry)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid GeoJSON geometry: {exc}",
+            )
+        if geom.get("type") not in ("Polygon", "MultiPolygon"):
+            raise HTTPException(
+                status_code=400,
+                detail="geometry must be a Polygon or MultiPolygon",
+            )
+    else:
+        parcel = await fetch_agri_parcel(tenant_id, parcel_id)
+        if parcel is None or parcel.get("geometry") is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Parcel not found or has no geometry: {parcel_id}",
+            )
+        geom = parcel["geometry"]
+
+    # 3. Compute zonal stats
+    try:
+        stats = compute_zonal_stats(geom, metric_list, date)
+    except Exception:
+        logger.exception("Failed to compute zonal stats for parcel=%s", parcel_id)
+        raise HTTPException(
+            status_code=500, detail="Failed to compute zonal statistics"
+        )
+
+    # 4. Add parcel metadata
+    stats["parcel_id"] = parcel_id
+    if not geometry:
+        stats["parcel_name"] = parcel.get("name")
+
+    return stats

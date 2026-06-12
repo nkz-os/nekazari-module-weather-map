@@ -81,7 +81,7 @@ async def fetch_dem_tile(z: int, x: int, y: int) -> dict[str, Any] | None:
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(
-                f"{settings.elevation_service_url}/raster",
+                f"{settings.elevation_service_url}/api/elevation/raster",
                 params=params,
             )
             resp.raise_for_status()
@@ -117,7 +117,7 @@ async def fetch_station_weather(
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{settings.weather_api_url}/api/coordinates/weather",
+                f"{settings.weather_api_url}/api/weather/coordinates",
                 params=params,
                 headers=headers,
             )
@@ -180,3 +180,62 @@ async def fetch_tenant_parcels(tenant_id: str) -> list[dict[str, Any]]:
         entity-manager query when the integration is built.
     """
     return [{"id": "demo", "lon": -1.65, "lat": 42.8}]
+
+
+async def fetch_agri_parcel(
+    tenant_id: str, parcel_id: str
+) -> dict[str, Any] | None:
+    """Fetch an ``AgriParcel`` NGSI-LD entity from Orion-LD for geometry.
+
+    Returns a dict with the parcel's GeoJSON ``location`` geometry and
+    ``agriParcelOf`` (tenant/enterprise), or ``None`` if not found.
+    """
+    # Normalize: strip prefix if already has it
+    eid = parcel_id if parcel_id.startswith("urn:ngsi-ld:AgriParcel:") else \
+        f"urn:ngsi-ld:AgriParcel:{parcel_id}"
+    params = {"options": "keyValues"}
+    headers = {
+        "NGSILD-Tenant": tenant_id,
+        "Fiware-Service": tenant_id,
+        "Fiware-ServicePath": "/",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{settings.orion_url}/ngsi-ld/v1/entities/{eid}",
+                params=params,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            geometry = data.get("location") or data.get("geometry")
+            if geometry is None:
+                logger.warning(
+                    "fetch_agri_parcel(tenant=%s, parcel=%s): no location geometry",
+                    tenant_id, parcel_id,
+                )
+                return None
+            return {
+                "id": data.get("id", eid),
+                "geometry": geometry,
+                "name": data.get("name"),
+                "description": data.get("description"),
+            }
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            logger.warning(
+                "fetch_agri_parcel(tenant=%s, parcel=%s): entity not found (404)",
+                tenant_id, parcel_id,
+            )
+        else:
+            logger.exception(
+                "fetch_agri_parcel(tenant=%s, parcel=%s) HTTP error",
+                tenant_id, parcel_id,
+            )
+        return None
+    except Exception:
+        logger.exception(
+            "fetch_agri_parcel(tenant=%s, parcel=%s) failed",
+            tenant_id, parcel_id,
+        )
+        return None
