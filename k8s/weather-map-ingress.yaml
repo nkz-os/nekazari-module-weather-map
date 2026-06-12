@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: weather-map-api
+  namespace: nekazari
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: nkz.robotika.cloud
+    http:
+      paths:
+      - backend:
+          service:
+            name: weather-map-backend
+            port:
+              number: 8080
+        path: /api/weather-map
+        pathType: Prefix
+status:
+  loadBalancer:
+    ingress:
+    - ip: 109.123.252.120
