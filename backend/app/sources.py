@@ -176,9 +176,11 @@ async def write_entity_attrs(
     entity_id: str,
     attrs: dict[str, Any],
 ) -> bool:
-    """Write NGSI-LD attributes to an entity in Orion-LD via PATCH /attrs.
+    """Write NGSI-LD attributes to an entity in Orion-LD via POST /attrs.
 
-    Each key in *attrs* becomes a top-level NGSI-LD attribute:
+    Uses ``?options=append`` which creates the attribute if it does not
+    exist or updates it if it does.  Each key in *attrs* becomes a
+    top-level NGSI-LD attribute:
 
     .. code-block:: json
 
@@ -200,8 +202,9 @@ async def write_entity_attrs(
     }
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.patch(
+            resp = await client.post(
                 f"{settings.orion_url}/ngsi-ld/v1/entities/{entity_id}/attrs",
+                params={"options": "append"},
                 headers=headers,
                 json=attrs,
             )
@@ -246,6 +249,68 @@ async def fetch_entity_attr(
             tenant_id, entity_id, attr_name,
         )
         return None
+
+
+async def fetch_tenant_parcels(tenant_id: str) -> list[dict[str, Any]]:
+    """Fetch all AgriParcel entities for a tenant from Orion-LD.
+
+    Uses ``POST /ngsi-ld/v1/entityOperations/query`` to retrieve
+    entities of type ``AgriParcel`` with their ``location`` geometry.
+
+    Returns a list of dicts with ``id``, ``location`` (GeoJSON geometry),
+    and optionally ``name`` / ``description``.
+
+    Returns an empty list on error or if no parcels exist.
+    """
+    headers = {
+        "NGSILD-Tenant": tenant_id,
+        "Fiware-Service": tenant_id,
+        "Fiware-ServicePath": "/",
+        "Content-Type": "application/json",
+    }
+    payload: dict[str, Any] = {
+        "type": "AgriParcel",
+        "attrs": ["location", "name", "description"],
+    }
+    params = {"options": "keyValues"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{settings.orion_url}/ngsi-ld/v1/entityOperations/query",
+                params=params,
+                headers=headers,
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list):
+                logger.warning(
+                    "fetch_tenant_parcels(tenant=%s): unexpected response type %s",
+                    tenant_id, type(data).__name__,
+                )
+                return []
+
+            parcels = []
+            for entity in data[:100]:  # limit to first 100
+                location = entity.get("location")
+                if location is None:
+                    continue
+                parcel: dict[str, Any] = {
+                    "id": entity.get("id"),
+                    "location": location,
+                }
+                if entity.get("name") is not None:
+                    parcel["name"] = entity["name"]
+                if entity.get("description") is not None:
+                    parcel["description"] = entity["description"]
+                parcels.append(parcel)
+
+            return parcels
+    except Exception:
+        logger.exception(
+            "fetch_tenant_parcels(tenant=%s) failed", tenant_id,
+        )
+        return []
 
 
 async def fetch_agri_parcel(
