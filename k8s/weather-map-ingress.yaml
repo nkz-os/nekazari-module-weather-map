@@ -6,7 +6,7 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
-  - host: nkz.robotika.cloud
+  - host: YOUR_DOMAIN
     http:
       paths:
       - backend:
@@ -16,7 +16,3 @@ spec:
               number: 8080
         path: /api/weather-map
         pathType: Prefix
-status:
-  loadBalancer:
-    ingress:
-    - ip: 109.123.252.120
