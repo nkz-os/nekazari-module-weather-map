@@ -1,0 +1,11 @@
+moduleId: weather-map
+version: "1.0.0"
+publishes: []
+consumes:
+  - entityType: AgriParcel
+  - entityType: WeatherObserved
+  - entityType: AgriSoil
+depends_on:
+  - weather-api
+  - weather-worker
+  - eu-elevation

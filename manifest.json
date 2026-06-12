@@ -1,0 +1,17 @@
+{
+  "id": "weather-map",
+  "name": "Weather Map",
+  "description": "Weather-derived raster overlays (temperature, water balance, ET0)",
+  "version": "1.0.0",
+  "vendor": "NKZ-OS",
+  "type": "module",
+  "federation": {
+    "remoteEntry": "remoteEntry.js",
+    "exposes": {
+      "./Module": "./src/Module.tsx"
+    },
+    "shared": ["react", "react-dom", "@nekazari/sdk", "i18next"]
+  },
+  "slots": ["map-layer", "layer-toggle", "context-panel"],
+  "license": "AGPL-3.0"
+}
