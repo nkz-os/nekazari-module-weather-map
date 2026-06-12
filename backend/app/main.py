@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.tiles import router as tiles_router
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,8 @@ app = FastAPI(
     description="Weather-derived raster overlays via COG tiles",
     version="1.0.0",
 )
+
+app.include_router(tiles_router, prefix="/api/weather-map")
 
 app.add_middleware(
     CORSMiddleware,
