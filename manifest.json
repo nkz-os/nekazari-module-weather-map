@@ -8,7 +8,10 @@
   "federation": {
     "remoteEntry": "remoteEntry.js",
     "exposes": {
-      "./Module": "./src/Module.tsx"
+      "./Module": "./src/Module.tsx",
+      "./WeatherRasterLayer": "./src/components/WeatherRasterLayer.tsx",
+      "./WeatherLayerControl": "./src/components/WeatherLayerControl.tsx",
+      "./WeatherLayerToggle": "./src/components/WeatherLayerToggle.tsx"
     },
     "shared": ["react", "react-dom", "@nekazari/sdk", "i18next"]
   },

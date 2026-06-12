@@ -1,0 +1,20 @@
+{
+  "title": "Mapa Meteorológico",
+  "description": "Camadas raster derivadas do clima",
+  "metrics": {
+    "temperature_avg": "Temperatura Média",
+    "temperature_min": "Temperatura Mínima",
+    "solar_radiation": "Radiação Solar",
+    "eto": "ET de Referência",
+    "water_balance": "Balanço Hídrico",
+    "frost_risk": "Risco de Geada",
+    "soil_moisture": "Umidade do Solo"
+  },
+  "controls": {
+    "metric": "Métrica",
+    "date": "Data",
+    "opacity": "Opacidade",
+    "visible": "Visível"
+  },
+  "layerToggle": "Camadas Climáticas"
+}

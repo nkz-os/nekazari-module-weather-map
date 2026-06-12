@@ -1,0 +1,20 @@
+{
+  "title": "Mapa Meteorològic",
+  "description": "Capes ràster derivades del clima",
+  "metrics": {
+    "temperature_avg": "Temperatura Mitjana",
+    "temperature_min": "Temperatura Mínima",
+    "solar_radiation": "Radació Solar",
+    "eto": "ET de Referència",
+    "water_balance": "Balanç Hídric",
+    "frost_risk": "Risc de Gelada",
+    "soil_moisture": "Humitat del Sòl"
+  },
+  "controls": {
+    "metric": "Mètrica",
+    "date": "Data",
+    "opacity": "Opacitat",
+    "visible": "Visible"
+  },
+  "layerToggle": "Capes Climàtiques"
+}

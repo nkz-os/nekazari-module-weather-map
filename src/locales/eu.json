@@ -1,0 +1,20 @@
+{
+  "title": "Mapa Meteorologikoa",
+  "description": "Eguralditik eratorritako geruza raster-ak",
+  "metrics": {
+    "temperature_avg": "Batez Besteko Tenperatura",
+    "temperature_min": "Tenperatura Minimoa",
+    "solar_radiation": "Erradiazio Eguzkitakoa",
+    "eto": "Erreferentziazko ET",
+    "water_balance": "Ur Oreka",
+    "frost_risk": "Izozte Arriskua",
+    "soil_moisture": "Lurzoruaren Hezetasuna"
+  },
+  "controls": {
+    "metric": "Metrika",
+    "date": "Data",
+    "opacity": "Opakotasuna",
+    "visible": "Ikusgai"
+  },
+  "layerToggle": "Eguraldi Geruzak"
+}

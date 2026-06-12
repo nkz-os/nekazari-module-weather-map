@@ -1,4 +1,20 @@
 {
   "title": "Mapa Meteorológico",
-  "description": "Capas raster derivadas del clima"
+  "description": "Capas raster derivadas del clima",
+  "metrics": {
+    "temperature_avg": "Temperatura Media",
+    "temperature_min": "Temperatura Mínima",
+    "solar_radiation": "Radiación Solar",
+    "eto": "ET de Referencia",
+    "water_balance": "Balance Hídrico",
+    "frost_risk": "Riesgo de Helada",
+    "soil_moisture": "Humedad del Suelo"
+  },
+  "controls": {
+    "metric": "Métrica",
+    "date": "Fecha",
+    "opacity": "Opacidad",
+    "visible": "Visible"
+  },
+  "layerToggle": "Capas Climáticas"
 }

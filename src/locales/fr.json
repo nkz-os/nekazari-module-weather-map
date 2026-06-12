@@ -1,0 +1,20 @@
+{
+  "title": "Carte Météorologique",
+  "description": "Couches raster dérivées des conditions météorologiques",
+  "metrics": {
+    "temperature_avg": "Température Moyenne",
+    "temperature_min": "Température Minimale",
+    "solar_radiation": "Rayonnement Solaire",
+    "eto": "ET de Référence",
+    "water_balance": "Bilan Hydrique",
+    "frost_risk": "Risque de Gel",
+    "soil_moisture": "Humidité du Sol"
+  },
+  "controls": {
+    "metric": "Métrique",
+    "date": "Date",
+    "opacity": "Opacité",
+    "visible": "Visible"
+  },
+  "layerToggle": "Couches Météo"
+}

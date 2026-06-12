@@ -1,4 +1,20 @@
 {
   "title": "Weather Map",
-  "description": "Weather-derived raster overlays"
+  "description": "Weather-derived raster overlays",
+  "metrics": {
+    "temperature_avg": "Avg Temperature",
+    "temperature_min": "Min Temperature",
+    "solar_radiation": "Solar Radiation",
+    "eto": "Reference ET",
+    "water_balance": "Water Balance",
+    "frost_risk": "Frost Risk",
+    "soil_moisture": "Soil Moisture"
+  },
+  "controls": {
+    "metric": "Metric",
+    "date": "Date",
+    "opacity": "Opacity",
+    "visible": "Visible"
+  },
+  "layerToggle": "Weather Layers"
 }
