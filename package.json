@@ -8,16 +8,20 @@
     "dev": "vite"
   },
   "dependencies": {
-    "@nekazari/sdk": "^2.0.0",
-    "@nekazari/ui-kit": "^2.0.0",
-    "@nekazari/viewer-kit": "^2.0.0",
+    "@nekazari/module-kit": "^0.7.0",
+    "@nekazari/sdk": "^1.0.0",
+    "@nekazari/ui-kit": "^1.0.2-alpha.4",
+    "@nekazari/viewer-kit": "^0.1.1-alpha.0",
+    "i18next": "^23.11.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
-    "react-i18next": "^14.0.0",
-    "i18next": "^23.11.0"
+    "react-i18next": "^14.0.0"
+  },
+  "nkz": {
+    "moduleId": "weather-map"
   },
   "devDependencies": {
-    "@nekazari/module-builder": "^2.0.3",
+    "@nekazari/module-builder": "2.0.3",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
     "typescript": "^5.5.0",

@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from datetime import datetime, timedelta, timezone
+
+# Ensure /app is on the path (scripts/ runs from /app root in Docker)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.cog_generator import run_for_tenant
 from app.sources import fetch_tenant_parcels

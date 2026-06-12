@@ -171,15 +171,81 @@ async def fetch_agri_soil(
         return None
 
 
-async def fetch_tenant_parcels(tenant_id: str) -> list[dict[str, Any]]:
-    """Fetch active parcels for a tenant.
+async def write_entity_attrs(
+    tenant_id: str,
+    entity_id: str,
+    attrs: dict[str, Any],
+) -> bool:
+    """Write NGSI-LD attributes to an entity in Orion-LD via PATCH /attrs.
 
-    .. note::
+    Each key in *attrs* becomes a top-level NGSI-LD attribute:
 
-        Currently returns a hard-coded demo parcel.  Replace with a real
-        entity-manager query when the integration is built.
+    .. code-block:: json
+
+        {
+          "weatherStats": {
+            "type": "Property",
+            "value": {…},
+            "observedAt": "2026-06-12T00:00:00Z"
+          }
+        }
+
+    Returns ``True`` on success, ``False`` on failure.
     """
-    return [{"id": "demo", "lon": -1.65, "lat": 42.8}]
+    headers = {
+        "NGSILD-Tenant": tenant_id,
+        "Fiware-Service": tenant_id,
+        "Fiware-ServicePath": "/",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.patch(
+                f"{settings.orion_url}/ngsi-ld/v1/entities/{entity_id}/attrs",
+                headers=headers,
+                json=attrs,
+            )
+            resp.raise_for_status()
+            return True
+    except Exception:
+        logger.exception(
+            "write_entity_attrs(tenant=%s, entity=%s) failed",
+            tenant_id, entity_id,
+        )
+        return False
+
+
+async def fetch_entity_attr(
+    tenant_id: str,
+    entity_id: str,
+    attr_name: str,
+) -> Any | None:
+    """Fetch a single NGSI-LD attribute from an entity in Orion-LD.
+
+    Returns the attribute's ``value`` (with keyValues simplification) or
+    ``None`` if the entity/attribute does not exist or on error.
+    """
+    headers = {
+        "NGSILD-Tenant": tenant_id,
+        "Fiware-Service": tenant_id,
+        "Fiware-ServicePath": "/",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{settings.orion_url}/ngsi-ld/v1/entities/{entity_id}",
+                params={"options": "keyValues"},
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get(attr_name)
+    except Exception:
+        logger.exception(
+            "fetch_entity_attr(tenant=%s, entity=%s, attr=%s) failed",
+            tenant_id, entity_id, attr_name,
+        )
+        return None
 
 
 async def fetch_agri_parcel(

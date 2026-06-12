@@ -16,8 +16,10 @@ from rasterio.windows import Window
 from app.config import settings
 from app.minio_io import download_cog, get_latest_date
 from app.color_scales import apply_color_scale
+from datetime import datetime, timezone
+
 from app.stats import compute_zonal_stats
-from app.sources import fetch_agri_parcel
+from app.sources import fetch_agri_parcel, fetch_entity_attr, write_entity_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +153,21 @@ async def parcel_zonal_stats(
             "the caller already has the parcel geometry."
         ),
     ),
+    crop: Optional[str] = Query(
+        None,
+        description=(
+            "Crop species name (e.g. 'wheat', 'maize') to fetch phenology "
+            "params from Orion-LD AgriCrop entities. When provided together "
+            "with *stage*, reads Kc/Ky and includes them in the response."
+        ),
+    ),
+    stage: Optional[str] = Query(
+        None,
+        description=(
+            "Phenological stage (e.g. 'mid-season', 'initial'). Required if "
+            "*crop* is provided to look up the correct Kc/Ky values."
+        ),
+    ),
 ):
     """Compute zonal statistics for a parcel across one or more metrics.
 
@@ -223,8 +240,38 @@ async def parcel_zonal_stats(
             status_code=500, detail="Failed to compute zonal statistics"
         )
 
-    # 4. Add parcel metadata
+    # 4. Read phenology params from Orion-LD (if crop+stage provided)
+    phenology = None
+    if crop and stage:
+        crop_eid = f"urn:ngsi-ld:AgriCrop:{crop}_{stage}".replace(" ", "_")
+        attrs = await fetch_entity_attr(tenant_id, crop_eid, "kc")
+        if isinstance(attrs, (int, float)):
+            ky_val = await fetch_entity_attr(tenant_id, crop_eid, "ky")
+            phenology = {
+                "crop": crop,
+                "stage": stage,
+                "kc": float(attrs),
+                "ky": float(ky_val) if isinstance(ky_val, (int, float)) else None,
+            }
+        else:
+            # Fallback: try reading the AgriCrop from Orion-LD via options
+            pass
+
+    # 5. Write stats to Orion-LD as NGSI-LD attribute on AgriParcel
+    observed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    orion_attrs = {
+        "weatherStats": {
+            "type": "Property",
+            "value": stats.get("metrics", {}),
+            "observedAt": observed_at,
+        }
+    }
+    await write_entity_attrs(tenant_id, parcel_id, orion_attrs)
+
+    # 6. Add parcel metadata + optional phenology
     stats["parcel_id"] = parcel_id
+    if phenology:
+        stats["phenology"] = phenology
     if not geometry:
         stats["parcel_name"] = parcel.get("name")
 

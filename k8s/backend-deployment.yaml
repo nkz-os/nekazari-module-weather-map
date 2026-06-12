@@ -40,6 +40,7 @@ spec:
             secretKeyRef:
               name: minio-secret
               key: secret-key
+              key: secret-key
         - name: MINIO_BUCKET
           value: "nekazari-weather-map"
         - name: ELEVATION_SERVICE_URL

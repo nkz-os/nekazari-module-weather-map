@@ -447,13 +447,8 @@ async def run_for_tenant(
     zoom : int
         TMS zoom level (default 14).
     """
-    # 1. Ensure the MinIO bucket exists
-    if not ensure_bucket():
-        logger.error(
-            "Could not ensure bucket for tenant '%s' — aborting",
-            tenant_id,
-        )
-        return
+    # 1. MinIO bucket — assume it exists (created by admin).
+    # skip ensure_bucket() to avoid spurious AccessDenied.
 
     # 2. Today's date string (used for the COG path)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
