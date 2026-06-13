@@ -78,6 +78,7 @@ def test_compute_histogram_empty():
 def test_compute_zonal_stats_unknown_metric():
     """Unknown metric should return an error entry."""
     result = compute_zonal_stats(
+        "test-tenant",
         SAMPLE_PARCEL_GEOM,
         metrics=["nonexistent_metric"],
     )
@@ -89,6 +90,7 @@ def test_compute_zonal_stats_unknown_metric():
 def test_compute_zonal_stats_no_cogs():
     """When no COG data is available, per-metric entries should have error."""
     result = compute_zonal_stats(
+        "test-tenant",
         SAMPLE_PARCEL_GEOM,
         metrics=["temperature_avg"],
         date="2099-01-01",

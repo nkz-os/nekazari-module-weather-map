@@ -17,7 +17,7 @@ export default defineModule({
   main: WeatherMapMain,
   slots: weatherMapSlots as never,
   data: {
-    entities: [],
-    timeseries: [],
+    entities: ["AgriParcel", "AgriParcelRecord", "AgriSoil"],
+    timeseries: ["AgriParcelRecord"],
   },
 });

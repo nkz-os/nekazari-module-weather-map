@@ -4,22 +4,23 @@ from __future__ import annotations
 
 import io
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 import rasterio
 from rasterio.windows import Window
 
+from app.auth import require_tenant
 from app.config import settings
 from app.minio_io import download_cog, get_latest_date
 from app.color_scales import apply_color_scale
-from datetime import datetime, timezone
-
+from app.records import build_agri_parcel_record
 from app.stats import compute_zonal_stats
-from app.sources import fetch_agri_parcel, fetch_entity_attr, write_entity_attrs
+from app.sources import fetch_agri_parcel, fetch_entity_attr, upsert_record
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ async def serve_tile(
     z: int,
     x: int,
     y: int,
-    tenant_id: str = Query("default"),
+    tenant_id: str = Depends(require_tenant),
     date: Optional[str] = Query(None),
 ):
     """Serve a PNG map tile for a given weather metric and zoom/tile coordinates.
@@ -144,7 +145,7 @@ async def parcel_zonal_stats(
     date: Optional[str] = Query(
         None, description="COG date (YYYY-MM-DD). Defaults to latest."
     ),
-    tenant_id: str = Query("default"),
+    tenant_id: str = Depends(require_tenant),
     geometry: Optional[str] = Query(
         None,
         description=(
@@ -233,7 +234,7 @@ async def parcel_zonal_stats(
 
     # 3. Compute zonal stats
     try:
-        stats = compute_zonal_stats(geom, metric_list, date)
+        stats = compute_zonal_stats(tenant_id, geom, metric_list, date)
     except Exception:
         logger.exception("Failed to compute zonal stats for parcel=%s", parcel_id)
         raise HTTPException(
@@ -257,18 +258,7 @@ async def parcel_zonal_stats(
             # Fallback: try reading the AgriCrop from Orion-LD via options
             pass
 
-    # 5. Write stats to Orion-LD as NGSI-LD attribute on AgriParcel
-    observed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    orion_attrs = {
-        "weatherStats": {
-            "type": "Property",
-            "value": stats.get("metrics", {}),
-            "observedAt": observed_at,
-        }
-    }
-    await write_entity_attrs(tenant_id, parcel_id, orion_attrs)
-
-    # 6. Add parcel metadata + optional phenology
+    # 5. Add parcel metadata + optional phenology
     stats["parcel_id"] = parcel_id
     if phenology:
         stats["phenology"] = phenology
@@ -276,3 +266,63 @@ async def parcel_zonal_stats(
         stats["parcel_name"] = parcel.get("name")
 
     return stats
+
+
+@router.post("/stats/{parcel_id}")
+async def persist_zonal_stats(
+    parcel_id: str,
+    metrics: str = Query("eto"),
+    tenant_id: str = Depends(require_tenant),
+):
+    """Compute zonal stats and persist them as an AgriParcelRecord timeseries point.
+
+    Fetches the parcel geometry from Orion-LD, computes zonal statistics for
+    the requested metrics, builds an AgriParcelRecord entity, and upserts it
+    into Orion-LD via the SDK.
+
+    Parameters
+    ----------
+    parcel_id : str
+        AgriParcel ID (``urn:ngsi-ld:AgriParcel:XXX`` or just ``XXX``).
+    metrics : str
+        Comma-separated metric names. Defaults to ``eto``.
+    tenant_id : str
+        Resolved from the ``X-Tenant-ID`` header by ``require_tenant``.
+
+    Returns
+    -------
+    dict
+        ``{"status": "persisted", "id": <record_id>, "stats": <zonal_stats>}``
+    """
+    parcel = await fetch_agri_parcel(tenant_id, parcel_id)
+    if not parcel:
+        raise HTTPException(status_code=404, detail="Parcel not found")
+
+    geom = parcel.get("geometry")
+    metric_list = [m.strip() for m in metrics.split(",") if m.strip()]
+
+    try:
+        stats = compute_zonal_stats(tenant_id, geom, metric_list)
+    except Exception:
+        logger.exception("Failed to compute zonal stats for parcel=%s", parcel_id)
+        raise HTTPException(status_code=500, detail="Failed to compute zonal statistics")
+
+    # Extract a flat scalar (mean) per metric for the AgriParcelRecord.
+    # compute_zonal_stats returns {"metrics": {metric: {"mean": float, ...}}}.
+    # Metrics with errors (dict with "error" key) are skipped — value stays None.
+    flat_metrics: dict[str, float] = {}
+    for metric_name, metric_data in stats.get("metrics", {}).items():
+        if isinstance(metric_data, dict) and "mean" in metric_data:
+            flat_metrics[metric_name] = metric_data["mean"]
+
+    observed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    record = build_agri_parcel_record(
+        tenant_id=tenant_id,
+        parcel_id=parcel_id,
+        geometry=geom,
+        metrics=flat_metrics,
+        observed_at=observed_at,
+    )
+
+    await upsert_record(tenant_id, record)
+    return {"status": "persisted", "id": record["id"], "stats": stats}

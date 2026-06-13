@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import Any
 
 from minio import Minio
 

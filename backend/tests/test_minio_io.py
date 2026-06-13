@@ -5,7 +5,6 @@ Tests path construction only — no network calls.
 
 from __future__ import annotations
 
-import pytest
 
 from app.minio_io import cog_path, latest_pointer_path
 

@@ -23,7 +23,7 @@ const WeatherLayerControl: React.FC<Props> = ({
   const { t } = useTranslation('weather-map');
 
   return (
-    <SlotShellCompact title={t('title')}>
+    <SlotShellCompact moduleId="weather-map">
       <div className="weather-layer-control">
         {/* Metric selector */}
         <div className="weather-layer-control__field">
