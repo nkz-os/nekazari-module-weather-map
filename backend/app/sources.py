@@ -280,7 +280,13 @@ async def fetch_agri_parcel(
     orion = OrionClient(tenant_id)
     try:
         data = await orion.get_entity(eid)
-        geometry = data.get("location") or data.get("geometry")
+        # get_entity returns NORMALIZED NGSI-LD: location is
+        # {"type": "GeoProperty", "value": <GeoJSON>}. Unwrap to the raw GeoJSON.
+        raw_loc = data.get("location") or data.get("geometry")
+        if isinstance(raw_loc, dict) and raw_loc.get("type") == "GeoProperty":
+            geometry = raw_loc.get("value")
+        else:
+            geometry = raw_loc
         if geometry is None:
             logger.warning(
                 "fetch_agri_parcel(tenant=%s, parcel=%s): no location geometry",

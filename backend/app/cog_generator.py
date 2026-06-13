@@ -159,6 +159,38 @@ def _parcel_geometry(parcel: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _parcel_lonlat(parcel: dict[str, Any]) -> tuple[float, float] | None:
+    """Return a representative (lon, lat) centroid for a parcel.
+
+    Derives it from the parcel's GeoJSON geometry (averaging the coordinates)
+    so the COG bbox covers the parcel's real location. Parcels from
+    ``fetch_tenant_parcels`` carry a ``location`` GeoJSON dict, NOT ``lon``/``lat``
+    keys, so reading ``lon``/``lat`` directly would default to (0, 0).
+    """
+    geom = _parcel_geometry(parcel)
+    if not geom:
+        return None
+    coords: list[float] = []
+
+    def _walk(node: Any) -> None:
+        if (
+            isinstance(node, (list, tuple))
+            and len(node) == 2
+            and all(isinstance(c, (int, float)) for c in node)
+        ):
+            coords.append((float(node[0]), float(node[1])))
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                _walk(child)
+
+    _walk(geom.get("coordinates"))
+    if not coords:
+        return None
+    lons = [c[0] for c in coords]
+    lats = [c[1] for c in coords]
+    return (sum(lons) / len(lons), sum(lats) / len(lats))
+
+
 # ---------------------------------------------------------------------------
 # Per-tile COG computation
 # ---------------------------------------------------------------------------
@@ -480,8 +512,15 @@ async def _generate_and_upload_cogs(
 
     Extracted from ``run_for_tenant`` to allow independent testing/patching.
     """
-    lons = [p.get("lon", p.get("longitude", 0.0)) for p in parcels]
-    lats = [p.get("lat", p.get("latitude", 0.0)) for p in parcels]
+    centroids = [c for c in (_parcel_lonlat(p) for p in parcels) if c is not None]
+    if not centroids:
+        logger.warning(
+            "Tenant '%s': no usable parcel coordinates, skipping COG generation",
+            tenant_id,
+        )
+        return
+    lons = [c[0] for c in centroids]
+    lats = [c[1] for c in centroids]
     min_lon, max_lon = min(lons), max(lons)
     min_lat, max_lat = min(lats), max(lats)
     logger.info(
