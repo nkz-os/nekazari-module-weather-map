@@ -12,6 +12,7 @@ import math
 from typing import Any
 
 import httpx
+from nkz_platform_sdk import OrionClient
 
 from app.config import settings
 
@@ -136,32 +137,20 @@ async def fetch_station_weather(
 async def fetch_agri_soil(
     tenant_id: str, parcel_id: str
 ) -> dict[str, float | None] | None:
-    """Fetch the ``AgriSoil`` NGSI-LD entity from Orion-LD.
+    """Fetch the ``AgriSoil`` NGSI-LD entity from Orion-LD via the SDK.
 
     Returns a dict with ``sand_pct``, ``silt_pct``, ``clay_pct`` keys,
     or ``None`` if the entity does not exist or the request fails.
     """
     entity_id = f"urn:ngsi-ld:AgriSoil:{parcel_id}"
-    params = {"options": "keyValues"}
-    headers = {
-        "NGSILD-Tenant": tenant_id,
-        "Fiware-Service": tenant_id,
-        "Fiware-ServicePath": "/",
-    }
+    orion = OrionClient(tenant_id)
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                f"{settings.orion_url}/ngsi-ld/v1/entities/{entity_id}",
-                params=params,
-                headers=headers,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return {
-                "sand_pct": data.get("sandPct") or data.get("sand_pct"),
-                "silt_pct": data.get("siltPct") or data.get("silt_pct"),
-                "clay_pct": data.get("clayPct") or data.get("clay_pct"),
-            }
+        data = await orion.get_entity(entity_id)
+        return {
+            "sand_pct": data.get("sandPct") or data.get("sand_pct"),
+            "silt_pct": data.get("siltPct") or data.get("silt_pct"),
+            "clay_pct": data.get("clayPct") or data.get("clay_pct"),
+        }
     except Exception:
         logger.exception(
             "fetch_agri_soil(tenant=%s, parcel=%s) failed",
@@ -169,53 +158,26 @@ async def fetch_agri_soil(
             parcel_id,
         )
         return None
+    finally:
+        await orion.close()
 
 
-async def write_entity_attrs(
-    tenant_id: str,
-    entity_id: str,
-    attrs: dict[str, Any],
-) -> bool:
-    """Write NGSI-LD attributes to an entity in Orion-LD via POST /attrs.
+async def upsert_record(tenant_id: str, entity: dict) -> None:
+    """Create an NGSI-LD entity (AgriParcelRecord) via the SDK.
 
-    Uses ``?options=append`` which creates the attribute if it does not
-    exist or updates it if it does.  Each key in *attrs* becomes a
-    top-level NGSI-LD attribute:
-
-    .. code-block:: json
-
-        {
-          "weatherStats": {
-            "type": "Property",
-            "value": {…},
-            "observedAt": "2026-06-12T00:00:00Z"
-          }
-        }
-
-    Returns ``True`` on success, ``False`` on failure.
+    Same-second id collisions are tolerated: a 409/duplicate is logged and
+    ignored (append-only timeseries).
     """
-    headers = {
-        "NGSILD-Tenant": tenant_id,
-        "Fiware-Service": tenant_id,
-        "Fiware-ServicePath": "/",
-        "Content-Type": "application/json",
-    }
+    orion = OrionClient(tenant_id)
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(
-                f"{settings.orion_url}/ngsi-ld/v1/entities/{entity_id}/attrs",
-                params={"options": "append"},
-                headers=headers,
-                json=attrs,
-            )
-            resp.raise_for_status()
-            return True
-    except Exception:
-        logger.exception(
-            "write_entity_attrs(tenant=%s, entity=%s) failed",
-            tenant_id, entity_id,
-        )
-        return False
+        await orion.create_entity(entity)
+    except Exception as exc:  # noqa: BLE001
+        if "already exists" in str(exc).lower() or "409" in str(exc):
+            logger.info("AgriParcelRecord %s already exists, skipping", entity.get("id"))
+            return
+        logger.warning("upsert_record(tenant=%s) failed: %s", tenant_id, exc)
+    finally:
+        await orion.close()
 
 
 async def fetch_entity_attr(
@@ -223,32 +185,23 @@ async def fetch_entity_attr(
     entity_id: str,
     attr_name: str,
 ) -> Any | None:
-    """Fetch a single NGSI-LD attribute from an entity in Orion-LD.
+    """Fetch a single NGSI-LD attribute from an entity in Orion-LD via the SDK.
 
     Returns the attribute's ``value`` (with keyValues simplification) or
     ``None`` if the entity/attribute does not exist or on error.
     """
-    headers = {
-        "NGSILD-Tenant": tenant_id,
-        "Fiware-Service": tenant_id,
-        "Fiware-ServicePath": "/",
-    }
+    orion = OrionClient(tenant_id)
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                f"{settings.orion_url}/ngsi-ld/v1/entities/{entity_id}",
-                params={"options": "keyValues"},
-                headers=headers,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get(attr_name)
+        data = await orion.get_entity(entity_id)
+        return data.get(attr_name)
     except Exception:
         logger.exception(
             "fetch_entity_attr(tenant=%s, entity=%s, attr=%s) failed",
             tenant_id, entity_id, attr_name,
         )
         return None
+    finally:
+        await orion.close()
 
 
 async def fetch_tenant_parcels(tenant_id: str) -> list[dict[str, Any]]:
@@ -316,7 +269,7 @@ async def fetch_tenant_parcels(tenant_id: str) -> list[dict[str, Any]]:
 async def fetch_agri_parcel(
     tenant_id: str, parcel_id: str
 ) -> dict[str, Any] | None:
-    """Fetch an ``AgriParcel`` NGSI-LD entity from Orion-LD for geometry.
+    """Fetch an ``AgriParcel`` NGSI-LD entity from Orion-LD for geometry via SDK.
 
     Returns a dict with the parcel's GeoJSON ``location`` geometry and
     ``agriParcelOf`` (tenant/enterprise), or ``None`` if not found.
@@ -324,34 +277,22 @@ async def fetch_agri_parcel(
     # Normalize: strip prefix if already has it
     eid = parcel_id if parcel_id.startswith("urn:ngsi-ld:AgriParcel:") else \
         f"urn:ngsi-ld:AgriParcel:{parcel_id}"
-    params = {"options": "keyValues"}
-    headers = {
-        "NGSILD-Tenant": tenant_id,
-        "Fiware-Service": tenant_id,
-        "Fiware-ServicePath": "/",
-    }
+    orion = OrionClient(tenant_id)
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                f"{settings.orion_url}/ngsi-ld/v1/entities/{eid}",
-                params=params,
-                headers=headers,
+        data = await orion.get_entity(eid)
+        geometry = data.get("location") or data.get("geometry")
+        if geometry is None:
+            logger.warning(
+                "fetch_agri_parcel(tenant=%s, parcel=%s): no location geometry",
+                tenant_id, parcel_id,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            geometry = data.get("location") or data.get("geometry")
-            if geometry is None:
-                logger.warning(
-                    "fetch_agri_parcel(tenant=%s, parcel=%s): no location geometry",
-                    tenant_id, parcel_id,
-                )
-                return None
-            return {
-                "id": data.get("id", eid),
-                "geometry": geometry,
-                "name": data.get("name"),
-                "description": data.get("description"),
-            }
+            return None
+        return {
+            "id": data.get("id", eid),
+            "geometry": geometry,
+            "name": data.get("name"),
+            "description": data.get("description"),
+        }
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
             logger.warning(
@@ -370,3 +311,5 @@ async def fetch_agri_parcel(
             tenant_id, parcel_id,
         )
         return None
+    finally:
+        await orion.close()

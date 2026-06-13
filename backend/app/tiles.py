@@ -17,10 +17,8 @@ from app.auth import require_tenant
 from app.config import settings
 from app.minio_io import download_cog, get_latest_date
 from app.color_scales import apply_color_scale
-from datetime import datetime, timezone
-
 from app.stats import compute_zonal_stats
-from app.sources import fetch_agri_parcel, fetch_entity_attr, write_entity_attrs
+from app.sources import fetch_agri_parcel, fetch_entity_attr
 
 logger = logging.getLogger(__name__)
 
@@ -258,18 +256,7 @@ async def parcel_zonal_stats(
             # Fallback: try reading the AgriCrop from Orion-LD via options
             pass
 
-    # 5. Write stats to Orion-LD as NGSI-LD attribute on AgriParcel
-    observed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    orion_attrs = {
-        "weatherStats": {
-            "type": "Property",
-            "value": stats.get("metrics", {}),
-            "observedAt": observed_at,
-        }
-    }
-    await write_entity_attrs(tenant_id, parcel_id, orion_attrs)
-
-    # 6. Add parcel metadata + optional phenology
+    # 5. Add parcel metadata + optional phenology
     stats["parcel_id"] = parcel_id
     if phenology:
         stats["phenology"] = phenology
