@@ -29,12 +29,18 @@ SEVERE_DEFICIT_THRESHOLD_MM = -15.0  # pixels <= this are "severe deficit"
 
 
 def _collect_pixels(
+    tenant_id: str,
     geometry: dict[str, Any],
     metric: str,
     date: str,
     zoom: int = 14,
 ) -> np.ndarray | None:
     """Mask the COG tile(s) intersecting *geometry* and return pixel values.
+
+    Parameters
+    ----------
+    tenant_id : str
+        Tenant namespace used to locate per-tenant COGs in MinIO.
 
     Returns a 1-D float32 array of pixel values that fall inside the
     parcel polygon, or ``None`` when no data is available.
@@ -53,7 +59,7 @@ def _collect_pixels(
     all_pixels: list[np.ndarray] = []
 
     for z, tx, ty in tiles:
-        cog_bytes = download_cog("default", metric, date, z, tx, ty)
+        cog_bytes = download_cog(tenant_id, metric, date, z, tx, ty)
         if cog_bytes is None:
             continue
 
@@ -141,6 +147,7 @@ def _compute_histogram(
 
 
 def compute_zonal_stats(
+    tenant_id: str,
     geometry: dict[str, Any],
     metrics: list[str],
     date: str | None = None,
@@ -149,6 +156,8 @@ def compute_zonal_stats(
 
     Parameters
     ----------
+    tenant_id : str
+        Tenant whose COGs to read (COGs are stored per tenant in MinIO).
     geometry : dict
         GeoJSON geometry dict (Polygon or MultiPolygon), e.g. from an
         AgriParcel ``location`` property.
@@ -162,7 +171,7 @@ def compute_zonal_stats(
     dict
         ``{"parcel_geojson": …, "date": …, "metrics": {metric: {…}}}``.
     """
-    resolved_date = date or get_latest_date("default", metrics[0] if metrics else "temperature_avg")
+    resolved_date = date or get_latest_date(tenant_id, metrics[0] if metrics else "temperature_avg")
     if not resolved_date:
         return {"error": "No COG data available", "metrics": {}}
 
@@ -177,7 +186,7 @@ def compute_zonal_stats(
             result["metrics"][metric] = {"error": f"Unknown metric: {metric}"}
             continue
 
-        pixels = _collect_pixels(geometry, metric, resolved_date)
+        pixels = _collect_pixels(tenant_id, geometry, metric, resolved_date)
         if pixels is None or len(pixels) == 0:
             result["metrics"][metric] = {
                 "error": "No data for parcel at this metric/date",

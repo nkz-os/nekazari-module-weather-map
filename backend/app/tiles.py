@@ -234,7 +234,7 @@ async def parcel_zonal_stats(
 
     # 3. Compute zonal stats
     try:
-        stats = compute_zonal_stats(geom, metric_list, date)
+        stats = compute_zonal_stats(tenant_id, geom, metric_list, date)
     except Exception:
         logger.exception("Failed to compute zonal stats for parcel=%s", parcel_id)
         raise HTTPException(
