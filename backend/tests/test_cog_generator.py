@@ -7,9 +7,7 @@ which have no external dependencies.  Async integration tests that exercise
 
 from __future__ import annotations
 
-import math
 
-import pytest
 
 from app.cog_generator import _bbox_to_tiles, _tile_to_bbox
 

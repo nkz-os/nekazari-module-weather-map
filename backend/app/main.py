@@ -7,7 +7,6 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import settings
 from app.tiles import router as tiles_router
 
 logger = logging.getLogger(__name__)

@@ -1,7 +1,6 @@
 """Tests for the Weather Map downscaler physics engine."""
 
 import numpy as np
-import pytest
 
 from app.downscaler import (
     correct_temperature,

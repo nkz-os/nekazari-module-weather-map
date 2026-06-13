@@ -108,7 +108,7 @@ class TestFetchTenantParcels:
                 "name": "Parcela A",
             },
         ]
-        with self._mock_client(response_data) as patcher:
+        with self._mock_client(response_data) as _:
             result = await fetch_tenant_parcels("test-tenant")
 
         assert len(result) == 1
@@ -134,7 +134,7 @@ class TestFetchTenantParcels:
                 "description": "Southern plot",
             },
         ]
-        with self._mock_client(response_data) as patcher:
+        with self._mock_client(response_data) as _:
             result = await fetch_tenant_parcels("test-tenant")
 
         assert len(result) == 1
@@ -162,7 +162,7 @@ class TestFetchTenantParcels:
                 "location": None,
             },
         ]
-        with self._mock_client(response_data) as patcher:
+        with self._mock_client(response_data) as _:
             result = await fetch_tenant_parcels("test-tenant")
 
         assert len(result) == 1
@@ -171,7 +171,7 @@ class TestFetchTenantParcels:
     @pytest.mark.asyncio
     async def test_empty_list_on_empty_response(self):
         """Returns empty list when Orion returns no entities."""
-        with self._mock_client([]) as patcher:
+        with self._mock_client([]) as _:
             result = await fetch_tenant_parcels("test-tenant")
 
         assert result == []
@@ -184,7 +184,7 @@ class TestFetchTenantParcels:
             request=MagicMock(),
             response=MagicMock(status_code=404),
         )
-        with self._mock_client([], raise_for_status=http_error) as patcher:
+        with self._mock_client([], raise_for_status=http_error) as _:
             result = await fetch_tenant_parcels("test-tenant")
 
         assert result == []
@@ -203,7 +203,7 @@ class TestFetchTenantParcels:
     @pytest.mark.asyncio
     async def test_empty_list_on_non_list_response(self):
         """Returns empty list if Orion returns a non-list (e.g. error object)."""
-        with self._mock_client({"error": "Internal"}) as patcher:
+        with self._mock_client({"error": "Internal"}) as _:
             result = await fetch_tenant_parcels("test-tenant")
 
         assert result == []
@@ -219,7 +219,7 @@ class TestFetchTenantParcels:
             }
             for i in range(150)
         ]
-        with self._mock_client(many_parcels) as patcher:
+        with self._mock_client(many_parcels) as _:
             result = await fetch_tenant_parcels("test-tenant")
 
         assert len(result) == 100

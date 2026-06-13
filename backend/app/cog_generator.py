@@ -30,7 +30,7 @@ from app.downscaler import (
     saxton_rawls_ptf,
     get_texture_defaults,
 )
-from app.minio_io import ensure_bucket, set_latest_date, upload_cog
+from app.minio_io import set_latest_date, upload_cog
 from app.records import build_agri_parcel_record
 from app.sources import fetch_agri_soil, fetch_dem_tile, fetch_station_weather, upsert_record
 from app.stats import compute_zonal_stats
