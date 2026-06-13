@@ -31,7 +31,9 @@ from app.downscaler import (
     get_texture_defaults,
 )
 from app.minio_io import ensure_bucket, set_latest_date, upload_cog
-from app.sources import fetch_agri_soil, fetch_dem_tile, fetch_station_weather
+from app.records import build_agri_parcel_record
+from app.sources import fetch_agri_soil, fetch_dem_tile, fetch_station_weather, upsert_record
+from app.stats import compute_zonal_stats
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +126,39 @@ def _date_to_doy(date_str: str) -> int:
     return dt.timetuple().tm_yday
 
 
+def _parcel_geometry(parcel: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract or build a GeoJSON geometry from a parcel dict.
+
+    Tries ``location`` first (Polygon/MultiPolygon from Orion-LD), then
+    falls back to building a small 0.001° bbox polygon from ``lon``/``lat``
+    (or ``longitude``/``latitude``) if only a point is available.
+
+    Returns ``None`` when no usable coordinates are found.
+    """
+    location = parcel.get("location")
+    if isinstance(location, dict) and location.get("type") in ("Polygon", "MultiPolygon"):
+        return location
+
+    lon = parcel.get("lon", parcel.get("longitude"))
+    lat = parcel.get("lat", parcel.get("latitude"))
+    if lon is None or lat is None:
+        return None
+
+    lon = float(lon)
+    lat = float(lat)
+    delta = 0.0005  # ~55 m at mid-latitudes
+    return {
+        "type": "Polygon",
+        "coordinates": [[
+            [lon - delta, lat - delta],
+            [lon + delta, lat - delta],
+            [lon + delta, lat + delta],
+            [lon - delta, lat + delta],
+            [lon - delta, lat - delta],
+        ]],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-tile COG computation
 # ---------------------------------------------------------------------------
@@ -139,6 +174,7 @@ async def generate_cog_for_tile(
     date_to: str,
     tile_center_lat: float,
     tile_center_lon: float,
+    parcel_id: str = "",
 ) -> bytes | None:
     """Compute a weather raster for a single TMS tile and return COG bytes.
 
@@ -154,6 +190,9 @@ async def generate_cog_for_tile(
         Date range (``"YYYY-MM-DD"``).
     tile_center_lat, tile_center_lon : float
         Centre of the tile (used for nearest-station lookup).
+    parcel_id : str
+        NGSI-LD AgriParcel URN used to fetch the matching AgriSoil entity.
+        Pass the real parcel id so soil lookup uses actual parcel data.
 
     Returns
     -------
@@ -350,10 +389,13 @@ async def generate_cog_for_tile(
         result = compute_frost_risk(t_min_corrected, elevations)
 
     elif metric == "soil_moisture":
-        soil = await fetch_agri_soil(tenant_id, "")
+        soil = await fetch_agri_soil(tenant_id, parcel_id)
         if soil is not None and soil.get("sand_pct") is not None:
             ptf = saxton_rawls_ptf(soil["sand_pct"], soil["clay_pct"])
         else:
+            logger.warning(
+                "No AgriSoil for %s; using texture defaults", parcel_id
+            )
             defaults = get_texture_defaults()
             ptf = saxton_rawls_ptf(
                 defaults["sand_pct"], defaults["clay_pct"],
@@ -422,6 +464,87 @@ async def generate_cog_for_tile(
 
 
 # ---------------------------------------------------------------------------
+# Orchestrator helpers
+# ---------------------------------------------------------------------------
+
+
+async def _generate_and_upload_cogs(
+    tenant_id: str,
+    parcels: list[dict[str, Any]],
+    date_from: str,
+    date_to: str,
+    zoom: int,
+    today: str,
+) -> None:
+    """Generate COGs for all metrics/tiles covering the parcels' aggregate bbox.
+
+    Extracted from ``run_for_tenant`` to allow independent testing/patching.
+    """
+    lons = [p.get("lon", p.get("longitude", 0.0)) for p in parcels]
+    lats = [p.get("lat", p.get("latitude", 0.0)) for p in parcels]
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+    logger.info(
+        "Parcel bbox for tenant '%s': %.4f, %.4f, %.4f, %.4f",
+        tenant_id, min_lon, min_lat, max_lon, max_lat,
+    )
+
+    tiles = _bbox_to_tiles(min_lon, min_lat, max_lon, max_lat, zoom=zoom)
+    logger.info(
+        "Tenant '%s': %d tiles at zoom %d",
+        tenant_id, len(tiles), zoom,
+    )
+
+    # Use the first parcel's id for soil lookup (tiles span aggregate bbox)
+    first_parcel_id = parcels[0]["id"] if parcels else ""
+
+    for metric in settings.metrics:
+        logger.info(
+            "Generating COGs for metric '%s' / tenant '%s'",
+            metric, tenant_id,
+        )
+
+        success_count = 0
+        total = len(tiles)
+
+        for idx, (z_tile, x_tile, y_tile) in enumerate(tiles):
+            min_lon_t, min_lat_t, max_lon_t, max_lat_t = _tile_to_bbox(
+                z_tile, x_tile, y_tile,
+            )
+            tile_center_lon = (min_lon_t + max_lon_t) / 2.0
+            tile_center_lat = (min_lat_t + max_lat_t) / 2.0
+
+            cog_bytes = await generate_cog_for_tile(
+                tenant_id, metric, z_tile, x_tile, y_tile,
+                date_from, date_to, tile_center_lat, tile_center_lon,
+                parcel_id=first_parcel_id,
+            )
+
+            if cog_bytes is not None:
+                ok = upload_cog(
+                    cog_bytes, tenant_id, metric, today,
+                    z_tile, x_tile, y_tile,
+                )
+                if ok:
+                    success_count += 1
+
+            if (idx + 1) % 10 == 0:
+                logger.info(
+                    "  [%s] tile %d/%d (%d/%d/%d) — %d/%d succeeded",
+                    metric, idx + 1, total, z_tile, x_tile, y_tile,
+                    success_count, idx + 1,
+                )
+
+        logger.info(
+            "Metric '%s': %d/%d tiles succeeded for tenant '%s'",
+            metric, success_count, total, tenant_id,
+        )
+
+        if success_count > 0:
+            set_latest_date(tenant_id, metric, today)
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -433,7 +556,8 @@ async def run_for_tenant(
     date_to: str,
     zoom: int = 14,
 ) -> None:
-    """Run COG generation for all metrics and all tiles covering a tenant's parcels.
+    """Run COG generation for all metrics and all tiles covering a tenant's parcels,
+    then persist one AgriParcelRecord per parcel with zonal stats.
 
     Parameters
     ----------
@@ -453,7 +577,7 @@ async def run_for_tenant(
     # 2. Today's date string (used for the COG path)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # 3. Compute aggregate bounding box from all parcels
+    # 3. Guard: no parcels
     if not parcels:
         logger.warning(
             "No parcels for tenant '%s' — skipping COG generation",
@@ -461,66 +585,38 @@ async def run_for_tenant(
         )
         return
 
-    lons = [p.get("lon", p.get("longitude", 0.0)) for p in parcels]
-    lats = [p.get("lat", p.get("latitude", 0.0)) for p in parcels]
-    min_lon, max_lon = min(lons), max(lons)
-    min_lat, max_lat = min(lats), max(lats)
-    logger.info(
-        "Parcel bbox for tenant '%s': %.4f, %.4f, %.4f, %.4f",
-        tenant_id, min_lon, min_lat, max_lon, max_lat,
+    # 4. Generate and upload COGs for all metrics / tiles
+    await _generate_and_upload_cogs(
+        tenant_id, parcels, date_from, date_to, zoom, today,
     )
 
-    # 4. Compute the list of tiles that cover the bbox
-    tiles = _bbox_to_tiles(min_lon, min_lat, max_lon, max_lat, zoom=zoom)
-    logger.info(
-        "Tenant '%s': %d tiles at zoom %d",
-        tenant_id, len(tiles), zoom,
-    )
-
-    # 5. Generate COGs for each metric
-    for metric in settings.metrics:
-        logger.info(
-            "Generating COGs for metric '%s' / tenant '%s'",
-            metric, tenant_id,
-        )
-
-        success_count = 0
-        total = len(tiles)
-
-        for idx, (z_tile, x_tile, y_tile) in enumerate(tiles):
-            # Compute tile centre for nearest-station lookup
-            min_lon_t, min_lat_t, max_lon_t, max_lat_t = _tile_to_bbox(
-                z_tile, x_tile, y_tile,
+    # 5. Persist one AgriParcelRecord per parcel with zonal stats
+    observed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for parcel in parcels:
+        parcel_id = parcel["id"]
+        geometry = _parcel_geometry(parcel)
+        if geometry is None:
+            logger.warning(
+                "No usable geometry for parcel %s — skipping record", parcel_id,
             )
-            tile_center_lon = (min_lon_t + max_lon_t) / 2.0
-            tile_center_lat = (min_lat_t + max_lat_t) / 2.0
+            continue
 
-            cog_bytes = await generate_cog_for_tile(
-                tenant_id, metric, z_tile, x_tile, y_tile,
-                date_from, date_to, tile_center_lat, tile_center_lon,
-            )
+        stats = compute_zonal_stats(tenant_id, geometry, settings.metrics)
+        flat_metrics: dict[str, float] = {}
+        for metric_name, metric_stats in stats.get("metrics", {}).items():
+            if "error" in metric_stats or "mean" not in metric_stats:
+                continue
+            flat_metrics[metric_name] = metric_stats["mean"]
 
-            if cog_bytes is not None:
-                ok = upload_cog(
-                    cog_bytes, tenant_id, metric, today,
-                    z_tile, x_tile, y_tile,
-                )
-                if ok:
-                    success_count += 1
-
-            # Log progress every 10 tiles
-            if (idx + 1) % 10 == 0:
-                logger.info(
-                    "  [%s] tile %d/%d (%d/%d/%d) — %d/%d succeeded",
-                    metric, idx + 1, total, z_tile, x_tile, y_tile,
-                    success_count, idx + 1,
-                )
-
-        logger.info(
-            "Metric '%s': %d/%d tiles succeeded for tenant '%s'",
-            metric, success_count, total, tenant_id,
+        record = build_agri_parcel_record(
+            tenant_id=tenant_id,
+            parcel_id=parcel_id,
+            geometry=geometry,
+            metrics=flat_metrics,
+            observed_at=observed_at,
         )
-
-        # Update the latest-date pointer if at least one tile succeeded
-        if success_count > 0:
-            set_latest_date(tenant_id, metric, today)
+        await upsert_record(tenant_id, record)
+        logger.info(
+            "Persisted AgriParcelRecord for parcel %s / tenant %s",
+            parcel_id, tenant_id,
+        )
