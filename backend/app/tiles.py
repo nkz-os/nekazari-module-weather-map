@@ -8,11 +8,12 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 import rasterio
 from rasterio.windows import Window
 
+from app.auth import require_tenant
 from app.config import settings
 from app.minio_io import download_cog, get_latest_date
 from app.color_scales import apply_color_scale
@@ -32,7 +33,7 @@ async def serve_tile(
     z: int,
     x: int,
     y: int,
-    tenant_id: str = Query("default"),
+    tenant_id: str = Depends(require_tenant),
     date: Optional[str] = Query(None),
 ):
     """Serve a PNG map tile for a given weather metric and zoom/tile coordinates.
@@ -144,7 +145,7 @@ async def parcel_zonal_stats(
     date: Optional[str] = Query(
         None, description="COG date (YYYY-MM-DD). Defaults to latest."
     ),
-    tenant_id: str = Query("default"),
+    tenant_id: str = Depends(require_tenant),
     geometry: Optional[str] = Query(
         None,
         description=(
