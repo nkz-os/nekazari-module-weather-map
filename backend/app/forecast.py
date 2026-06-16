@@ -8,7 +8,6 @@ budget worker to project soil moisture deficit.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -56,9 +55,6 @@ async def forecast_et0(
     lat, lon = centroid
 
     # 2. Fetch forecast from weather-api (which proxies Open-Meteo)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    end = (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%d")
-
     params = {
         "lat": lat,
         "lon": lon,
