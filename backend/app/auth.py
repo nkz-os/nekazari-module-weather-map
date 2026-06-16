@@ -22,13 +22,20 @@ if settings.auth_disabled:
     )
 
 
-def require_tenant(x_tenant_id: str | None = Header(default=None)) -> str:
-    """Return the caller's tenant id from the api-gateway header.
+def require_tenant(
+    x_tenant_id: str | None = Header(default=None),
+    x_user_id: str | None = Header(default=None),
+) -> str:
+    """Return the caller's tenant id from the api-gateway headers.
 
-    Raises 401 when the header is absent (and auth is enabled).
+    Validates both X-Tenant-ID and X-User-ID to prevent spoofing
+    when the endpoint is reached via direct ingress (bypassing api-gateway).
+    Raises 401 when either header is absent (and auth is enabled).
     """
     if settings.auth_disabled:
         return x_tenant_id or "dev"
     if not x_tenant_id:
         raise HTTPException(status_code=401, detail="Missing X-Tenant-ID")
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Missing X-User-ID")
     return x_tenant_id

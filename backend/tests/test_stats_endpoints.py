@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 TENANT = "asociacion-allotarra"
-AUTH_HEADERS = {"X-Tenant-ID": TENANT}
+AUTH_HEADERS = {"X-Tenant-ID": TENANT, "X-User-ID": "test-user"}
 
 SAMPLE_GEOM = {
     "type": "Polygon",

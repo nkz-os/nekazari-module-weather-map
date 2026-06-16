@@ -28,6 +28,11 @@ class Settings:
     
     auth_disabled: bool = os.getenv("AUTH_DISABLED", "false").lower() == "true"
     internal_service_secret: str = os.getenv("INTERNAL_SERVICE_SECRET", "")
+    cors_origins: str = os.getenv("CORS_ORIGINS", "https://nekazari.robotika.cloud")
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
     
     tile_size: int = 256
     tile_scale: float = 1.0

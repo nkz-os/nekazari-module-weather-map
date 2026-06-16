@@ -15,7 +15,7 @@ def test_unknown_metric_returns_404(client):
     """Request with unknown metric should return 404."""
     resp = client.get(
         "/api/weather-map/tiles/invalid_metric/14/8557/5302.png",
-        headers={"X-Tenant-ID": "test-tenant"},
+        headers={"X-Tenant-ID": "test-tenant", "X-User-ID": "test-user"},
     )
     assert resp.status_code == 404
 
