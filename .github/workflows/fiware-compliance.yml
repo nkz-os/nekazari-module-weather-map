@@ -1,0 +1,20 @@
+name: FIWARE Compliance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  compliance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run FIWARE compliance check
+        run: |
+          if [ -f scripts/check-fiware-compliance.sh ]; then
+            bash scripts/check-fiware-compliance.sh
+          else
+            echo "No compliance script found — skipping"
+          fi
