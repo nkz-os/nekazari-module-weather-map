@@ -10,10 +10,7 @@ import io
 import logging
 import os
 import tempfile
-from typing import Any
-
 import geolibre_wasm as gl
-import numpy as np
 import rasterio
 from rasterio.merge import merge as merge_tools
 

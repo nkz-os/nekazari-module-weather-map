@@ -24,12 +24,11 @@ async def get_zones(
     limit: int = Query(20, ge=1, le=50),
 ) -> dict[str, Any]:
     """Return the latest AgriParcelZone entities for a parcel."""
-    tid = tenant_id or ""
     pid = parcel_id if parcel_id.startswith("urn:") else f"urn:ngsi-ld:AgriParcel:{parcel_id}"
 
     # Use SDK for auto-header injection
     import httpx
-    orion = OrionClient(tid)
+    orion = OrionClient(tenant_id or "")
     try:
         headers = await orion._get_headers()  # reuse SDK's header builder
         headers["Accept"] = "application/ld+json"
@@ -82,7 +81,6 @@ async def get_gdd(
     if not settings.postgres_url:
         raise HTTPException(status_code=503, detail="POSTGRES_URL not configured")
 
-    tid = tenant_id or ""
     pid = parcel_id if parcel_id.startswith("urn:") else f"urn:ngsi-ld:AgriParcel:{parcel_id}"
     start_dt = datetime.strptime(season_start, "%Y-%m-%d")
     end_dt = datetime.now(timezone.utc)

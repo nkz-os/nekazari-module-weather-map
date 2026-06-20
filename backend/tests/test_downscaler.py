@@ -13,7 +13,6 @@ from app.downscaler import (
     get_texture_defaults,
     discretize_aspect,
     compute_zones,
-    _dominant_sector,
 )
 
 
@@ -454,7 +453,6 @@ class TestDiscretizeAspect:
 
     def test_aspect_boundaries(self):
         """Sector boundaries handled correctly."""
-        slope = np.full(8, 5.0)
         # Values just below boundary → lower sector; at boundary → upper sector
         # Boundary at 22.5 → 22.4 is N(1), 22.5 is NE(2)
         aspects = np.array([22.4, 22.5, 67.4, 67.5])

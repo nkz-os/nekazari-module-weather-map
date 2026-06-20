@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
       - name: backend
-        image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:603df7230656fe6d4e1191e672d1d901703c374ef2e0b435aa1e3d6971840f99
+        image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:d7b7e0aa453b7ddc045f88030ed4593a9aa67f34b683ee240a2f5ba2ae74a7b8
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
