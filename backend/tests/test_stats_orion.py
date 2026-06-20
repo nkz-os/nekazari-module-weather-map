@@ -49,7 +49,7 @@ SAMPLE_PARCEL_RESPONSE = {
     "description": "A test parcel in Navarra",
 }
 
-AUTH_HEADERS = {"X-Tenant-ID": "test-tenant"}
+AUTH_HEADERS = {"X-Tenant-ID": "test-tenant", "X-User-ID": "test-user"}
 
 
 def _fresh_stats_two_metrics() -> dict:

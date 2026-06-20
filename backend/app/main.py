@@ -7,7 +7,10 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.config import settings
+from app.forecast import router as forecast_router
 from app.tiles import router as tiles_router
+from app.zones import router as zones_router
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +21,12 @@ app = FastAPI(
 )
 
 app.include_router(tiles_router, prefix="/api/weather-map")
+app.include_router(forecast_router, prefix="/api/weather-map")
+app.include_router(zones_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

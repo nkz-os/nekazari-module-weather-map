@@ -205,3 +205,43 @@ def set_latest_date(tenant_id: str, metric: str, date: str) -> bool:
             metric,
         )
         return False
+
+
+# ---------------------------------------------------------------------------
+# COG cleanup
+# ---------------------------------------------------------------------------
+
+
+def delete_old_cogs(tenant_id: str, max_age_days: int = 30) -> None:
+    """Delete COG files older than *max_age_days* from MinIO."""
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    client = _get_client()
+    bucket = settings.minio_bucket
+    prefix = f"cogs/{tenant_id}/"
+    try:
+        objects = client.list_objects(bucket, prefix=prefix, recursive=True)
+        deleted = 0
+        for obj in objects:
+            parts = obj.object_name.split("/")
+            if len(parts) < 4:
+                continue
+            try:
+                date_str = parts[3]
+                obj_date = datetime.strptime(date_str, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                )
+                if obj_date < cutoff:
+                    client.remove_object(bucket, obj.object_name)
+                    deleted += 1
+            except (ValueError, IndexError):
+                continue
+        if deleted:
+            logger.info(
+                "Deleted %d old COGs for tenant %s", deleted, tenant_id
+            )
+    except Exception:
+        logger.exception(
+            "Failed to delete old COGs for tenant %s", tenant_id
+        )

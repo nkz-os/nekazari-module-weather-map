@@ -6,6 +6,7 @@
   "packageManager": "pnpm@9.15.4",
   "scripts": {
     "build": "vite build",
+    "build:module": "vite build",
     "dev": "vite"
   },
   "dependencies": {

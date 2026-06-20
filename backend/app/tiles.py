@@ -1,9 +1,16 @@
-"""Tile server endpoint — reads precomputed COGs from MinIO and serves PNG tiles."""
+"""Tile server endpoint — reads precomputed COGs from MinIO and serves PNG tiles.
+
+DEPRECATED: Use PMTiles instead (see pmtiles_generator.py).
+Tile serving is being migrated to static PMTiles served directly from MinIO,
+eliminating the need for this on-demand tile renderer.
+Will be removed in a future version once PMTiles are stable.
+"""
 
 from __future__ import annotations
 
 import io
 import logging
+import warnings
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -21,6 +28,12 @@ from app.color_scales import apply_color_scale
 from app.records import build_agri_parcel_record
 from app.stats import compute_zonal_stats
 from app.sources import fetch_agri_parcel, fetch_entity_attr, upsert_record
+
+warnings.warn(
+    "tiles.py is deprecated. Use PMTiles from MinIO instead (see pmtiles_generator.py).",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 logger = logging.getLogger(__name__)
 

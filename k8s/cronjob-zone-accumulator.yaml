@@ -1,0 +1,21 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: zone-accumulator
+  namespace: nekazari
+  labels:
+    app: zone-accumulator
+spec:
+  schedule: "0 2 * * *"   # daily at 02:00 UTC
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: zone-accumulator
+            image: ghcr.io/nkz-os/nekazari-module-weather-map/backend:latest
+            command: ["python3", "-m", "app.zone_accumulator"]
+            env:
+              - name: MONITORED_TENANTS
+                value: "montiko"
+          restartPolicy: OnFailure

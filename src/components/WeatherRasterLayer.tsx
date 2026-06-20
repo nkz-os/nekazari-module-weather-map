@@ -5,33 +5,55 @@ interface Props {
   metric: string;
   date?: string;
   opacity?: number;
+  tenantId?: string;
 }
 
-// VITE_API_URL comes from CI build env (set in _publish-module.yml -> VITE_API_URL=https://nkz.robotika.cloud)
-// Empty fallback = relative URL (works with dev servers, prod CI always sets it).
-const API_BASE = (import.meta as any).env?.VITE_API_URL || '';
+const FRONTEND_HOST = 'https://nekazari.robotika.cloud';
 
-const WeatherRasterLayer: React.FC<Props> = ({ metric, date, opacity = 0.7 }) => {
-  const { cesiumViewer: viewer } = useViewer();
+const WeatherRasterLayer: React.FC<Props> = ({ metric, date, opacity = 0.7, tenantId }) => {
+  const viewerCtx = useViewer();
+  const viewer = (viewerCtx as any).cesiumViewer;
+  const CesiumLib = (window as any).Cesium;
 
-  const url = useMemo(() => {
-    const params = new URLSearchParams();
-    if (date) params.set('date', date);
-    const qs = params.toString();
-    return `${API_BASE}/api/weather-map/tiles/${metric}/{z}/{x}/{y}.png${qs ? '?' + qs : ''}`;
-  }, [metric, date]);
+  // Derive tenantId from viewer context if not explicitly provided
+  const resolvedTenantId = tenantId || (viewerCtx as any).tenantId || 'default';
+
+  const pmtilesUrl = useMemo(() => {
+    if (!date) return null; // Need a date to resolve the PMTiles
+    return `${FRONTEND_HOST}/modules/weather-map/pmtiles/${resolvedTenantId}/${metric}/${date}.pmtiles`;
+  }, [metric, date, resolvedTenantId]);
 
   useEffect(() => {
-    if (!viewer) return;
+    if (!viewer || !pmtilesUrl || !CesiumLib) return;
 
-    const provider = new (Cesium as any).UrlTemplateImageryProvider({ url });
-    const layer = viewer.imageryLayers.addImageryProvider(provider);
-    layer.alpha = opacity;
+    let layer: any = null;
+
+    (async () => {
+      try {
+        // Use Cesium's PMTiles support via createTileMapServiceImageryProvider
+        // PMTiles implements the Tile Map Service specification
+        const provider = await CesiumLib.createTileMapServiceImageryProvider({
+          url: pmtilesUrl,
+          minimumLevel: 10,
+          maximumLevel: 15,
+        });
+
+        layer = viewer.imageryLayers.addImageryProvider(provider);
+        layer.alpha = opacity;
+      } catch (err) {
+        console.error('[WeatherMap] PMTiles layer failed:', err);
+      }
+    })();
 
     return () => {
-      viewer.imageryLayers.remove(layer);
+      if (layer) {
+        viewer.imageryLayers.remove(layer);
+      }
     };
-  }, [viewer, url, opacity]);
+  }, [viewer, pmtilesUrl, opacity, CesiumLib]);
+
+  // Show nothing if no date is selected
+  if (!date || !pmtilesUrl) return null;
 
   return null;
 };

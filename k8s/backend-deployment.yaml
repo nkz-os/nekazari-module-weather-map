@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
       - name: backend
-        image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:e73c71d9723bbf43cc38e0ddc7d11cd3c3580659dfa0912ffdcd75457461f813
+        image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:d7b7e0aa453b7ddc045f88030ed4593a9aa67f34b683ee240a2f5ba2ae74a7b8
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
@@ -39,7 +39,6 @@ spec:
           valueFrom:
             secretKeyRef:
               name: minio-secret
-              key: secret-key
               key: secret-key
         - name: MINIO_BUCKET
           value: "nekazari-weather-map"

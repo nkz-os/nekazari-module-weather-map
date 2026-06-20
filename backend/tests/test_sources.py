@@ -11,7 +11,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from app.sources import fetch_tenant_parcels, tms_tile_to_bbox
+from app.sources import (
+    _haversine,
+    fetch_tenant_parcels,
+    find_nearby_sensors,
+    tms_tile_to_bbox,
+    upsert_agri_parcel_zones,
+)
 from app.minio_io import cog_path
 
 
@@ -232,3 +238,175 @@ class TestCogPathFormat:
         """Verify cog path matches expected pattern."""
         path = cog_path("tenant1", "temperature_avg", "2026-06-10", 14, 8557, 5302)
         assert path == "cogs/tenant1/temperature_avg/2026-06-10/14/8557/5302.tif"
+
+
+# ======================================================================
+# Haversine
+# ======================================================================
+
+
+class TestHaversine:
+    """Tests for _haversine distance calculation."""
+
+    def test_zero_distance(self):
+        """Same point yields 0.0."""
+        assert _haversine(0, 0, 0, 0) == 0.0
+
+    def test_known_distance(self):
+        """Madrid (40.4168, -3.7038) to Barcelona (41.3851, 2.1734) ~ 505 km."""
+        d = _haversine(-3.7038, 40.4168, 2.1734, 41.3851)
+        assert 500_000 < d < 510_000
+
+    def test_antipodal_equator(self):
+        """Antipodal points at equator ~ 20 037 km."""
+        d = _haversine(0, 0.0, 180.0, 0.0)
+        assert 20_000_000 < d < 20_100_000
+
+    def test_small_distance(self):
+        """~1 m offset at equator (1 m ~ 0.000008983° lon)."""
+        d = _haversine(0, 0, 0.000008983, 0)
+        assert 0.8 < d < 1.2
+
+
+# ======================================================================
+# upsert_agri_parcel_zones
+# ======================================================================
+
+
+class TestUpsertAgriParcelZones:
+    """Tests for upsert_agri_parcel_zones — mocked SDK calls."""
+
+    @pytest.mark.asyncio
+    async def test_upsert_agri_parcel_zones_empty_list(self):
+        """Empty zone list → no SDK instantiation."""
+        with patch("app.sources.OrionClient") as mock_orion_cls:
+            await upsert_agri_parcel_zones("test-tenant", [])
+        mock_orion_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_upsert_agri_parcel_zones_success(self):
+        """Mock success → verifies upsert_entities_batch called with zones."""
+        zones = [
+            {
+                "id": "urn:ngsi-ld:AgriParcelZone:zone-1",
+                "type": "AgriParcelZone",
+                "location": {"type": "Point", "coordinates": [-1.65, 42.8]},
+                "zoneType": "management",
+            },
+        ]
+
+        mock_orion = AsyncMock()
+        mock_orion.upsert_entities_batch = AsyncMock(
+            return_value={"upserted": 1, "errors": []},
+        )
+        mock_orion.close = AsyncMock()
+
+        with patch("app.sources.OrionClient", return_value=mock_orion):
+            await upsert_agri_parcel_zones("test-tenant", zones)
+
+        mock_orion.upsert_entities_batch.assert_called_once_with(zones)
+        mock_orion.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_upsert_agri_parcel_zones_http_error(self):
+        """SDK raises → logs error, does not raise."""
+        zones = [
+            {
+                "id": "urn:ngsi-ld:AgriParcelZone:zone-2",
+                "type": "AgriParcelZone",
+                "location": {"type": "Point", "coordinates": [-1.65, 42.8]},
+                "zoneType": "management",
+            },
+        ]
+
+        mock_orion = AsyncMock()
+        mock_orion.upsert_entities_batch = AsyncMock(
+            side_effect=ValueError("orion error"),
+        )
+        mock_orion.close = AsyncMock()
+
+        with patch("app.sources.OrionClient", return_value=mock_orion):
+            await upsert_agri_parcel_zones("test-tenant", zones)
+
+        mock_orion.upsert_entities_batch.assert_called_once()
+        mock_orion.close.assert_called_once()
+
+
+# ======================================================================
+# find_nearby_sensors
+# ======================================================================
+
+
+class TestFindNearbySensors:
+    """Tests for find_nearby_sensors — mocked SDK calls."""
+
+    @staticmethod
+    def _mock_orion_client(response_data, side_effect=None):
+        """Create a patched OrionClient returning *response_data*."""
+        mock_orion = AsyncMock()
+        mock_orion.query_entities = AsyncMock(return_value=response_data)
+        if side_effect:
+            mock_orion.query_entities = AsyncMock(side_effect=side_effect)
+        mock_orion.close = AsyncMock()
+        return patch("app.sources.OrionClient", return_value=mock_orion)
+
+    @pytest.mark.asyncio
+    async def test_find_nearby_sensors_no_devices(self):
+        """Device query returns empty → zones returned unchanged (no sensor_nearby)."""
+        zones = [
+            {
+                "id": "urn:ngsi-ld:AgriParcelZone:z1",
+                "location": {"type": "Point", "coordinates": [-1.65, 42.8]},
+            },
+        ]
+
+        with self._mock_orion_client([]):
+            result = await find_nearby_sensors("test-tenant", "parcel-1", zones)
+
+        assert len(result) == 1
+        assert "sensor_nearby" not in result[0]
+        assert "sensor_distance_m" not in result[0]
+        assert result[0]["id"] == "urn:ngsi-ld:AgriParcelZone:z1"
+
+    @pytest.mark.asyncio
+    async def test_find_nearby_sensors_devices_found(self):
+        """Device query returns 1 device → zones enriched with sensor_nearby + sensor_distance_m."""
+        zones = [
+            {
+                "id": "urn:ngsi-ld:AgriParcelZone:z1",
+                "location": {"type": "Point", "coordinates": [-1.65, 42.8]},
+            },
+        ]
+        devices = [
+            {
+                "id": "urn:ngsi-ld:Device:sensor-1",
+                "location": {"type": "Point", "coordinates": [-1.65, 42.8001]},
+                "name": "Soil Moisture Sensor A",
+            },
+        ]
+
+        with self._mock_orion_client(devices):
+            result = await find_nearby_sensors("test-tenant", "parcel-1", zones)
+
+        assert len(result) == 1
+        assert result[0]["sensor_nearby"] == "urn:ngsi-ld:Device:sensor-1"
+        assert isinstance(result[0]["sensor_distance_m"], float)
+        assert result[0]["sensor_distance_m"] > 0
+
+    @pytest.mark.asyncio
+    async def test_find_nearby_sensors_fetch_fails(self):
+        """Device query raises → zones returned unchanged."""
+        zones = [
+            {
+                "id": "urn:ngsi-ld:AgriParcelZone:z1",
+                "location": {"type": "Point", "coordinates": [-1.65, 42.8]},
+            },
+        ]
+
+        with self._mock_orion_client([], side_effect=ValueError("orion error")):
+            result = await find_nearby_sensors("test-tenant", "parcel-1", zones)
+
+        assert len(result) == 1
+        assert "sensor_nearby" not in result[0]
+        assert "sensor_distance_m" not in result[0]
+        assert result[0]["id"] == "urn:ngsi-ld:AgriParcelZone:z1"

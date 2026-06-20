@@ -659,3 +659,11 @@ async def run_for_tenant(
             "Persisted AgriParcelRecord for parcel %s / tenant %s",
             parcel_id, tenant_id,
         )
+
+    # ── Generate PMTiles from the newly computed COGs ────────────────
+    try:
+        from app.pmtiles_generator import generate_all_pmtiles as _gen_pmtiles
+        pmtiles_urls = _gen_pmtiles(tenant_id, today, zoom)
+        logger.info("PMTiles generated for tenant '%s': %s", tenant_id, pmtiles_urls)
+    except Exception as exc:
+        logger.error("PMTiles generation failed for tenant '%s': %s", tenant_id, exc)

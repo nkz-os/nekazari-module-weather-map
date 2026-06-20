@@ -416,3 +416,179 @@ def get_texture_defaults() -> dict:
         ``sand_pct``, ``silt_pct``, ``clay_pct``.
     """
     return {"sand_pct": 50.0, "silt_pct": 30.0, "clay_pct": 20.0}
+
+
+# ---------------------------------------------------------------------------
+# 9. Topographic zoning (elevation bands × aspect sectors)
+# ---------------------------------------------------------------------------
+
+
+_SECTOR_NAMES = {0: "flat", 1: "N", 2: "NE", 3: "E", 4: "SE",
+                 5: "S", 6: "SW", 7: "W", 8: "NW"}
+
+
+def discretize_aspect(
+    aspect_deg: np.ndarray,
+    slope_deg: np.ndarray,
+    flat_threshold: float = 2.0,
+) -> np.ndarray:
+    """Discretise aspect into 9 sectors.
+
+    Pixels with slope < *flat_threshold* are classified as flat (sector 0)
+    regardless of their aspect value.  All other pixels are binned into 8
+    wind-direction sectors:
+
+    * 0 — flat
+    * 1 — N    (337.5–360 / 0–22.5)
+    * 2 — NE   (22.5–67.5)
+    * 3 — E    (67.5–112.5)
+    * 4 — SE   (112.5–157.5)
+    * 5 — S    (157.5–202.5)
+    * 6 — SW   (202.5–247.5)
+    * 7 — W    (247.5–292.5)
+    * 8 — NW   (292.5–337.5)
+
+    Parameters
+    ----------
+    aspect_deg : np.ndarray
+        2-D array of aspect angles (degrees, 0 = North, clockwise).
+    slope_deg : np.ndarray
+        2-D array of slope angles (degrees).
+    flat_threshold : float, optional
+        Slopes below this value are considered flat (default 2.0).
+
+    Returns
+    -------
+    np.ndarray
+        Integer array with sector codes 0–8, same shape as inputs.
+    """
+    sectors = np.zeros_like(aspect_deg, dtype=np.int32)
+    aspect = aspect_deg % 360.0
+
+    # Flat check — slope below threshold
+    flat_mask = slope_deg < flat_threshold
+    sectors[flat_mask] = 0
+
+    not_flat = ~flat_mask
+
+    sectors[not_flat & ((aspect >= 337.5) | (aspect < 22.5))] = 1   # N
+    sectors[not_flat & ((aspect >= 22.5) & (aspect < 67.5))] = 2    # NE
+    sectors[not_flat & ((aspect >= 67.5) & (aspect < 112.5))] = 3   # E
+    sectors[not_flat & ((aspect >= 112.5) & (aspect < 157.5))] = 4  # SE
+    sectors[not_flat & ((aspect >= 157.5) & (aspect < 202.5))] = 5  # S
+    sectors[not_flat & ((aspect >= 202.5) & (aspect < 247.5))] = 6  # SW
+    sectors[not_flat & ((aspect >= 247.5) & (aspect < 292.5))] = 7  # W
+    sectors[not_flat & ((aspect >= 292.5) & (aspect < 337.5))] = 8  # NW
+
+    return sectors
+
+
+def compute_zones(
+    elevation_2d: np.ndarray,
+    aspect_2d: np.ndarray,
+    slope_2d: np.ndarray,
+    min_pixels: int = 50,
+    elevation_band_m: float = 50.0,
+) -> tuple[list[dict], np.ndarray]:
+    """Group pixels into contiguous topographic zones.
+
+    Each zone is a connected region sharing the same elevation band and
+    aspect sector.  Zone descriptors are returned *without* an ``id`` key
+    — the caller assigns stable IDs later.
+
+    Parameters
+    ----------
+    elevation_2d : np.ndarray
+        2-D array of pixel elevations (m).
+    aspect_2d : np.ndarray
+        2-D array of aspect angles (degrees).
+    slope_2d : np.ndarray
+        2-D array of slope angles (degrees).
+    min_pixels : int, optional
+        Minimum number of pixels for a zone (default 50).
+    elevation_band_m : float, optional
+        Elevation band height (default 50.0 m).
+
+    Returns
+    -------
+    tuple[list[dict], np.ndarray]
+        ``(zones, zone_labels)`` where *zones* is a list of descriptors
+        (``elevationMean``, ``elevationMin``, ``elevationMax``,
+        ``aspectSector``, ``pixelCount``) and *zone_labels* is an int32
+        array of the same shape, 0 = background.
+
+        Zone key = (elevation_band, sector) — tuple encoding avoids collision
+        across different elevation/aspect combinations.
+    """
+    import scipy.ndimage  # deferred — only needed when computing zones
+
+    # Handle empty input
+    if elevation_2d.size == 0 or elevation_2d.shape[0] == 0:
+        return [], np.array([], dtype=np.int32)
+
+    # 1. Floor elevation to bands
+    elev_bands = np.floor(elevation_2d / elevation_band_m).astype(np.int32)
+
+    # 2. Discretise aspect sectors
+    sectors = discretize_aspect(aspect_2d, slope_2d)
+
+    # 3. Combine into tuple encoding (avoids collision across band/sector combos)
+    combo = np.stack([
+        elev_bands.astype(np.int32),
+        sectors.astype(np.int32),
+    ], axis=-1)
+
+    zone_labels = np.zeros_like(elevation_2d, dtype=np.int32)
+    zones: list[dict] = []
+    next_label = 1
+
+    unique_combos = np.unique(combo.reshape(-1, 2), axis=0)
+    for band_val, sector_val in unique_combos:
+        if sector_val == 0 and band_val == 0:
+            continue  # skip background
+        mask = (combo[..., 0] == band_val) & (combo[..., 1] == sector_val)
+        labeled, n_features = scipy.ndimage.label(mask)
+
+        for feature_id in range(1, n_features + 1):
+            feature_mask = labeled == feature_id
+            pixel_count = int(np.count_nonzero(feature_mask))
+
+            if pixel_count < min_pixels:
+                continue
+
+            zone_labels[feature_mask] = next_label
+            zone_elev = elevation_2d[feature_mask]
+
+            zones.append({
+                "elevationMean": float(np.mean(zone_elev)),
+                "elevationMin": float(np.min(zone_elev)),
+                "elevationMax": float(np.max(zone_elev)),
+                "aspectSector": _dominant_sector(sectors[feature_mask]),
+                "pixelCount": pixel_count,
+            })
+            next_label += 1
+
+    return zones, zone_labels
+
+
+def _dominant_sector(sector_labels: np.ndarray) -> str:
+    """Return the most frequent aspect sector label.
+
+    Parameters
+    ----------
+    sector_labels : np.ndarray
+        1-D array of integer sector labels (0–8) as produced by
+        :func:`discretize_aspect`.
+
+    Returns
+    -------
+    str
+        One of ``flat``, ``N``, ``NE``, ``E``, ``SE``, ``S``, ``SW``,
+        ``W``, ``NW``.
+    """
+    if len(sector_labels) == 0:
+        return "flat"
+
+    unique, counts = np.unique(sector_labels, return_counts=True)
+    most_common = unique[np.argmax(counts)]
+    return _SECTOR_NAMES[int(most_common)]
