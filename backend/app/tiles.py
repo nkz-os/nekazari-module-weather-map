@@ -6,14 +6,14 @@ eliminating the need for this on-demand tile renderer.
 Will be removed in a future version once PMTiles are stable.
 """
 
+from __future__ import annotations
+
 import warnings
 warnings.warn(
     "tiles.py is deprecated. Use PMTiles from MinIO instead (see pmtiles_generator.py).",
     DeprecationWarning,
     stacklevel=2,
 )
-
-from __future__ import annotations
 
 import io
 import logging
