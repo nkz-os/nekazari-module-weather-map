@@ -11,6 +11,9 @@ from app.downscaler import (
     compute_soil_moisture,
     saxton_rawls_ptf,
     get_texture_defaults,
+    discretize_aspect,
+    compute_zones,
+    _dominant_sector,
 )
 
 
@@ -416,3 +419,122 @@ class TestTextureDefaults:
         """Texture percentages sum to 100."""
         result = get_texture_defaults()
         assert abs(result["sand_pct"] + result["silt_pct"] + result["clay_pct"] - 100.0) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# 9. Topographic zoning (elevation bands × aspect sectors)
+# ---------------------------------------------------------------------------
+
+
+class TestDiscretizeAspect:
+    """Aspect discretisation into 9 sectors."""
+
+    def test_flat_pixel_returns_zero(self):
+        """Slope < flat_threshold → sector 0 (flat) regardless of aspect."""
+        aspect = np.array([[45.0, 180.0], [270.0, 350.0]])
+        slope = np.array([[1.0, 0.5], [0.0, 1.9]])
+        result = discretize_aspect(aspect, slope, flat_threshold=2.0)
+        assert np.all(result == 0)
+
+    def test_north(self):
+        """Aspect around 0° → sector 1 (N)."""
+        result = discretize_aspect(
+            np.array([[0.0, 359.0], [10.0, 350.0]]),
+            np.full((2, 2), 10.0),
+        )
+        assert np.all(result == 1)
+
+    def test_south(self):
+        """Aspect around 180° → sector 5 (S)."""
+        result = discretize_aspect(
+            np.array([[160.0, 180.0], [200.0, 180.0]]),
+            np.full((2, 2), 10.0),
+        )
+        assert np.all(result == 5)
+
+    def test_aspect_boundaries(self):
+        """Sector boundaries handled correctly."""
+        slope = np.full(8, 5.0)
+        # Values just below boundary → lower sector; at boundary → upper sector
+        # Boundary at 22.5 → 22.4 is N(1), 22.5 is NE(2)
+        aspects = np.array([22.4, 22.5, 67.4, 67.5])
+        expected = [1, 2, 2, 3]  # N, NE, NE, E
+        result = discretize_aspect(aspects, np.full(4, 5.0))
+        assert np.all(result == expected)
+
+
+class TestComputeZones:
+    """Topographic zoning from elevation × aspect sectors."""
+
+    def test_single_flat_parcel(self):
+        """All pixels same elevation → 1 zone."""
+        shape = (8, 8)
+        elev = np.full(shape, 100.0)
+        aspect = np.full(shape, 0.0)
+        slope = np.full(shape, 0.0)
+        zones, labels = compute_zones(elev, aspect, slope, min_pixels=1, elevation_band_m=50.0)
+        assert labels.shape == shape
+        assert len(zones) == 1
+        assert zones[0]["pixelCount"] == 64
+        assert np.all(labels > 0)
+
+    def test_two_elevation_bands(self):
+        """Two bands → 2 zones."""
+        shape = (4, 4)
+        elev = np.full(shape, 30.0)
+        elev[:2, :] = 80.0
+        aspect = np.full(shape, 180.0)
+        slope = np.full(shape, 5.0)
+        zones, labels = compute_zones(elev, aspect, slope, min_pixels=1, elevation_band_m=50.0)
+        assert labels.shape == shape
+        assert len(zones) == 2
+        assert labels[0, 0] != labels[2, 0]
+        assert np.all(labels > 0)
+
+    def test_two_separate_hills_same_elevation(self):
+        """Same elevation/aspect but separate → 2 distinct zone labels."""
+        shape = (10, 10)
+        elev = np.full(shape, 10.0)
+        aspect = np.full(shape, 180.0)
+        slope = np.full(shape, 5.0)
+        elev[1:4, 1:4] = 120.0
+        elev[6:9, 6:9] = 120.0
+        zones, labels = compute_zones(elev, aspect, slope, min_pixels=1, elevation_band_m=50.0)
+        assert labels.shape == shape
+        hill_1 = labels[2, 2]
+        hill_2 = labels[7, 7]
+        assert hill_1 > 0
+        assert hill_2 > 0
+        assert hill_1 != hill_2
+
+    def test_ignores_small_clusters(self):
+        """Clusters < min_pixels dropped (label = 0)."""
+        shape = (10, 10)
+        elev = np.full(shape, 10.0)
+        aspect = np.full(shape, 0.0)
+        slope = np.full(shape, 5.0)
+        # 2-pixel cluster at 120 m
+        elev[5, 5] = 120.0
+        elev[5, 6] = 120.0
+        zones, labels = compute_zones(elev, aspect, slope, min_pixels=5, elevation_band_m=50.0)
+        assert labels[5, 5] == 0
+        assert labels[5, 6] == 0
+
+    def test_flat_zone_returns_flat_aspectSector(self):
+        """Flat terrain (slope=0, aspect=0) → aspectSector is 'flat'."""
+        shape = (10, 10)
+        elev = np.full(shape, 100.0)
+        aspect = np.full(shape, 0.0)
+        slope = np.full(shape, 0.0)
+        zones, labels = compute_zones(elev, aspect, slope, min_pixels=1, elevation_band_m=50.0)
+        assert len(zones) == 1
+        assert zones[0]["aspectSector"] == "flat"
+
+    def test_empty_parcel(self):
+        """Empty input → ([], empty array)."""
+        elev = np.empty((0, 5))
+        aspect = np.empty((0, 5))
+        slope = np.empty((0, 5))
+        zones, labels = compute_zones(elev, aspect, slope)
+        assert zones == []
+        assert labels.shape == (0,)

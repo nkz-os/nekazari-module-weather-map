@@ -19,12 +19,21 @@ class Settings:
     elevation_service_url: str = os.getenv("ELEVATION_SERVICE_URL", "http://elevation-api-service:80")
     weather_api_url: str = os.getenv("WEATHER_API_URL", "http://weather-api-service:8000")
     orion_url: str = os.getenv("ORION_URL", "http://orion-ld-service:1026")
+    context_url: str = os.getenv("CONTEXT_URL", "https://nekazari.robotika.cloud/ngsi-ld-context.json")
+    postgres_url: str = os.getenv("POSTGRES_URL", "")
     
     cog_interval_days: int = int(os.getenv("COG_INTERVAL_DAYS", "5"))
     cog_retention_periods: int = int(os.getenv("COG_RETENTION_PERIODS", "3"))
     
     redis_url: str = os.getenv("REDIS_URL", "redis://redis-service:6379/0")
     dem_cache_ttl_days: int = int(os.getenv("DEM_CACHE_TTL_DAYS", "30"))
+
+    # Zone generation
+    zones_min_pixels: int = int(os.getenv("ZONES_MIN_PIXELS", "50"))
+    zones_max_count: int = int(os.getenv("ZONES_MAX_COUNT", "20"))
+    zones_elevation_band_m: float = float(os.getenv("ZONES_ELEVATION_BAND_M", "50.0"))
+    zones_cog_ttl_days: int = int(os.getenv("ZONES_COG_TTL_DAYS", "30"))
+    monitored_tenants: str = os.getenv("MONITORED_TENANTS", "")
     
     auth_disabled: bool = os.getenv("AUTH_DISABLED", "false").lower() == "true"
     internal_service_secret: str = os.getenv("INTERNAL_SERVICE_SECRET", "")

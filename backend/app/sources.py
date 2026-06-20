@@ -220,6 +220,7 @@ async def fetch_tenant_parcels(tenant_id: str) -> list[dict[str, Any]]:
         "Fiware-Service": tenant_id,
         "Fiware-ServicePath": "/",
         "Content-Type": "application/json",
+        "Link": f'<{settings.context_url}>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
     }
     payload: dict[str, Any] = {
         "type": "AgriParcel",
@@ -319,3 +320,220 @@ async def fetch_agri_parcel(
         return None
     finally:
         await orion.close()
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+
+def _haversine(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """Compute great-circle distance in metres between two WGS-84 points.
+
+    Uses the standard haversine formula with Earth radius R = 6,371,000 m.
+    """
+    R = 6_371_000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return float(R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+
+
+def _unwrap_location(location: Any) -> dict | None:
+    """Unwrap an NGSI-LD GeoProperty to a raw GeoJSON geometry dict.
+
+    Handles both the normalized format
+    ``{"type": "GeoProperty", "value": <GeoJSON>}`` and the simplified
+    ``keyValues`` format where the value *is* the GeoJSON geometry.
+
+    Returns ``None`` if *location* cannot be interpreted as a GeoJSON
+    geometry (e.g. it is ``None`` or not a dict).
+    """
+    if isinstance(location, dict) and location.get("type") == "GeoProperty":
+        return location.get("value")
+    if isinstance(location, dict) and "type" in location and "coordinates" in location:
+        return location  # already raw GeoJSON
+    return None
+
+
+def _centroid(geometry: dict) -> tuple[float, float] | None:
+    """Return ``(lon, lat)`` centroid from a GeoJSON geometry dict.
+
+    Supports ``Point``, ``Polygon`` and ``MultiPolygon``.
+    For ``Polygon`` / ``MultiPolygon`` the centroid is the arithmetic
+    mean of the exterior-ring vertex coordinates.
+    """
+    if not isinstance(geometry, dict):
+        return None
+    geom_type = geometry.get("type")
+    coords = geometry.get("coordinates")
+    if not coords:
+        return None
+    if geom_type == "Point":
+        return (float(coords[0]), float(coords[1]))
+    if geom_type == "Polygon":
+        ring = coords[0]
+        lon = sum(float(c[0]) for c in ring) / len(ring)
+        lat = sum(float(c[1]) for c in ring) / len(ring)
+        return (lon, lat)
+    if geom_type == "MultiPolygon":
+        lons, lats = [], []
+        for polygon in coords:
+            ring = polygon[0]
+            lons.extend(float(c[0]) for c in ring)
+            lats.extend(float(c[1]) for c in ring)
+        return (sum(lons) / len(lons), sum(lats) / len(lats))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Zone helpers
+# ---------------------------------------------------------------------------
+
+
+async def upsert_agri_parcel_zones(tenant_id: str, zones: list[dict]) -> None:
+    """Batch upsert ``AgriParcelZone`` entities via Orion-LD SDK.
+
+    Uses ``OrionClient.upsert_entities_batch()`` to create or replace all
+    zone entities in a single request.  Attributes on existing entities are
+    updated; new entities are created.
+
+    Parameters
+    ----------
+    tenant_id : str
+        The tenant / FIWARE service.
+    zones : list[dict]
+        NGSI-LD entity dicts (from ``build_agri_parcel_zone``).
+    """
+    if not zones:
+        logger.info(
+            "upsert_agri_parcel_zones(tenant=%s): no zones to upsert", tenant_id,
+        )
+        return
+
+    orion = OrionClient(tenant_id)
+    try:
+        result = await orion.upsert_entities_batch(zones)
+        logger.info(
+            "upsert_agri_parcel_zones(tenant=%s): upserted %d zone(s)",
+            tenant_id, result.get("upserted", 0),
+        )
+        if result.get("errors"):
+            logger.warning(
+                "upsert_agri_parcel_zones(tenant=%s): %d error(s)",
+                tenant_id, len(result["errors"]),
+            )
+    except Exception:
+        logger.exception(
+            "upsert_agri_parcel_zones(tenant=%s) failed for %d zone(s)",
+            tenant_id, len(zones),
+        )
+    finally:
+        await orion.close()
+
+
+async def find_nearby_sensors(
+    tenant_id: str,
+    parcel_id: str,
+    zones: list[dict],
+) -> list[dict]:
+    """Enrich zone descriptors with the nearest IoT sensor.
+
+    Queries Orion-LD for ``Device`` entities associated with the tenant,
+    then for each zone finds the closest device by haversine distance.
+    Adds ``sensor_nearby`` (device URN) and ``sensor_distance_m``
+    (distance in metres, rounded to 1 decimal) to each zone dict.
+
+    Parameters
+    ----------
+    tenant_id : str
+        The tenant / FIWARE service.
+    parcel_id : str
+        The parcel identifier (for logging).
+    zones : list[dict]
+        Zone descriptors (NGSI-LD entity dicts with a ``location``
+        attribute).
+
+    Returns
+    -------
+    list[dict]
+        Enriched zone dicts; original zones if no devices found.
+    """
+    if not zones:
+        return []
+
+    # Fetch all Device entities for this tenant via SDK
+    orion = OrionClient(tenant_id)
+    devices: list[dict[str, Any]] = []
+    try:
+        data = await orion.query_entities(
+            type="Device",
+            attrs="location,name",
+            options="keyValues",
+        )
+        if isinstance(data, list):
+            for entity in data:
+                raw_loc = entity.get("location")
+                loc = _unwrap_location(raw_loc)
+                if loc is None:
+                    continue
+                devices.append({
+                    "id": entity.get("id"),
+                    "location": loc,
+                })
+    except Exception:
+        logger.exception(
+            "find_nearby_sensors(tenant=%s, parcel=%s): failed to fetch devices",
+            tenant_id, parcel_id,
+        )
+        return list(zones)  # return unenriched
+    finally:
+        await orion.close()
+
+    if not devices:
+        logger.info(
+            "find_nearby_sensors(tenant=%s, parcel=%s): no devices found",
+            tenant_id, parcel_id,
+        )
+        return list(zones)
+
+    # Enrich each zone with the nearest device
+    enriched: list[dict[str, Any]] = []
+    for zone in zones:
+        zone_copy = dict(zone)
+        raw_loc = zone_copy.get("location") or zone_copy.get("geometry")
+        loc = _unwrap_location(raw_loc)
+        if loc is None:
+            enriched.append(zone_copy)
+            continue
+
+        zone_centroid = _centroid(loc)
+        if zone_centroid is None:
+            enriched.append(zone_copy)
+            continue
+
+        zone_lon, zone_lat = zone_centroid
+        best_dist = float("inf")
+        best_sensor: str | None = None
+
+        for device in devices:
+            dev_centroid = _centroid(device["location"])
+            if dev_centroid is None:
+                continue
+            d = _haversine(zone_lon, zone_lat, dev_centroid[0], dev_centroid[1])
+            if d < best_dist:
+                best_dist = d
+                best_sensor = device["id"]
+
+        if best_sensor is not None:
+            zone_copy["sensor_nearby"] = best_sensor
+            zone_copy["sensor_distance_m"] = round(best_dist, 1)
+
+        enriched.append(zone_copy)
+
+    logger.info(
+        "find_nearby_sensors(tenant=%s, parcel=%s): enriched %d zone(s) with %d device(s)",
+        tenant_id, parcel_id, len(enriched), len(devices),
+    )
+    return enriched
