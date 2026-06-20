@@ -24,6 +24,8 @@ class Settings:
     
     cog_interval_days: int = int(os.getenv("COG_INTERVAL_DAYS", "5"))
     cog_retention_periods: int = int(os.getenv("COG_RETENTION_PERIODS", "3"))
+    pmtiles_min_zoom: int = int(os.getenv("PMTILES_MIN_ZOOM", "10"))
+    pmtiles_max_zoom: int = int(os.getenv("PMTILES_MAX_ZOOM", "15"))
     
     redis_url: str = os.getenv("REDIS_URL", "redis://redis-service:6379/0")
     dem_cache_ttl_days: int = int(os.getenv("DEM_CACHE_TTL_DAYS", "30"))

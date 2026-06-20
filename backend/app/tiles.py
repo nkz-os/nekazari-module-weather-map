@@ -1,4 +1,17 @@
-"""Tile server endpoint — reads precomputed COGs from MinIO and serves PNG tiles."""
+"""Tile server endpoint — reads precomputed COGs from MinIO and serves PNG tiles.
+
+DEPRECATED: Use PMTiles instead (see pmtiles_generator.py).
+Tile serving is being migrated to static PMTiles served directly from MinIO,
+eliminating the need for this on-demand tile renderer.
+Will be removed in a future version once PMTiles are stable.
+"""
+
+import warnings
+warnings.warn(
+    "tiles.py is deprecated. Use PMTiles from MinIO instead (see pmtiles_generator.py).",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from __future__ import annotations
 
