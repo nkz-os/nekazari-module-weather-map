@@ -17,7 +17,7 @@ spec:
         spec:
           containers:
           - name: generator
-            image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:33e9f77107223783f6b871ff8aa279e7881ca7315c11eb2425a20d482ea57d1b
+            image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:603df7230656fe6d4e1191e672d1d901703c374ef2e0b435aa1e3d6971840f99
             imagePullPolicy: Always
             command: ["python3", "/app/scripts/run_cog_generator.py"]
             env:
