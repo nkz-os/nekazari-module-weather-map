@@ -4,3 +4,10 @@ node_modules/
 dist/
 .env
 .venv/
+
+# Security: sensitive files
+*.pem
+*.key
+apikey_*.txt
+*.apikey
+*-secret*
