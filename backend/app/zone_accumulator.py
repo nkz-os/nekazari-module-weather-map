@@ -26,6 +26,7 @@ from app.sources import (
     upsert_agri_parcel_zones,
 )
 from app.cog_generator import _bbox_to_tiles, _parcel_geometry, _parcel_lonlat
+from app.tenants import discover_tenants
 
 logger = logging.getLogger(__name__)
 
@@ -246,9 +247,9 @@ async def run_for_tenant(tenant_id: str) -> None:
 async def main() -> None:
     """CLI entry point — called by the CronJob."""
     logging.basicConfig(level=logging.INFO)
-    tenants = [t.strip() for t in settings.monitored_tenants.split(",") if t.strip()]
+    tenants = discover_tenants("MONITORED_TENANTS")
     if not tenants:
-        logger.error("No tenants configured in MONITORED_TENANTS")
+        logger.error("zone-accumulator: no tenants to process")
         return
     for tenant_id in tenants:
         try:

@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.cog_generator import run_for_tenant
 from app.sources import fetch_tenant_parcels
+from app.tenants import discover_tenants
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,11 +39,10 @@ async def main() -> None:
     Reads tenant IDs from the ``COG_TENANTS`` environment variable
     (comma-separated).  If empty, logs a warning and exits.
     """
-    tenant_ids_str = os.getenv("COG_TENANTS", "")
-    if not tenant_ids_str:
-        logger.warning("COG_TENANTS env var is empty — no tenants to process")
+    tenant_ids = discover_tenants("COG_TENANTS")
+    if not tenant_ids:
+        logger.warning("cog-generator: no tenants to process")
         return
-    tenant_ids = [t.strip() for t in tenant_ids_str.split(",") if t.strip()]
 
     date_to = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     date_from = (
