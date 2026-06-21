@@ -47,6 +47,20 @@ spec:
               value: "true"
             - name: COG_INTERVAL_DAYS
               value: "5"
+            # Postgres for dynamic tenant discovery (mirrors weather-worker / db-init-job)
+            - name: POSTGRES_HOST
+              value: "postgresql-service"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: "nekazari"
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: password
             resources:
               requests:
                 cpu: "500m"
