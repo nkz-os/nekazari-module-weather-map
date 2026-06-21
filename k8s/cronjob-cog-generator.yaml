@@ -43,10 +43,28 @@ spec:
               value: "http://weather-api-service:8000"
             - name: ORION_URL
               value: "http://orion-ld-service:1026"
+            - name: ORION_LD_URL
+              value: "http://orion-ld-service:1026"
+            - name: CONTEXT_URL
+              value: "http://api-gateway-service:5000/ngsi-ld-context.json"
             - name: AUTH_DISABLED
               value: "true"
             - name: COG_INTERVAL_DAYS
               value: "5"
+            # Postgres for dynamic tenant discovery (mirrors weather-worker / db-init-job)
+            - name: POSTGRES_HOST
+              value: "postgresql-service"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: "nekazari"
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: password
             resources:
               requests:
                 cpu: "500m"
