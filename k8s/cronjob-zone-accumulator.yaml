@@ -18,7 +18,7 @@ spec:
         spec:
           containers:
           - name: zone-accumulator
-            image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:d7b7e0aa453b7ddc045f88030ed4593a9aa67f34b683ee240a2f5ba2ae74a7b8
+            image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:33ac0f5f30aad2385da6cde47a66e5c5bd7a02a6d1e70d79c63d8053c23748cf  # main c9c00be: flow-B dynamic tenants
             command: ["python3", "-m", "app.zone_accumulator"]
             env:
             - name: ORION_URL
