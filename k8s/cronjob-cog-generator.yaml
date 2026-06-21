@@ -43,6 +43,8 @@ spec:
               value: "http://weather-api-service:8000"
             - name: ORION_URL
               value: "http://orion-ld-service:1026"
+            - name: CONTEXT_URL
+              value: "http://api-gateway-service:5000/ngsi-ld-context.json"
             - name: AUTH_DISABLED
               value: "true"
             - name: COG_INTERVAL_DAYS

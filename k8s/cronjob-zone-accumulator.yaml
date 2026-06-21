@@ -24,7 +24,7 @@ spec:
             - name: ORION_URL
               value: "http://orion-ld-service:1026"
             - name: CONTEXT_URL
-              value: "https://nekazari.robotika.cloud/ngsi-ld-context.json"
+              value: "http://api-gateway-service:5000/ngsi-ld-context.json"
             - name: ELEVATION_SERVICE_URL
               value: "http://elevation-api-service:80"
             - name: WEATHER_API_URL
