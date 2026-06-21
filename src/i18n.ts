@@ -1,3 +1,4 @@
+import { i18n } from '@nekazari/sdk';
 import en from './locales/en.json';
 import es from './locales/es.json';
 import eu from './locales/eu.json';
@@ -5,16 +6,14 @@ import fr from './locales/fr.json';
 import pt from './locales/pt.json';
 import ca from './locales/ca.json';
 
-if (typeof window !== 'undefined') {
-  const nkzSdk = (window as any).__NKZ_SDK__;
-  if (nkzSdk?.i18n) {
-    nkzSdk.i18n.addResources('en', 'weather-map', en);
-    nkzSdk.i18n.addResources('es', 'weather-map', es);
-    nkzSdk.i18n.addResources('eu', 'weather-map', eu);
-    nkzSdk.i18n.addResources('fr', 'weather-map', fr);
-    nkzSdk.i18n.addResources('pt', 'weather-map', pt);
-    nkzSdk.i18n.addResources('ca', 'weather-map', ca);
-  } else {
-    console.warn('[weather-map] __NKZ_SDK__ bridge not available — i18n resources not registered');
+const NS = 'weather-map';
+
+function register(): void {
+  const add = i18n && typeof i18n.addResourceBundle === 'function' ? i18n.addResourceBundle : undefined;
+  if (!add) return;
+  for (const [lang, resources] of Object.entries({ en, es, eu, fr, pt, ca })) {
+    add.call(i18n, lang, NS, resources, true, true);
   }
 }
+
+register();
