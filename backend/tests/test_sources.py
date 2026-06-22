@@ -127,6 +127,23 @@ class TestFetchTenantParcels:
         assert "description" not in result[0]
 
     @pytest.mark.asyncio
+    async def test_query_body_is_ngsi_ld_query_object(self):
+        """POST body MUST be an NGSI-LD Query (type=Query, entities=[AgriParcel]);
+        a bare {"type": "AgriParcel"} is rejected by Orion with 400."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = []
+        mock_response.raise_for_status = MagicMock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.return_value = mock_response
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            await fetch_tenant_parcels("test-tenant")
+        _, kwargs = mock_client.post.call_args
+        body = kwargs["json"]
+        assert body["type"] == "Query"
+        assert {"type": "AgriParcel"} in body["entities"]
+
+    @pytest.mark.asyncio
     async def test_returns_parcels_with_description(self):
         """Includes description when present, omits name when absent."""
         response_data = [

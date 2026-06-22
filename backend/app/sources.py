@@ -222,8 +222,11 @@ async def fetch_tenant_parcels(tenant_id: str) -> list[dict[str, Any]]:
         "Content-Type": "application/json",
         "Link": f'<{settings.context_url}>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
     }
+    # NGSI-LD POST /entityOperations/query body MUST be a Query object with the
+    # type selector under `entities` — a bare {"type": "AgriParcel"} is a 400.
     payload: dict[str, Any] = {
-        "type": "AgriParcel",
+        "type": "Query",
+        "entities": [{"type": "AgriParcel"}],
         "attrs": ["location", "name", "description"],
     }
     params = {"options": "keyValues"}
