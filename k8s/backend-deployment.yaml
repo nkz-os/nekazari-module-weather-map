@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
       - name: backend
-        image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:33ac0f5f30aad2385da6cde47a66e5c5bd7a02a6d1e70d79c63d8053c23748cf  # main c9c00be: flow-B dynamic tenants
+        image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:e9a40dc9d78de34886cde082ee575ce631275376c8d377650de59486a224a510  # main fb75ce0: tenant_installed_modules discovery
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
