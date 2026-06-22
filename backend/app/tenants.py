@@ -1,8 +1,9 @@
 """Dynamic tenant discovery for weather-map scheduled jobs.
 
-Mirrors weather-worker's parcel_engine._get_active_tenants: env override →
-admin_platform.tenant_limits → empty (NEVER 'default'). Keeps weather-map
-multitenant and hermetic: callers loop per tenant with NGSILD-Tenant scoping.
+Resolution order: env override → tenant_installed_modules (active-tenant
+registry; tenant_limits was retired) → empty (NEVER 'default'). Keeps
+weather-map multitenant and hermetic: callers loop per tenant with
+NGSILD-Tenant scoping.
 """
 from __future__ import annotations
 
@@ -36,9 +37,12 @@ def _discover_from_db() -> list[str]:
         conn = psycopg2.connect(url)
         try:
             cur = conn.cursor()
+            # Canonical active-tenant registry (tenant_limits was retired).
+            # 'platform' is a system pseudo-tenant with no agronomic parcels.
             cur.execute(
-                "SELECT DISTINCT tenant_id FROM tenant_limits "
+                "SELECT DISTINCT tenant_id FROM tenant_installed_modules "
                 "WHERE tenant_id IS NOT NULL AND tenant_id != '' "
+                "AND tenant_id <> 'platform' "
                 "ORDER BY tenant_id"
             )
             rows = [r[0] for r in cur.fetchall()]
@@ -55,7 +59,7 @@ def discover_tenants(env_override_var: str) -> list[str]:
     """Active tenants for a scheduled job.
 
     1. env override (``env_override_var``, comma-separated) — escape hatch.
-    2. admin_platform.tenant_limits (all active tenants).
+    2. tenant_installed_modules (active-tenant registry).
     3. [] — skip and warn (never 'default').
     """
     override = os.getenv(env_override_var, "").strip()
@@ -63,7 +67,7 @@ def discover_tenants(env_override_var: str) -> list[str]:
         return [t.strip() for t in override.split(",") if t.strip()]
     found = _discover_from_db()
     if found:
-        logger.info("tenants: discovered %d from tenant_limits: %s", len(found), found)
+        logger.info("tenants: discovered %d from tenant_installed_modules: %s", len(found), found)
         return found
     logger.warning("tenants: none discovered (no override, empty DB) — skipping run")
     return []
