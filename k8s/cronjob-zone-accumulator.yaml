@@ -1,0 +1,65 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: zone-accumulator
+  namespace: nekazari
+  labels:
+    app: zone-accumulator
+    app.kubernetes.io/name: weather-map
+    app.kubernetes.io/component: zone-accumulator
+spec:
+  schedule: "0 2 * * *"   # daily at 02:00 UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: zone-accumulator
+            image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:60e3d0d204ff1fdb9017a97609565b7cd60aa2b89a9687b389900ade5a73b403  # main fb75ce0: tenant_installed_modules discovery
+            command: ["python3", "-m", "app.zone_accumulator"]
+            env:
+            - name: ORION_URL
+              value: "http://orion-ld-service:1026"
+            - name: ORION_LD_URL
+              value: "http://orion-ld-service:1026"
+            - name: CONTEXT_URL
+              value: "http://api-gateway-service:5000/ngsi-ld-context.json"
+            - name: ELEVATION_SERVICE_URL
+              value: "http://elevation-api-service:80"
+            - name: WEATHER_API_URL
+              value: "http://weather-api-service:8000"
+            - name: MINIO_ENDPOINT
+              value: "minio-service:9000"
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secret
+                  key: access-key
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secret
+                  key: secret-key
+            - name: MINIO_BUCKET
+              value: "nekazari-weather-map"
+            - name: AUTH_DISABLED
+              value: "true"
+            # Postgres for dynamic tenant discovery (mirrors weather-worker / db-init-job)
+            - name: POSTGRES_HOST
+              value: "postgresql-service"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: "nekazari"
+            - name: POSTGRES_USER
+              value: "postgres"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: password
+            # MONITORED_TENANTS intentionally unset → dynamic discovery via discover_tenants()
+          restartPolicy: OnFailure

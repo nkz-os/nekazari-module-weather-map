@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weather-map-backend
+  namespace: nekazari
+  labels:
+    app.kubernetes.io/name: weather-map
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weather-map-backend
+  template:
+    metadata:
+      labels:
+        app: weather-map-backend
+        app.kubernetes.io/name: weather-map
+        app.kubernetes.io/component: backend
+    spec:
+      containers:
+      - name: backend
+        image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:60e3d0d204ff1fdb9017a97609565b7cd60aa2b89a9687b389900ade5a73b403  # main fb75ce0: tenant_installed_modules discovery
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: PORT
+          value: "8080"
+        - name: MINIO_ENDPOINT
+          value: "minio-service:9000"
+        - name: MINIO_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-secret
+              key: access-key
+        - name: MINIO_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-secret
+              key: secret-key
+        - name: MINIO_BUCKET
+          value: "nekazari-weather-map"
+        - name: ELEVATION_SERVICE_URL
+          value: "http://elevation-api-service:80"
+        - name: WEATHER_API_URL
+          value: "http://weather-api-service:8000"
+        - name: ORION_URL
+          value: "http://orion-ld-service:1026"
+        - name: REDIS_URL
+          value: "redis://redis-service:6379/0"
+        - name: AUTH_DISABLED
+          value: "false"
+        - name: COG_INTERVAL_DAYS
+          value: "5"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weather-map-backend
+  namespace: nekazari
+  labels:
+    app.kubernetes.io/name: weather-map
+    app.kubernetes.io/component: backend
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  selector:
+    app: weather-map-backend
