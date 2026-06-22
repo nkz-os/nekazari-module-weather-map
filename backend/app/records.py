@@ -103,7 +103,9 @@ def build_agri_parcel_zone(
     entityOperations/upsert each time zonal stats are recomputed.
     """
     parcel_short = _parcel_short(parcel_id)
-    zone_id = zone.get("zone_id", "unknown")
+    # zone_accumulator builds the zone dict with key "id"; accept both so each
+    # zone gets a DISTINCT entity id (else all collapse to ...:unknown).
+    zone_id = zone.get("zone_id") or zone.get("id") or "unknown"
     centroid = _geometry_centroid(geometry)
 
     entity: dict[str, Any] = {
