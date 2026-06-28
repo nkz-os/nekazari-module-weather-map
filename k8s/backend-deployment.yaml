@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
       - name: backend
-        image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:60e3d0d204ff1fdb9017a97609565b7cd60aa2b89a9687b389900ade5a73b403  # main fb75ce0: tenant_installed_modules discovery
+        image: ghcr.io/nkz-os/nekazari-module-weather-map@sha256:7bb696ae1885bbc1a552e600076af46b3775525c465cbc4b893b727a07d53db1  # main a0551d7: bump nkz-platform-sdk to >=0.6.2
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
