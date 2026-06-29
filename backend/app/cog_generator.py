@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import rasterio
+from nkz_platform_sdk.gis.terrain import aspect_degrees, slope_degrees
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
 
@@ -267,41 +268,10 @@ async def generate_cog_for_tile(
         return None
 
     # ------------------------------------------------------------------
-    # 2. Slope & aspect (Horn 1981)
+    # 2. Slope & aspect (Horn 1981 — nkz_platform_sdk.gis.terrain)
     # ------------------------------------------------------------------
-    dzdx = np.zeros_like(elevations)
-    dzdy = np.zeros_like(elevations)
-    if rows > 2 and cols > 2:
-        dzdx[1:-1, 1:-1] = (
-            (
-                elevations[:-2, 2:]
-                + 2 * elevations[1:-1, 2:]
-                + elevations[2:, 2:]
-            )
-            - (
-                elevations[:-2, :-2]
-                + 2 * elevations[1:-1, :-2]
-                + elevations[2:, :-2]
-            )
-        ) / (8 * pixel_size_deg * 111320)
-        dzdy[1:-1, 1:-1] = (
-            (
-                elevations[2:, :-2]
-                + 2 * elevations[2:, 1:-1]
-                + elevations[2:, 2:]
-            )
-            - (
-                elevations[:-2, :-2]
-                + 2 * elevations[:-2, 1:-1]
-                + elevations[:-2, 2:]
-            )
-        ) / (8 * pixel_size_deg * 111320)
-
-    slope = np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2)))
-    aspect = np.degrees(np.arctan2(-dzdx, dzdy))
-    aspect = np.where(aspect < 0, aspect + 360, aspect)
-    np.nan_to_num(slope, nan=0.0, copy=False)
-    np.nan_to_num(aspect, nan=0.0, copy=False)
+    slope = slope_degrees(elevations, pixel_size_deg)
+    aspect = aspect_degrees(elevations, pixel_size_deg)
 
     # ------------------------------------------------------------------
     # 3. Fetch station weather
