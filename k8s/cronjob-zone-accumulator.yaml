@@ -47,6 +47,11 @@ spec:
               value: "nekazari-weather-map"
             - name: AUTH_DISABLED
               value: "true"
+            - name: INTERNAL_SERVICE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: internal-service-secret
+                  key: INTERNAL_SERVICE_SECRET
             # Postgres for dynamic tenant discovery (mirrors weather-worker / db-init-job)
             - name: POSTGRES_HOST
               value: "postgresql-service"

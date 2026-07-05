@@ -6,10 +6,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
-from fastapi import APIRouter, HTTPException, Query
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query
 from nkz_platform_sdk import OrionClient
 
+from app.auth import require_tenant
 from app.config import settings
+from app.sources import fetch_agri_parcel
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/weather-map", tags=["zones"])
@@ -17,20 +20,24 @@ router = APIRouter(prefix="/api/weather-map", tags=["zones"])
 _SAFE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+def _parcel_urn(parcel_id: str) -> str:
+    if parcel_id.startswith("urn:"):
+        return parcel_id
+    return f"urn:ngsi-ld:AgriParcel:{parcel_id}"
+
+
 @router.get("/zones/{parcel_id:path}")
 async def get_zones(
     parcel_id: str,
-    tenant_id: str = Query(None, alias="tenant_id"),
+    tenant_id: str = Depends(require_tenant),
     limit: int = Query(20, ge=1, le=50),
 ) -> dict[str, Any]:
     """Return the latest AgriParcelZone entities for a parcel."""
-    pid = parcel_id if parcel_id.startswith("urn:") else f"urn:ngsi-ld:AgriParcel:{parcel_id}"
+    pid = _parcel_urn(parcel_id)
 
-    # Use SDK for auto-header injection
-    import httpx
-    orion = OrionClient(tenant_id or "")
+    orion = OrionClient(tenant_id)
     try:
-        headers = await orion._get_headers()  # reuse SDK's header builder
+        headers = await orion._get_headers()
         headers["Accept"] = "application/ld+json"
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
@@ -67,7 +74,7 @@ async def get_gdd(
     season_start: str = Query(..., description="Season start date (YYYY-MM-DD)"),
     base_temp: float = Query(10.0, description="Base temperature (°C)"),
     upper_cutoff: float = Query(30.0, description="Upper cutoff temperature (°C)"),
-    tenant_id: str = Query(None, alias="tenant_id"),
+    tenant_id: str = Depends(require_tenant),
 ) -> dict[str, Any]:
     """Accumulated GDD per zone from agriparcelzone.
 
@@ -81,8 +88,12 @@ async def get_gdd(
     if not settings.postgres_url:
         raise HTTPException(status_code=503, detail="POSTGRES_URL not configured")
 
-    pid = parcel_id if parcel_id.startswith("urn:") else f"urn:ngsi-ld:AgriParcel:{parcel_id}"
-    start_dt = datetime.strptime(season_start, "%Y-%m-%d")
+    pid = _parcel_urn(parcel_id)
+    parcel = await fetch_agri_parcel(tenant_id, pid)
+    if parcel is None:
+        raise HTTPException(status_code=404, detail=f"Parcel not found: {parcel_id}")
+
+    start_dt = datetime.strptime(season_start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end_dt = datetime.now(timezone.utc)
 
     if start_dt >= end_dt:

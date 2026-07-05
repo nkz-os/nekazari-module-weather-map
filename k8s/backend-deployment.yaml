@@ -52,6 +52,11 @@ spec:
           value: "redis://redis-service:6379/0"
         - name: AUTH_DISABLED
           value: "false"
+        - name: INTERNAL_SERVICE_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: internal-service-secret
+              key: INTERNAL_SERVICE_SECRET
         - name: COG_INTERVAL_DAYS
           value: "5"
         livenessProbe:

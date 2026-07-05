@@ -80,10 +80,14 @@ async def fetch_dem_tile(z: int, x: int, y: int) -> dict[str, Any] | None:
         "purpose": "weather",
     }
     try:
+        headers: dict[str, str] = {}
+        if settings.internal_service_secret:
+            headers["X-Internal-Service-Secret"] = settings.internal_service_secret
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(
                 f"{settings.elevation_service_url}/api/elevation/raster",
                 params=params,
+                headers=headers,
             )
             resp.raise_for_status()
             return resp.json()
