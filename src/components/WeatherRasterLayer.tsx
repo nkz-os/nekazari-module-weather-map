@@ -1,59 +1,103 @@
-import React, { useEffect, useMemo } from 'react';
-import { useViewer } from '@nekazari/sdk';
-
-interface Props {
-  metric: string;
-  date?: string;
-  opacity?: number;
-  tenantId?: string;
-}
+import React, { useEffect, useRef } from 'react';
+import { useViewerOptional } from '@nekazari/sdk';
+import { useWeatherLayerContext } from '../services/weatherLayerContext';
+import { fetchLatestWeatherDate } from '../services/weatherApi';
 
 const FRONTEND_HOST = 'https://nekazari.robotika.cloud';
 
-const WeatherRasterLayer: React.FC<Props> = ({ metric, date, opacity = 0.7, tenantId }) => {
-  const viewerCtx = useViewer();
-  const viewer = (viewerCtx as any).cesiumViewer;
-  const CesiumLib = (window as any).Cesium;
+const WeatherRasterLayer: React.FC = () => {
+  const viewerCtx = useViewerOptional();
+  const viewer = (viewerCtx as { cesiumViewer?: unknown })?.cesiumViewer;
+  const tenantId =
+    (viewerCtx as { tenantId?: string })?.tenantId ||
+    (viewerCtx as { tenant?: string })?.tenant ||
+    'default';
 
-  // Derive tenantId from viewer context if not explicitly provided
-  const resolvedTenantId = tenantId || (viewerCtx as any).tenantId || 'default';
-
-  const pmtilesUrl = useMemo(() => {
-    if (!date) return null; // Need a date to resolve the PMTiles
-    return `${FRONTEND_HOST}/modules/weather-map/pmtiles/${resolvedTenantId}/${metric}/${date}.pmtiles`;
-  }, [metric, date, resolvedTenantId]);
+  const { metric, date, visible, opacity, setDate, setStatus } = useWeatherLayerContext();
+  const layerRef = useRef<{ alpha?: number } | null>(null);
+  const resolvedDateRef = useRef<string>('');
 
   useEffect(() => {
-    if (!viewer || !pmtilesUrl || !CesiumLib) return;
+    if (!visible || date) return;
+    let cancelled = false;
+    setStatus('loading');
+    fetchLatestWeatherDate(metric)
+      .then((latest) => {
+        if (cancelled) return;
+        if (latest) {
+          setDate(latest);
+        } else {
+          setStatus('empty');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setStatus('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [visible, date, metric, setDate, setStatus]);
 
-    let layer: any = null;
+  useEffect(() => {
+    const CesiumLib = (window as { Cesium?: typeof import('cesium') }).Cesium;
+    const v = viewer as {
+      imageryLayers?: { remove: (l: unknown, destroy?: boolean) => void; addImageryProvider: (p: unknown) => { alpha?: number } };
+      isDestroyed?: () => boolean;
+    } | undefined;
+
+    const removeLayer = () => {
+      if (!layerRef.current || v?.isDestroyed?.()) return;
+      try {
+        v?.imageryLayers?.remove(layerRef.current, true);
+      } catch {
+        /* viewer torn down */
+      }
+      layerRef.current = null;
+    };
+
+    removeLayer();
+
+    if (!viewer || !visible || !date || !CesiumLib) {
+      if (!visible) setStatus('idle');
+      return;
+    }
+
+    const pmtilesUrl = `${FRONTEND_HOST}/modules/weather-map/pmtiles/${tenantId}/${metric}/${date}.pmtiles`;
+    let cancelled = false;
+    setStatus('loading');
+    resolvedDateRef.current = date;
 
     (async () => {
       try {
-        // Use Cesium's PMTiles support via createTileMapServiceImageryProvider
-        // PMTiles implements the Tile Map Service specification
         const provider = await CesiumLib.createTileMapServiceImageryProvider({
           url: pmtilesUrl,
           minimumLevel: 10,
           maximumLevel: 15,
         });
-
-        layer = viewer.imageryLayers.addImageryProvider(provider);
-        layer.alpha = opacity;
+        if (cancelled || v?.isDestroyed?.()) return;
+        const layer = v?.imageryLayers?.addImageryProvider(provider);
+        if (layer) {
+          layer.alpha = opacity;
+          layerRef.current = layer;
+          setStatus('ready');
+        }
       } catch (err) {
         console.error('[WeatherMap] PMTiles layer failed:', err);
+        if (!cancelled) setStatus('empty');
       }
     })();
 
     return () => {
-      if (layer) {
-        viewer.imageryLayers.remove(layer);
-      }
+      cancelled = true;
+      removeLayer();
     };
-  }, [viewer, pmtilesUrl, opacity, CesiumLib]);
+  }, [viewer, tenantId, metric, date, visible, opacity, setStatus]);
 
-  // Show nothing if no date is selected
-  if (!date || !pmtilesUrl) return null;
+  useEffect(() => {
+    if (layerRef.current) {
+      layerRef.current.alpha = opacity;
+    }
+  }, [opacity]);
 
   return null;
 };

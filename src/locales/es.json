@@ -16,5 +16,13 @@
     "opacity": "Opacidad",
     "visible": "Visible"
   },
-  "layerToggle": "Capas Climáticas"
+  "layerToggle": "Capas Climáticas",
+  "layer": {
+    "title": "Clima",
+    "status": {
+      "loading": "Cargando…",
+      "empty": "Sin datos raster para esta métrica",
+      "error": "Error al cargar la capa"
+    }
+  }
 }

@@ -1,4 +1,4 @@
-import { defineModule } from '@nekazari/module-kit';
+import { defineModule, withModuleProvider } from '@nekazari/module-kit';
 import { lazy } from 'react';
 import './i18n';
 import { weatherMapSlots } from './slots';
@@ -15,7 +15,7 @@ export default defineModule({
   accent: { base: '#2563EB', soft: '#DBEAFE', strong: '#1E40AF' },
   icon: 'cloud-sun',
   main: WeatherMapMain,
-  slots: weatherMapSlots as never,
+  slots: withModuleProvider(weatherMapSlots as never) as never,
   data: {
     entities: ["AgriParcel", "AgriParcelRecord", "AgriSoil"],
     timeseries: ["AgriParcelRecord"],

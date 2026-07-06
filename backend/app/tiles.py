@@ -40,6 +40,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+@router.get("/latest/{metric}")
+async def latest_raster_date(
+    metric: str,
+    tenant_id: str = Depends(require_tenant),
+):
+    """Return the latest COG date available for a tenant/metric pair."""
+    if metric not in settings.metrics:
+        raise HTTPException(status_code=404, detail=f"Unknown metric: {metric}")
+    date = get_latest_date(tenant_id, metric)
+    if date is None:
+        raise HTTPException(status_code=404, detail="No COG data available for this metric")
+    return {"metric": metric, "date": date}
+
+
 @router.get("/tiles/{metric}/{z}/{x}/{y}.png")
 async def serve_tile(
     metric: str,

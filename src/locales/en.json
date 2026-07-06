@@ -16,5 +16,13 @@
     "opacity": "Opacity",
     "visible": "Visible"
   },
-  "layerToggle": "Weather Layers"
+  "layerToggle": "Weather Layers",
+  "layer": {
+    "title": "Weather",
+    "status": {
+      "loading": "Loading…",
+      "empty": "No raster data for this metric",
+      "error": "Failed to load layer"
+    }
+  }
 }

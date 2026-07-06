@@ -1,22 +1,40 @@
+import React from 'react';
+import WeatherRasterLayer from '../components/WeatherRasterLayer';
+import WeatherLayerControl from '../components/WeatherLayerControl';
+import WeatherLayerToggle from '../components/WeatherLayerToggle';
+import { WeatherProvider } from '../services/weatherLayerContext';
+
+const MODULE_ID = 'weather-map';
+
 export const weatherMapSlots = {
-  'map-layer': [{
-    id: 'weather-map-raster-layer',
-    moduleId: 'weather-map',
-    component: 'WeatherRasterLayer',
-    priority: 20,
-  }],
-  'layer-toggle': [{
-    id: 'weather-map-toggle',
-    moduleId: 'weather-map',
-    component: 'WeatherLayerToggle',
-    priority: 20,
-  }],
-  'context-panel': [{
-    id: 'weather-map-control',
-    moduleId: 'weather-map',
-    component: 'WeatherLayerControl',
-    priority: 20,
-    showWhen: { entityType: ['AgriParcel'] },
-  }],
+  'map-layer': [
+    {
+      id: 'weather-map-raster-layer',
+      moduleId: MODULE_ID,
+      component: 'WeatherRasterLayer',
+      priority: 20,
+      localComponent: WeatherRasterLayer,
+    },
+  ],
+  'layer-toggle': [
+    {
+      id: 'weather-map-toggle',
+      moduleId: MODULE_ID,
+      component: 'WeatherLayerToggle',
+      priority: 20,
+      localComponent: WeatherLayerToggle,
+    },
+  ],
+  'context-panel': [
+    {
+      id: 'weather-map-control',
+      moduleId: MODULE_ID,
+      component: 'WeatherLayerControl',
+      priority: 20,
+      localComponent: WeatherLayerControl,
+      showWhen: { entityType: ['AgriParcel'] },
+    },
+  ],
   'entity-tree': [],
+  moduleProvider: WeatherProvider,
 };

@@ -20,6 +20,33 @@ def test_unknown_metric_returns_404(client):
     assert resp.status_code == 404
 
 
+def test_latest_unknown_metric_returns_404(client):
+    resp = client.get(
+        "/api/weather-map/latest/invalid_metric",
+        headers={"X-Tenant-ID": "test-tenant", "X-User-ID": "test-user"},
+    )
+    assert resp.status_code == 404
+
+
+def test_latest_metric_no_data_returns_404(client, monkeypatch):
+    monkeypatch.setattr("app.tiles.get_latest_date", lambda _t, _m: None)
+    resp = client.get(
+        "/api/weather-map/latest/temperature_avg",
+        headers={"X-Tenant-ID": "test-tenant", "X-User-ID": "test-user"},
+    )
+    assert resp.status_code == 404
+
+
+def test_latest_metric_returns_date(client, monkeypatch):
+    monkeypatch.setattr("app.tiles.get_latest_date", lambda _t, _m: "2026-06-10")
+    resp = client.get(
+        "/api/weather-map/latest/temperature_avg",
+        headers={"X-Tenant-ID": "test-tenant", "X-User-ID": "test-user"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"metric": "temperature_avg", "date": "2026-06-10"}
+
+
 @pytest.mark.asyncio
 async def test_apply_color_scale_tile():
     """apply_color_scale should work on 256x256 array."""
