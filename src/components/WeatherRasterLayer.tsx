@@ -3,15 +3,16 @@ import { useViewerOptional } from '@nekazari/sdk';
 import { useWeatherLayerContext } from '../services/weatherLayerContext';
 import { fetchLatestWeatherDate } from '../services/weatherApi';
 
-const FRONTEND_HOST = 'https://nekazari.robotika.cloud';
+const API_BASE =
+  (import.meta as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL
+  || 'https://nkz.robotika.cloud';
+// Backend COGs are generated at a single zoom level (14); Cesium upsamples
+// beyond it and misses (transparent 404s) below it.
+const TILE_LEVEL = 14;
 
 const WeatherRasterLayer: React.FC = () => {
   const viewerCtx = useViewerOptional();
   const viewer = (viewerCtx as { cesiumViewer?: unknown })?.cesiumViewer;
-  const tenantId =
-    (viewerCtx as { tenantId?: string })?.tenantId ||
-    (viewerCtx as { tenant?: string })?.tenant ||
-    'default';
 
   const { metric, date, visible, opacity, setDate, setStatus } = useWeatherLayerContext();
   const layerRef = useRef<{ alpha?: number } | null>(null);
@@ -62,36 +63,41 @@ const WeatherRasterLayer: React.FC = () => {
       return;
     }
 
-    const pmtilesUrl = `${FRONTEND_HOST}/modules/weather-map/pmtiles/${tenantId}/${metric}/${date}.pmtiles`;
     let cancelled = false;
     setStatus('loading');
     resolvedDateRef.current = date;
 
-    (async () => {
-      try {
-        const provider = await CesiumLib.createTileMapServiceImageryProvider({
-          url: pmtilesUrl,
-          minimumLevel: 10,
-          maximumLevel: 15,
-        });
-        if (cancelled || v?.isDestroyed?.()) return;
-        const layer = v?.imageryLayers?.addImageryProvider(provider);
-        if (layer) {
-          layer.alpha = opacity;
-          layerRef.current = layer;
-          setStatus('ready');
-        }
-      } catch (err) {
-        console.error('[WeatherMap] PMTiles layer failed:', err);
-        if (!cancelled) setStatus('empty');
+    try {
+      // Tile requests are plain XHR from Cesium: mark the API host as trusted
+      // so the nkz_token cookie travels with them (require_tenant on backend).
+      const apiHost = new URL(API_BASE).hostname;
+      CesiumLib.TrustedServers.add(apiHost, 443);
+
+      const provider = new CesiumLib.UrlTemplateImageryProvider({
+        url: `${API_BASE}/api/weather-map/tiles/${encodeURIComponent(metric)}/{z}/{x}/{y}.png?date=${encodeURIComponent(date)}`,
+        tilingScheme: new CesiumLib.WebMercatorTilingScheme(),
+        maximumLevel: TILE_LEVEL,
+        // Cut global 404 spam: weather COGs only cover EU tenants.
+        rectangle: CesiumLib.Rectangle.fromDegrees(-11.0, 34.0, 32.0, 62.0),
+        enablePickFeatures: false,
+      });
+      if (cancelled || v?.isDestroyed?.()) return;
+      const layer = v?.imageryLayers?.addImageryProvider(provider);
+      if (layer) {
+        layer.alpha = opacity;
+        layerRef.current = layer;
+        setStatus('ready');
       }
-    })();
+    } catch (err) {
+      console.error('[WeatherMap] tile layer failed:', err);
+      if (!cancelled) setStatus('empty');
+    }
 
     return () => {
       cancelled = true;
       removeLayer();
     };
-  }, [viewer, tenantId, metric, date, visible, opacity, setStatus]);
+  }, [viewer, metric, date, visible, opacity, setStatus]);
 
   useEffect(() => {
     if (layerRef.current) {
