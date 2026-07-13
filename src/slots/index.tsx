@@ -1,7 +1,6 @@
 import React from 'react';
 import WeatherRasterLayer from '../components/WeatherRasterLayer';
 import WeatherLayerControl from '../components/WeatherLayerControl';
-import WeatherLayerToggle from '../components/WeatherLayerToggle';
 import { WeatherProvider } from '../services/weatherLayerContext';
 
 const MODULE_ID = 'weather-map';
@@ -14,15 +13,6 @@ export const weatherMapSlots = {
       component: 'WeatherRasterLayer',
       priority: 20,
       localComponent: WeatherRasterLayer,
-    },
-  ],
-  'layer-toggle': [
-    {
-      id: 'weather-map-toggle',
-      moduleId: MODULE_ID,
-      component: 'WeatherLayerToggle',
-      priority: 20,
-      localComponent: WeatherLayerToggle,
     },
   ],
   'context-panel': [

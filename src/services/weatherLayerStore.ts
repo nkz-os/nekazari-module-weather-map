@@ -1,24 +1,18 @@
 /**
- * Shared weather-map layer state across layer-toggle, map-layer and module page
- * (each slot mounts in a separate React tree in the host viewer).
+ * Shared weather-map layer *configuration* across context-panel and map-layer
+ * slots (each mounts in a separate React tree in the host viewer). Visibility,
+ * opacity and load status now live in the host's unified LayerRegistry
+ * (@nekazari/sdk useViewerLayer) — only the metric/date selection is module-local.
  */
-
-export type WeatherLayerStatus = 'idle' | 'loading' | 'ready' | 'empty' | 'error';
 
 export interface WeatherLayerState {
   metric: string;
   date: string;
-  visible: boolean;
-  opacity: number;
-  status: WeatherLayerStatus;
 }
 
 let state: WeatherLayerState = {
   metric: 'temperature_avg',
   date: '',
-  visible: false,
-  opacity: 0.7,
-  status: 'idle',
 };
 
 const listeners = new Set<() => void>();

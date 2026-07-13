@@ -10,8 +10,8 @@
     "dev": "vite"
   },
   "dependencies": {
-    "@nekazari/module-kit": "^0.7.0",
-    "@nekazari/sdk": "^1.0.0",
+    "@nekazari/module-kit": "^0.8.0",
+    "@nekazari/sdk": "^1.2.0",
     "@nekazari/ui-kit": "^1.0.2-alpha.4",
     "@nekazari/viewer-kit": "^0.1.1-alpha.0",
     "i18next": "^23.11.0",

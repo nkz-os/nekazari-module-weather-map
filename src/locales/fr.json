@@ -16,5 +16,6 @@
     "opacity": "Opacité",
     "visible": "Visible"
   },
-  "layerToggle": "Couches Météo"
+  "layerToggle": "Couches Météo",
+  "layerTitle": "Météo"
 }
