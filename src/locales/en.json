@@ -24,6 +24,5 @@
       "empty": "No raster data for this metric",
       "error": "Failed to load layer"
     }
-  },
-  "layerTitle": "Weather"
+  }
 }

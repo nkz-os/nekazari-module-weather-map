@@ -24,6 +24,5 @@
       "empty": "Sin datos raster para esta métrica",
       "error": "Error al cargar la capa"
     }
-  },
-  "layerTitle": "Meteorología"
+  }
 }

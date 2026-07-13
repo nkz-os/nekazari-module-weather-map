@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { useViewerOptional, useViewerLayer } from '@nekazari/sdk';
+import { useViewerOptional } from '@nekazari/sdk';
 import { useWeatherLayerContext } from '../services/weatherLayerContext';
 import { fetchLatestWeatherDate } from '../services/weatherApi';
 
@@ -14,10 +14,7 @@ const WeatherRasterLayer: React.FC = () => {
   const viewerCtx = useViewerOptional();
   const viewer = (viewerCtx as { cesiumViewer?: unknown })?.cesiumViewer;
 
-  const { metric, date, setDate } = useWeatherLayerContext();
-  // Visibility, opacity (0–100) and load status are driven by the host's
-  // unified Layers menu via the shared LayerRegistry.
-  const { visible, opacity, setStatus } = useViewerLayer('weather-map-raster');
+  const { metric, date, visible, opacity, setDate, setStatus } = useWeatherLayerContext();
   const layerRef = useRef<{ alpha?: number } | null>(null);
   const resolvedDateRef = useRef<string>('');
 
@@ -87,7 +84,7 @@ const WeatherRasterLayer: React.FC = () => {
       if (cancelled || v?.isDestroyed?.()) return;
       const layer = v?.imageryLayers?.addImageryProvider(provider);
       if (layer) {
-        layer.alpha = opacity / 100;
+        layer.alpha = opacity;
         layerRef.current = layer;
         setStatus('ready');
       }
@@ -104,7 +101,7 @@ const WeatherRasterLayer: React.FC = () => {
 
   useEffect(() => {
     if (layerRef.current) {
-      layerRef.current.alpha = opacity / 100;
+      layerRef.current.alpha = opacity;
     }
   }, [opacity]);
 

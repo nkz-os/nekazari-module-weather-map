@@ -16,14 +16,6 @@ export default defineModule({
   icon: 'cloud-sun',
   main: WeatherMapMain,
   slots: withModuleProvider(weatherMapSlots as never) as never,
-  viewerLayers: [
-    {
-      id: 'weather-map-raster',
-      titleKey: 'weather-map:layerTitle',
-      supportsOpacity: true,
-      defaultVisible: false,
-    },
-  ],
   data: {
     entities: ["AgriParcel", "AgriParcelRecord", "AgriSoil"],
     timeseries: ["AgriParcelRecord"],

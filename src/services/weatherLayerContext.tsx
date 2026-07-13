@@ -4,11 +4,17 @@ import {
   setWeatherLayerState,
   subscribeWeatherLayer,
   type WeatherLayerState,
+  type WeatherLayerStatus,
 } from './weatherLayerStore';
+
+export type { WeatherLayerStatus };
 
 interface WeatherLayerControls extends WeatherLayerState {
   setMetric: (metric: string) => void;
   setDate: (date: string) => void;
+  setVisible: (visible: boolean) => void;
+  setOpacity: (opacity: number) => void;
+  setStatus: (status: WeatherLayerStatus) => void;
 }
 
 export function useWeatherLayerContext(): WeatherLayerControls {
@@ -19,15 +25,21 @@ export function useWeatherLayerContext(): WeatherLayerControls {
   );
 
   const setMetric = useCallback(
-    (metric: string) => setWeatherLayerState({ metric, date: '' }),
+    (metric: string) => setWeatherLayerState({ metric, date: '', status: 'idle' }),
     [],
   );
   const setDate = useCallback((date: string) => setWeatherLayerState({ date }), []);
+  const setVisible = useCallback((visible: boolean) => setWeatherLayerState({ visible }), []);
+  const setOpacity = useCallback((opacity: number) => setWeatherLayerState({ opacity }), []);
+  const setStatus = useCallback((status: WeatherLayerStatus) => setWeatherLayerState({ status }), []);
 
   return {
     ...snap,
     setMetric,
     setDate,
+    setVisible,
+    setOpacity,
+    setStatus,
   };
 }
 
