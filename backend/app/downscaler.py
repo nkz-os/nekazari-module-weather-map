@@ -214,8 +214,13 @@ def compute_eto(
     # Net longwave: Stefan–Boltzmann
     sigma = 4.903e-9  # MJ m⁻² day⁻¹ K⁻⁴
     t_avg_k = t_avg + 273.16
-    # Relative sunshine fraction (Rs / Rso)
-    # Rso ≈ 0.75 * Ra, but we use Rs / max(Rs) as a surrogate
+    # KNOWN LIMITATION (documented 2026-07-18, not fixed): the cloudiness term is
+    # degenerate. Rs_rel is Rs divided by itself, i.e. identically 1.0 — equivalent
+    # to permanently clear sky, so net longwave loss is always at its maximum and
+    # ET0 is biased low on overcast days. FAO-56 wants Rs/Rso with Rso ≈ 0.75·Ra
+    # (Ra = extraterrestrial radiation, computable from latitude and day of year).
+    # Fixing it changes ET0 for every downstream consumer (water balance, crop
+    # stress, yield projection) and needs its own validation — hence not done here.
     Rs_max = np.maximum(Rs, 1e-10)
     Rs_rel = Rs / Rs_max
     Rn_l = sigma * t_avg_k ** 4 * (0.34 - 0.14 * np.sqrt(ea)) * (1.35 * Rs_rel - 0.35)
