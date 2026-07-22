@@ -35,11 +35,11 @@ def test_all_historized_metrics_are_flat_scalars():
 
 SAMPLE_ZONE = {
     "zone_id": "zone-a",
-    "elevation_mean": 150.0,
-    "elevation_min": 120.0,
-    "elevation_max": 180.0,
-    "aspect_sector": "S",
-    "pixel_count": 500,
+    "elevationMean": 150.0,
+    "elevationMin": 120.0,
+    "elevationMax": 180.0,
+    "aspectSector": "S",
+    "pixelCount": 500,
 }
 
 

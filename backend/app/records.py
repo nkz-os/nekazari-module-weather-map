@@ -119,11 +119,11 @@ def build_agri_parcel_zone(
         },
         "nkz:zoneId": {"type": "Property", "value": zone_id},
         "nkz:centroid": {"type": "Property", "value": centroid},
-        "nkz:elevationMean": {"type": "Property", "value": zone.get("elevation_mean", 0.0)},
-        "nkz:elevationMin": {"type": "Property", "value": zone.get("elevation_min", 0.0)},
-        "nkz:elevationMax": {"type": "Property", "value": zone.get("elevation_max", 0.0)},
-        "nkz:aspectSector": {"type": "Property", "value": zone.get("aspect_sector", "")},
-        "nkz:pixelCount": {"type": "Property", "value": zone.get("pixel_count", 0)},
+        "nkz:elevationMean": {"type": "Property", "value": zone.get("elevationMean", 0.0)},
+        "nkz:elevationMin": {"type": "Property", "value": zone.get("elevationMin", 0.0)},
+        "nkz:elevationMax": {"type": "Property", "value": zone.get("elevationMax", 0.0)},
+        "nkz:aspectSector": {"type": "Property", "value": zone.get("aspectSector", "")},
+        "nkz:pixelCount": {"type": "Property", "value": zone.get("pixelCount", 0)},
     }
 
     if area_ha is not None:
