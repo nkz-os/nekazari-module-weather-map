@@ -25,7 +25,7 @@ from app.auth import require_tenant
 from app.config import settings
 from app.minio_io import download_cog, get_latest_date
 from app.color_scales import apply_color_scale
-from app.records import build_agri_parcel_record
+from app.records import build_agri_parcel_record, guard_frozen_metrics
 from app.stats import compute_zonal_stats
 from app.sources import fetch_agri_parcel, fetch_entity_attr, upsert_record
 
@@ -351,5 +351,6 @@ async def persist_zonal_stats(
         observed_at=observed_at,
     )
 
+    await guard_frozen_metrics(tenant_id, parcel_id, flat_metrics)
     await upsert_record(tenant_id, record)
     return {"status": "persisted", "id": record["id"], "stats": stats}

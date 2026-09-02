@@ -134,6 +134,87 @@ async def fetch_parcel_weather(tenant_id: str, parcel_id: str) -> dict | None:
 
     return out
 
+
+class MissingContextURL(Exception):
+    """`CONTEXT_URL` is not configured — refusing a history read that would
+    otherwise silently false-empty.
+
+    Without the platform `@context` Link header, Orion expands attribute and
+    type names against the default vocabulary and a query returns zero
+    matches — a broken query that LOOKS exactly like "no history yet" (see
+    `_get_entity_keyvalues`). A guard that can't tell "new parcel" from
+    "couldn't even ask the question" is not a guard; refuse instead of
+    returning `[]`.
+    """
+
+
+async def fetch_metric_history(
+    tenant_id: str, parcel_id: str, attr_name: str, limit: int = 5,
+) -> list[float]:
+    """Return up to *limit* prior published values of *attr_name* for one
+    parcel's own `AgriParcelRecord` history, oldest first.
+
+    Returns ``[]`` when there is no history yet (new parcel) or the read
+    failed — the guard treats both as "no signal, don't block". Raises
+    `MissingContextURL` when `CONTEXT_URL` is unset, since that must never
+    be mistaken for "no history yet".
+
+    `AgriParcelRecord` is shared with a field-photo pipeline (ids prefixed
+    `photo-`, also related to the same parcel via `hasAgriParcel`) — records
+    are filtered to weather-map's own `weather-` id prefix so a photo upload
+    is never read as a weather sample. Same broker-read shape as
+    `fetch_tenant_parcels` (manual `@context` Link header) combined with the
+    `q=hasAgriParcel==` + `orderBy` filter already used in `zones.py`.
+    """
+    if not settings.context_url:
+        raise MissingContextURL()
+
+    headers = {
+        "NGSILD-Tenant": tenant_id,
+        "Fiware-Service": tenant_id,
+        "Fiware-ServicePath": "/",
+        "Link": f'<{settings.context_url}>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{settings.orion_url}/ngsi-ld/v1/entities",
+                params={
+                    "type": "AgriParcelRecord",
+                    "q": f'hasAgriParcel=="{parcel_id}"',
+                    "attrs": attr_name,
+                    "options": "keyValues",
+                    "orderBy": "dateObserved:desc",
+                    "limit": limit,
+                },
+                headers=headers,
+            )
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        logger.exception(
+            "fetch_metric_history(tenant=%s, parcel=%s, attr=%s) failed",
+            tenant_id, parcel_id, attr_name,
+        )
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    values: list[float] = []
+    for entity in data:
+        entity_id = entity.get("id", "")
+        if not entity_id.rsplit(":", 1)[-1].startswith("weather-"):
+            continue  # another producer's record (e.g. field-photo `photo-...`)
+        value = entity.get(attr_name)
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+
+    values.reverse()  # `orderBy=...desc` gave most-recent-first; guard wants oldest-first
+    return values
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

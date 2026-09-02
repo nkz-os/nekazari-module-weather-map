@@ -32,7 +32,7 @@ from app.downscaler import (
     get_texture_defaults,
 )
 from app.minio_io import set_latest_date, upload_cog
-from app.records import build_agri_parcel_record
+from app.records import build_agri_parcel_record, guard_frozen_metrics
 from app.sources import (
     MissingWeatherInput,
     fetch_agri_soil,
@@ -654,6 +654,7 @@ async def run_for_tenant(
             metrics=flat_metrics,
             observed_at=observed_at,
         )
+        await guard_frozen_metrics(tenant_id, parcel_id, flat_metrics)
         await upsert_record(tenant_id, record)
         logger.info(
             "Persisted AgriParcelRecord for parcel %s / tenant %s",
