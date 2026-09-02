@@ -19,6 +19,37 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Weather input extraction
+# ---------------------------------------------------------------------------
+
+
+class MissingWeatherInput(Exception):
+    """Falta una entrada meteorológica obligatoria.
+
+    Se lanza en vez de devolver un default. El pipeline calculó sobre constantes
+    durante tres meses porque un `.get(clave, 15.0)` convertía la ausencia en un
+    número plausible. Un hueco es honesto; un número inventado no.
+    """
+
+    def __init__(self, keys):
+        self.keys = tuple(keys)
+        super().__init__(f"missing weather input, tried: {', '.join(self.keys)}")
+
+
+def require(payload: dict, *keys) -> float:
+    """Primera clave presente entre `keys`. Lanza `MissingWeatherInput` si ninguna.
+
+    Acepta varios nombres porque el @context de la plataforma no es inyectivo: la
+    compactación devuelve el alias que el escritor no usó (`airTemperature` donde
+    el productor escribió `temperature`).
+    """
+    for key in keys:
+        value = payload.get(key)
+        if value is not None:
+            return float(value)
+    raise MissingWeatherInput(keys)
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
