@@ -240,6 +240,7 @@ async def generate_cog_for_tile(
     tile_center_lat: float,
     tile_center_lon: float,
     parcels: list[dict[str, Any]],
+    weather_cache: dict[str, dict | None] | None = None,
 ) -> bytes | None:
     """Compute a weather raster for a single TMS tile and return COG bytes.
 
@@ -259,6 +260,13 @@ async def generate_cog_for_tile(
     parcels : list[dict]
         Tenant's parcels. The tile's weather (and soil) comes from the
         parcel NEAREST to the tile centre, never ``parcels[0]``.
+    weather_cache : dict or None
+        Per-run cache, keyed by parcel id. The weather is identical for all
+        seven metrics and for every tile sharing the same nearest parcel, so
+        without it one run issues two Orion GETs per (metric × tile) — each
+        on a fresh ``AsyncClient`` — against a broker that deadlocked on
+        connection exhaustion. ``None`` means "no sharing": a private cache
+        is used, so a lone call still behaves identically.
 
     Returns
     -------
@@ -319,7 +327,15 @@ async def generate_cog_for_tile(
         return None
     parcel_id = nearest_parcel["id"]
 
-    weather = await fetch_parcel_weather(tenant_id, parcel_id)
+    if weather_cache is None:
+        weather_cache = {}
+    if parcel_id in weather_cache:
+        weather = weather_cache[parcel_id]
+    else:
+        # A missing observation is cached too — re-asking Orion once per tile
+        # for a parcel that has no weather is the expensive half of the bug.
+        weather = await fetch_parcel_weather(tenant_id, parcel_id)
+        weather_cache[parcel_id] = weather
     if weather is None:
         logger.warning(
             "No weather observation for parcel %s (tile %d/%d/%d, tenant=%s)",
@@ -537,6 +553,10 @@ async def _generate_and_upload_cogs(
         tenant_id, len(tiles), zoom,
     )
 
+    # One broker read per parcel for the whole run, shared across every
+    # metric and every tile that resolves to the same nearest parcel.
+    weather_cache: dict[str, dict | None] = {}
+
     for metric in settings.metrics:
         logger.info(
             "Generating COGs for metric '%s' / tenant '%s'",
@@ -557,6 +577,7 @@ async def _generate_and_upload_cogs(
                 tenant_id, metric, z_tile, x_tile, y_tile,
                 date_from, date_to, tile_center_lat, tile_center_lon,
                 parcels=parcels,
+                weather_cache=weather_cache,
             )
 
             if cog_bytes is not None:
