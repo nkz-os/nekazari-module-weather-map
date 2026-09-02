@@ -41,7 +41,11 @@ jobs:
       - name: Lint (ruff)
         working-directory: backend
         run: |
-          pip install ruff
+          # Pinned deliberately. Unpinned, CI installs whatever ruff is newest at
+          # run time, and a release that widens the default rule set turns the
+          # build red with no code change — 0.16 added ~40 findings here overnight.
+          # Bump this on purpose, with the cleanup it implies, never by accident.
+          pip install ruff==0.15.0
           ruff check app/ tests/
 
       - name: Run unit tests
