@@ -86,7 +86,6 @@ async def process_parcel(
     lonlat = _parcel_lonlat(parcel)
     if lonlat is None:
         return []
-    centroid_lon, centroid_lat = lonlat
 
     # 1. Tiles covering the parcel
     min_lon, min_lat, max_lon, max_lat = _geom_geojson_bbox(geometry)
@@ -131,7 +130,7 @@ async def process_parcel(
         lat = np.linspace(td["origin_lat"], td["origin_lat"] + td["pixel_size"] * rows, rows)
         lon_g, lat_g = np.meshgrid(lon, lat)
 
-        tile_zones, tile_labels = compute_zones(
+        _, tile_labels = compute_zones(
             td["elev"], td["aspect"], td["slope"],
             min_pixels=settings.zones_min_pixels,
             elevation_band_m=settings.zones_elevation_band_m,

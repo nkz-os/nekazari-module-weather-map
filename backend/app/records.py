@@ -69,11 +69,10 @@ def assert_metric_varies(history: list[float]) -> None:
     genuinely stable weather — so this returns `None` rather than guessing.
     """
     if len(history) < 3:
-        return None
+        return
     last_three = history[-3:]
     if len(set(last_three)) == 1:
         raise FrozenMetric(last_three)
-    return None
 
 
 async def guard_frozen_metrics(

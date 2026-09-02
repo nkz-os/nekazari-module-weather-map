@@ -53,10 +53,10 @@ def test_gradient_flat_surface():
 # (location[2] de WeatherObserved), nunca contra el grid del DEM.
 # ======================================================================
 
-import logging  # noqa: E402
-from unittest.mock import AsyncMock  # noqa: E402
+import logging
+from unittest.mock import AsyncMock
 
-import pytest  # noqa: E402
+import pytest
 
 PARCEL = {"id": "urn:ngsi-ld:AgriParcel:p1", "lon": -1.65, "lat": 42.8}
 
