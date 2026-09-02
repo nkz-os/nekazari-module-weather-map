@@ -214,46 +214,6 @@ async def fetch_dem_tile(z: int, x: int, y: int) -> dict[str, Any] | None:
         return None
 
 
-async def fetch_station_weather(
-    tenant_id: str,
-    lat: float,
-    lon: float,
-    date_from: str,
-    date_to: str,
-) -> dict[str, Any] | None:
-    """Fetch weather data from the nearest station to (lat, lon).
-
-    Returns
-    -------
-    dict or None
-        JSON payload from the weather API, or ``None`` on failure.
-    """
-    params: dict[str, Any] = {
-        "lat": lat,
-        "lon": lon,
-        "date_from": date_from,
-        "date_to": date_to,
-    }
-    headers = {"X-Tenant-ID": tenant_id}
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{settings.weather_api_url}/api/weather/coordinates",
-                params=params,
-                headers=headers,
-            )
-            resp.raise_for_status()
-            return resp.json()
-    except Exception:
-        logger.exception(
-            "fetch_station_weather(tenant=%s, lat=%f, lon=%f) failed",
-            tenant_id,
-            lat,
-            lon,
-        )
-        return None
-
-
 async def fetch_agri_soil(
     tenant_id: str, parcel_id: str
 ) -> dict[str, float | None] | None:

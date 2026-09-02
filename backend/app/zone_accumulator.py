@@ -19,10 +19,12 @@ from app.config import settings
 from app.downscaler import compute_zones, correct_temperature, compute_eto
 from app.records import build_agri_parcel_zone
 from app.sources import (
+    MissingWeatherInput,
     fetch_dem_tile,
-    fetch_station_weather,
+    fetch_parcel_weather,
     fetch_tenant_parcels,
     find_nearby_sensors,
+    require,
     upsert_agri_parcel_zones,
 )
 from app.cog_generator import _bbox_to_tiles, _parcel_geometry, _parcel_lonlat
@@ -168,20 +170,27 @@ async def process_parcel(
         zones_all.sort(key=lambda z: z["pixelCount"], reverse=True)
         zones_all = zones_all[:settings.zones_max_count]
 
-    # 4. Fetch weather
-    weather = await fetch_station_weather(
-        tenant_id, centroid_lat, centroid_lon, date_from, date_from,
-    )
+    # 4. Fetch weather from the broker (no defaults — see app.sources.require)
+    weather = await fetch_parcel_weather(tenant_id, parcel_id)
     if weather is None:
-        logger.warning("No weather data for parcel %s", parcel_id)
+        logger.warning("No weather observation for parcel %s", parcel_id)
         return []
 
-    t_min = float(weather.get("t_min", weather.get("temperature_min", 10.0)))
-    t_max = float(weather.get("t_max", weather.get("temperature_max", 20.0)))
-    station_elev = float(weather.get("elevation_m", weather.get("elevation", 0.0)))
-    rh = float(weather.get("rh_avg", weather.get("humidity", 60.0)))
-    wind = float(weather.get("wind_speed_ms", weather.get("wind_speed", 2.0)))
-    solar = float(weather.get("solar_rad_w_m2", weather.get("solar_radiation", 200.0)))
+    try:
+        t_min = require(weather, "t_min", "temperature_min")
+        t_max = require(weather, "t_max", "temperature_max")
+        rh = require(weather, "rh_avg", "humidity")
+        wind = require(weather, "wind_speed_ms", "wind_speed")
+        solar = require(weather, "solar_rad_w_m2", "solar_radiation")
+        # The altitude the readings are already downscaled to — the per-zone
+        # correction below is RELATIVE to this, never to the DEM tile's own grid.
+        station_elev = require(weather, "reference_altitude_m")
+    except MissingWeatherInput as exc:
+        logger.error(
+            "Skipping parcel %s (tenant=%s): missing weather input, tried %s",
+            parcel_id, tenant_id, exc.keys,
+        )
+        return []
 
     # 5. Compute metrics per zone, build entities
     observed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
