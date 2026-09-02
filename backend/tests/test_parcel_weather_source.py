@@ -97,3 +97,63 @@ async def test_omits_the_altitude_when_location_is_2d(monkeypatch):
     monkeypatch.setattr(sources, "_get_entity_keyvalues", _fake)
     out = await sources.fetch_parcel_weather("t", "urn:ngsi-ld:AgriParcel:t:p1")
     assert "reference_altitude_m" not in out
+
+
+# ----------------------------------------------------------------------
+# Valor presente pero no convertible: se salta como una ausencia.
+# `float()` sobre un dict, un None anidado o "n/a" lanzaba TypeError /
+# ValueError, que escapa al handler de MissingWeatherInput y aborta el run
+# del tenant a mitad de métrica: algunos COGs subidos, puntero volteado,
+# ningún registro escrito. Un valor malformado se salta, no derriba el run.
+# ----------------------------------------------------------------------
+
+
+def test_require_skips_a_non_numeric_value_and_tries_the_next_key():
+    assert require({"t_min": "n/a", "temperature_min": 8.5}, "t_min", "temperature_min") == 8.5
+
+
+def test_require_raises_missing_when_every_candidate_is_malformed():
+    with pytest.raises(MissingWeatherInput):
+        require({"t_min": {"value": 8.5}}, "t_min")
+
+
+def test_require_raises_missing_not_typeerror_on_a_list_value():
+    with pytest.raises(MissingWeatherInput):
+        require({"wind_speed_ms": [2.0, 3.0]}, "wind_speed_ms")
+
+
+@pytest.mark.asyncio
+async def test_malformed_observed_value_is_omitted_not_crashed(monkeypatch):
+    """El extractor omite la clave; quien la necesite lanzará
+    MissingWeatherInput y el tile se saltará con log ruidoso."""
+    from app import sources
+
+    obs = dict(OBSERVED, airTemperature={"value": 21.0}, windSpeed="calm")
+
+    async def _fake(tenant_id, entity_id):
+        return obs if "WeatherObserved" in entity_id else FORECAST
+
+    monkeypatch.setattr(sources, "_get_entity_keyvalues", _fake)
+    out = await sources.fetch_parcel_weather("t", "urn:ngsi-ld:AgriParcel:t:p1")
+
+    assert "t_avg" not in out
+    assert "wind_speed_ms" not in out
+    assert out["rh_avg"] == 60.0  # el resto del payload sigue disponible
+
+
+@pytest.mark.asyncio
+async def test_malformed_altitude_or_forecast_temp_is_omitted(monkeypatch):
+    from app import sources
+
+    obs = dict(OBSERVED, location={"type": "Point", "coordinates": [-2.07, 42.63, None]})
+    fcst = dict(FORECAST, dayMinimum={"temperature": "n/a"})
+
+    async def _fake(tenant_id, entity_id):
+        return obs if "WeatherObserved" in entity_id else fcst
+
+    monkeypatch.setattr(sources, "_get_entity_keyvalues", _fake)
+    out = await sources.fetch_parcel_weather("t", "urn:ngsi-ld:AgriParcel:t:p1")
+
+    assert "reference_altitude_m" not in out
+    assert "t_min" not in out
+    assert out["t_max"] == 32.2

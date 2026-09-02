@@ -36,17 +36,45 @@ class MissingWeatherInput(Exception):
         super().__init__(f"missing weather input, tried: {', '.join(self.keys)}")
 
 
+def _as_float(value: Any) -> float | None:
+    """`float(value)` o `None` si el valor no es un escalar numérico.
+
+    Un `float()` desnudo sobre un dict anidado, una lista o `"n/a"` lanza
+    TypeError/ValueError, que escapa al handler de `MissingWeatherInput` y
+    aborta el run del tenant a mitad de métrica — algunos COGs subidos, el
+    puntero volteado, ningún registro escrito. Un valor malformado debe
+    saltarse como uno ausente, no derribar el run.
+    """
+    if value is None or isinstance(value, (dict, list, tuple, set, bool)):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def require(payload: dict, *keys) -> float:
     """Primera clave presente entre `keys`. Lanza `MissingWeatherInput` si ninguna.
 
     Acepta varios nombres porque el @context de la plataforma no es inyectivo: la
     compactación devuelve el alias que el escritor no usó (`airTemperature` donde
     el productor escribió `temperature`).
+
+    Un valor presente pero no convertible a float cuenta como ausente: se
+    prueba la siguiente clave y, si ninguna sirve, se lanza
+    `MissingWeatherInput` — nunca TypeError/ValueError, que nadie captura.
     """
     for key in keys:
         value = payload.get(key)
-        if value is not None:
-            return float(value)
+        if value is None:
+            continue
+        as_float = _as_float(value)
+        if as_float is not None:
+            return as_float
+        logger.warning(
+            "weather input %r present but not numeric (%r) — treating as missing",
+            key, value,
+        )
     raise MissingWeatherInput(keys)
 
 
@@ -102,13 +130,18 @@ async def fetch_parcel_weather(tenant_id: str, parcel_id: str) -> dict | None:
     out: dict = {}
 
     def _put(key, source, *names):
-        value = None
-        for n in names:
-            value = source.get(n)
+        for name in names:
+            raw = source.get(name)
+            if raw is None:
+                continue
+            value = _as_float(raw)
             if value is not None:
-                break
-        if value is not None:
-            out[key] = float(value)
+                out[key] = value
+                return
+            logger.warning(
+                "%s=%r on %s is not numeric — omitting %s",
+                name, raw, parcel_id, key,
+            )
 
     # Alias del @context: Orion devuelve el término que el productor NO usó.
     _put("t_avg", observed, "airTemperature", "temperature")
@@ -119,12 +152,14 @@ async def fetch_parcel_weather(tenant_id: str, parcel_id: str) -> dict | None:
 
     for key, attr in (("t_min", "dayMinimum"), ("t_max", "dayMaximum")):
         block = forecast.get(attr) or {}
-        if block.get("temperature") is not None:
-            out[key] = float(block["temperature"])
+        if isinstance(block, dict):
+            _put(key, block, "temperature")
 
     coords = (observed.get("location") or {}).get("coordinates") or []
     if len(coords) >= 3:
-        out["reference_altitude_m"] = float(coords[2])
+        altitude = _as_float(coords[2])
+        if altitude is not None:
+            out["reference_altitude_m"] = altitude
 
     observed_at = observed.get("dateObserved")
     if isinstance(observed_at, dict):
