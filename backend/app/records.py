@@ -34,6 +34,43 @@ _METRIC_TO_ATTR = {
 }
 
 
+class FrozenMetric(Exception):
+    """A published metric shows zero variance over its last 3 samples.
+
+    Raised instead of letting the value publish unremarked. This is the guard
+    that would have caught `airTemperatureAvg = 14.934`, identical to five
+    decimals, across 32 straight August days: no exception, no error log, no
+    failing test, percentiles and histograms computed faithfully over a
+    constant. Zero variance in 3 consecutive daily values is the same cheap
+    signature shared by a constant-fed pipeline, a frozen upstream source,
+    and a silent `.get(key, default)` — it doesn't matter which caused it.
+
+    Same calling convention as `MissingWeatherInput` in `sources.py`: the
+    caller must log at ERROR and skip that one metric — never let one frozen
+    metric abort the whole cron run.
+    """
+
+    def __init__(self, last_three: list[float]):
+        self.last_three = list(last_three)
+        super().__init__(f"metric frozen at {last_three[-1]!r} for 3 consecutive samples")
+
+
+def assert_metric_varies(history: list[float]) -> None:
+    """Raise `FrozenMetric` if the 3 most recent values in `history` are identical.
+
+    `AgriParcelRecord` is written once a day, so `history` is expected to be
+    the last N daily values for one metric on one parcel, oldest first. Fewer
+    than 3 samples is not enough to judge — two identical days happens in
+    genuinely stable weather — so this returns `None` rather than guessing.
+    """
+    if len(history) < 3:
+        return None
+    last_three = history[-3:]
+    if len(set(last_three)) == 1:
+        raise FrozenMetric(last_three)
+    return None
+
+
 def _parcel_short(parcel_id: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]", "-", parcel_id.split(":")[-1]).strip("-")
 
