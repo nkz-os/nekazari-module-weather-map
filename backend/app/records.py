@@ -11,7 +11,7 @@ import logging
 import re
 from typing import Any
 
-from app.sources import MissingContextURL, fetch_metric_history
+from app.sources import HistoryReadFailed, MissingContextURL, fetch_metric_history
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +87,12 @@ async def guard_frozen_metrics(
     prior days on record) stays silent: `assert_metric_varies` returns
     `None` and nothing is logged — a new parcel is not a frozen one.
 
-    A `MissingContextURL` from the history read is a different failure: the
-    guard could not even ask the question, which must not be mistaken for
-    "no history yet" (see `fetch_metric_history`). Logged loudly; only that
-    one metric's check is skipped.
+    A `HistoryReadFailed` (or its `MissingContextURL` subclass) is a
+    different failure: the guard could not even ask the question, which must
+    not be mistaken for "no history yet" (see `fetch_metric_history`). Logged
+    at ERROR — as loudly as a frozen metric, because a guard that quietly
+    disables itself is the same silent outcome one level up. Only that one
+    metric's check is skipped; the record still publishes.
     """
     for metric_name, value in metrics.items():
         attr = _METRIC_TO_ATTR.get(metric_name)
@@ -104,6 +106,14 @@ async def guard_frozen_metrics(
                 "configured, history read would false-empty — skipping the "
                 "variance check for this metric, publishing anyway",
                 attr, tenant_id, parcel_id,
+            )
+            continue
+        except HistoryReadFailed as exc:
+            logger.error(
+                "Cannot check %s for tenant=%s parcel=%s: history read failed "
+                "(%s) — a broken read is NOT 'no history yet'; skipping the "
+                "variance check for this metric, publishing anyway",
+                attr, tenant_id, parcel_id, exc,
             )
             continue
         try:

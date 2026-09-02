@@ -170,7 +170,19 @@ async def fetch_parcel_weather(tenant_id: str, parcel_id: str) -> dict | None:
     return out
 
 
-class MissingContextURL(Exception):
+class HistoryReadFailed(Exception):
+    """The history read did not complete — this is NOT "no history yet".
+
+    Every non-404 outcome (a 400 on `orderBy`, an Orion 500, a timeout, a
+    malformed body) used to return `[]`, which `guard_frozen_metrics` cannot
+    tell apart from a brand-new parcel. A guard that quietly disables itself
+    on the first broken read is the same silent failure this whole branch
+    exists to remove, one level up. Raise; the caller logs it as loudly as a
+    frozen metric and skips only that one check.
+    """
+
+
+class MissingContextURL(HistoryReadFailed):
     """`CONTEXT_URL` is not configured — refusing a history read that would
     otherwise silently false-empty.
 
@@ -189,10 +201,19 @@ async def fetch_metric_history(
     """Return up to *limit* prior published values of *attr_name* for one
     parcel's own `AgriParcelRecord` history, oldest first.
 
-    Returns ``[]`` when there is no history yet (new parcel) or the read
-    failed — the guard treats both as "no signal, don't block". Raises
-    `MissingContextURL` when `CONTEXT_URL` is unset, since that must never
-    be mistaken for "no history yet".
+    Returns ``[]`` ONLY when there is genuinely no history (a 404, or no
+    record of this producer). Any read that did not complete raises
+    `HistoryReadFailed` — a transport failure must never be mistaken for a
+    new parcel, and neither must an unset `CONTEXT_URL` (`MissingContextURL`,
+    a subclass).
+
+    Ordering is done here, client-side, on the compact timestamp weather-map
+    itself writes into the record id. `orderBy=dateObserved:desc` is sent as
+    a server-side hint to narrow `limit` to the recent window, but it is NOT
+    verified against Orion-LD over a nested `{"@type":"DateTime"}` Property:
+    if it is rejected the read now fails loudly, and if it is silently
+    ignored the returned order is checked and reported. Correctness of the
+    order never depends on it.
 
     `AgriParcelRecord` is shared with a field-photo pipeline (ids prefixed
     `photo-`, also related to the same parcel via `hasAgriParcel`) — records
@@ -225,30 +246,62 @@ async def fetch_metric_history(
                 headers=headers,
             )
             if resp.status_code == 404:
-                return []
+                return []  # genuine absence: no record for this parcel
             resp.raise_for_status()
             data = resp.json()
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "fetch_metric_history(tenant=%s, parcel=%s, attr=%s) failed",
             tenant_id, parcel_id, attr_name,
         )
-        return []
+        raise HistoryReadFailed(
+            f"history read failed for {attr_name} on {parcel_id}: {exc!r}"
+        ) from exc
 
     if not isinstance(data, list):
-        return []
+        raise HistoryReadFailed(
+            f"history read for {attr_name} on {parcel_id} returned "
+            f"{type(data).__name__}, expected a list"
+        )
 
-    values: list[float] = []
+    samples: list[tuple[str, float]] = []
     for entity in data:
         entity_id = entity.get("id", "")
         if not entity_id.rsplit(":", 1)[-1].startswith("weather-"):
             continue  # another producer's record (e.g. field-photo `photo-...`)
+        stamp = _record_timestamp(entity_id)
+        if stamp is None:
+            logger.warning(
+                "AgriParcelRecord %s carries no sortable timestamp in its id "
+                "— excluded from the variance history", entity_id,
+            )
+            continue
         value = entity.get(attr_name)
-        if isinstance(value, (int, float)):
-            values.append(float(value))
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            samples.append((stamp, value))
 
-    values.reverse()  # `orderBy=...desc` gave most-recent-first; guard wants oldest-first
-    return values
+    as_received = [stamp for stamp, _ in samples]
+    samples.sort(key=lambda sample: sample[0])  # oldest first — the guard's contract
+    if len(samples) > 1 and as_received != [stamp for stamp, _ in reversed(samples)]:
+        logger.warning(
+            "Orion did not honour orderBy=dateObserved:desc for %s on %s — the "
+            "client-side sort fixed the order, but `limit` then selects an "
+            "arbitrary window and the variance guard sees less than the most "
+            "recent samples", attr_name, parcel_id,
+        )
+    return [float(value) for _, value in samples]
+
+
+def _record_timestamp(entity_id: str) -> str | None:
+    """Compact timestamp weather-map writes at the end of its own record ids.
+
+    `build_agri_parcel_record` builds
+    ``urn:ngsi-ld:AgriParcelRecord:weather-{tenant}-{parcel}-{YYYYMMDDHHMMSS}``.
+    Lexicographic order over that suffix IS chronological order, and it is a
+    value this module writes — unlike the server-side `orderBy`.
+    """
+    tail = entity_id.rsplit(":", 1)[-1].rsplit("-", 1)[-1]
+    return tail if tail.isdigit() else None
 
 # ---------------------------------------------------------------------------
 # Helpers
