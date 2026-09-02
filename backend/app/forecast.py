@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth import require_tenant
 from app.config import settings
-from app.sources import fetch_agri_parcel
+from app.sources import MissingWeatherInput, fetch_agri_parcel, require
 
 logger = logging.getLogger(__name__)
 
@@ -91,16 +91,54 @@ async def forecast_et0(
 
     # 3. Transform to the format expected by the water budget worker
     raw_forecast = weather_data.get("forecast", [])
-    forecast = []
+    forecast = _to_worker_forecast(raw_forecast, parcel_id)
+    if raw_forecast and not forecast:
+        # Devolver [] aquí sería el mismo fallo silencioso en otra forma: el
+        # worker leería "sin días" como "sin déficit". Se falla ruidosamente.
+        raise HTTPException(
+            status_code=502,
+            detail="Weather forecast carried no usable ET0 / precipitation",
+        )
+
+    return {"forecast": forecast}
+
+
+def _to_worker_forecast(raw_forecast: list, parcel_id: str) -> list[dict]:
+    """Translate weather-api's forecast to the water-budget worker's format.
+
+    Un día sin ET0 o sin precipitación se **omite**. El `or 0.0` que vivía aquí
+    convertía una ausencia en un cero: el déficit proyectado se quedaba plano y
+    el consumidor lo leía como "sin estrés hídrico" — exactamente el bug que
+    publicó 14.934 durante 32 días, en un tercer consumidor que el test de
+    contrato no escaneaba. Un hueco en la serie es visible; ese cero no lo era.
+    """
+    forecast: list[dict] = []
+    dropped = 0
     for entry in raw_forecast:
+        try:
+            eto = require(entry, "eto_mm")
+            precip = require(entry, "precip_mm")
+        except MissingWeatherInput as exc:
+            dropped += 1
+            logger.warning(
+                "Dropping forecast day %s for parcel=%s: %s",
+                entry.get("date"), parcel_id, exc,
+            )
+            continue
         forecast.append({
             "day": entry.get("date", ""),
-            "et0": entry.get("eto_mm") or 0.0,
-            "precip": entry.get("precip_mm") or 0.0,
+            "et0": eto,
+            "precip": precip,
             "deficitAfter": 0.0,  # filled by the worker's _compute_projection
         })
 
-    return {"forecast": forecast}
+    if dropped:
+        logger.error(
+            "Forecast for parcel=%s: %d of %d day(s) had no usable ET0 / "
+            "precipitation and were dropped — never substituted with 0.0",
+            parcel_id, dropped, len(raw_forecast),
+        )
+    return forecast
 
 
 def _parcel_centroid(geometry: dict) -> Optional[tuple[float, float]]:
