@@ -49,6 +49,91 @@ def require(payload: dict, *keys) -> float:
             return float(value)
     raise MissingWeatherInput(keys)
 
+
+async def _get_entity_keyvalues(tenant_id: str, entity_id: str) -> dict | None:
+    """GET a single NGSI-LD entity in ``keyValues`` form, or ``None`` on 404/error.
+
+    Same header construction as ``fetch_tenant_parcels`` (Link header carrying the
+    platform ``@context``) — without it Orion silently expands attribute names
+    against the default vocabulary and the request is a false-empty, not an error.
+    """
+    headers = {
+        "NGSILD-Tenant": tenant_id,
+        "Fiware-Service": tenant_id,
+        "Fiware-ServicePath": "/",
+        "Link": f'<{settings.context_url}>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{settings.orion_url}/ngsi-ld/v1/entities/{entity_id}",
+                params={"options": "keyValues"},
+                headers=headers,
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        logger.exception(
+            "_get_entity_keyvalues(tenant=%s, entity=%s) failed",
+            tenant_id, entity_id,
+        )
+        return None
+
+
+async def fetch_parcel_weather(tenant_id: str, parcel_id: str) -> dict | None:
+    """Meteo por parcela desde el broker: WeatherObserved + WeatherForecast.
+
+    Devuelve un dict plano con las claves que el motor de física necesita, o None si
+    no hay observación. Una clave cuyo dato no exista se OMITE: quien la necesite
+    lanzará MissingWeatherInput y el tile se saltará con un log ruidoso.
+    """
+    suffix = parcel_id.split(":")[-1]
+    observed = await _get_entity_keyvalues(
+        tenant_id, f"urn:ngsi-ld:WeatherObserved:{tenant_id}:parcel-{suffix}"
+    )
+    if not observed:
+        return None
+    forecast = await _get_entity_keyvalues(
+        tenant_id, f"urn:ngsi-ld:WeatherForecast:{tenant_id}:parcel-{suffix}"
+    ) or {}
+
+    out: dict = {}
+
+    def _put(key, source, *names):
+        value = None
+        for n in names:
+            value = source.get(n)
+            if value is not None:
+                break
+        if value is not None:
+            out[key] = float(value)
+
+    # Alias del @context: Orion devuelve el término que el productor NO usó.
+    _put("t_avg", observed, "airTemperature", "temperature")
+    _put("rh_avg", observed, "humidity", "relativeHumidity")
+    _put("wind_speed_ms", observed, "windSpeed")
+    _put("solar_rad_w_m2", observed, "solarRadiation")
+    _put("precip_mm", observed, "precipitation")
+
+    for key, attr in (("t_min", "dayMinimum"), ("t_max", "dayMaximum")):
+        block = forecast.get(attr) or {}
+        if block.get("temperature") is not None:
+            out[key] = float(block["temperature"])
+
+    coords = (observed.get("location") or {}).get("coordinates") or []
+    if len(coords) >= 3:
+        out["reference_altitude_m"] = float(coords[2])
+
+    observed_at = observed.get("dateObserved")
+    if isinstance(observed_at, dict):
+        observed_at = observed_at.get("@value")
+    if observed_at:
+        out["observed_at"] = observed_at
+
+    return out
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
