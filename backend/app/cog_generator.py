@@ -641,6 +641,25 @@ async def run_for_tenant(
             continue
 
         stats = compute_zonal_stats(tenant_id, geometry, settings.metrics)
+
+        # Weather can now legitimately be absent: when every tile of a metric
+        # returns None, `set_latest_date` never advances and this call — which
+        # passes no date — resolves to the PREVIOUS pointer. Publishing that
+        # would restate yesterday's pixels under a fresh `observedAt`. Stale
+        # data presented as current is worse than a gap: the gap is visible
+        # downstream, this is not. Spec §5.3: a record with an incomplete
+        # input set is not published.
+        stats_date = stats.get("date")
+        if stats_date != today:
+            logger.error(
+                "Not publishing AgriParcelRecord for parcel %s (tenant=%s): "
+                "zonal stats resolved to date=%r, not today's %s — the COG "
+                "pointer did not advance, so the record would republish stale "
+                "pixels under a fresh observedAt",
+                parcel_id, tenant_id, stats_date, today,
+            )
+            continue
+
         flat_metrics: dict[str, float] = {}
         for metric_name, metric_stats in stats.get("metrics", {}).items():
             if "error" in metric_stats or "mean" not in metric_stats:
