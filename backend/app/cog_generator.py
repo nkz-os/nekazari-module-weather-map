@@ -32,8 +32,15 @@ from app.downscaler import (
     get_texture_defaults,
 )
 from app.minio_io import set_latest_date, upload_cog
-from app.records import build_agri_parcel_record
-from app.sources import fetch_agri_soil, fetch_dem_tile, fetch_station_weather, upsert_record
+from app.records import build_agri_parcel_record, guard_frozen_metrics
+from app.sources import (
+    MissingWeatherInput,
+    fetch_agri_soil,
+    fetch_dem_tile,
+    fetch_parcel_weather,
+    require,
+    upsert_record,
+)
 from app.stats import compute_zonal_stats
 
 logger = logging.getLogger(__name__)
@@ -192,6 +199,31 @@ def _parcel_lonlat(parcel: dict[str, Any]) -> tuple[float, float] | None:
     return (sum(lons) / len(lons), sum(lats) / len(lats))
 
 
+def _nearest_parcel(
+    parcels: list[dict[str, Any]], lat: float, lon: float,
+) -> dict[str, Any] | None:
+    """Return the parcel whose centroid is closest to (lat, lon).
+
+    The weather base for a tile is the NEAREST parcel to its centre —
+    ``parcels[0]`` was rejected: with parcels spread far apart it would use
+    one parcel's weather for another parcel's tile. Squared-degree distance
+    is enough for this ranking; parcels are compared at tile scale, so
+    geodesic correction changes nothing here.
+    """
+    best: dict[str, Any] | None = None
+    best_dist = float("inf")
+    for parcel in parcels:
+        lonlat = _parcel_lonlat(parcel)
+        if lonlat is None:
+            continue
+        p_lon, p_lat = lonlat
+        dist = (p_lon - lon) ** 2 + (p_lat - lat) ** 2
+        if dist < best_dist:
+            best_dist = dist
+            best = parcel
+    return best
+
+
 # ---------------------------------------------------------------------------
 # Per-tile COG computation
 # ---------------------------------------------------------------------------
@@ -207,7 +239,8 @@ async def generate_cog_for_tile(
     date_to: str,
     tile_center_lat: float,
     tile_center_lon: float,
-    parcel_id: str = "",
+    parcels: list[dict[str, Any]],
+    weather_cache: dict[str, dict | None] | None = None,
 ) -> bytes | None:
     """Compute a weather raster for a single TMS tile and return COG bytes.
 
@@ -222,16 +255,25 @@ async def generate_cog_for_tile(
     date_from, date_to : str
         Date range (``"YYYY-MM-DD"``).
     tile_center_lat, tile_center_lon : float
-        Centre of the tile (used for nearest-station lookup).
-    parcel_id : str
-        NGSI-LD AgriParcel URN used to fetch the matching AgriSoil entity.
-        Pass the real parcel id so soil lookup uses actual parcel data.
+        Centre of the tile — used to pick the nearest parcel (weather base)
+        and, for ``soil_moisture``, the matching AgriSoil entity.
+    parcels : list[dict]
+        Tenant's parcels. The tile's weather (and soil) comes from the
+        parcel NEAREST to the tile centre, never ``parcels[0]``.
+    weather_cache : dict or None
+        Per-run cache, keyed by parcel id. The weather is identical for all
+        seven metrics and for every tile sharing the same nearest parcel, so
+        without it one run issues two Orion GETs per (metric × tile) — each
+        on a fresh ``AsyncClient`` — against a broker that deadlocked on
+        connection exhaustion. ``None`` means "no sharing": a private cache
+        is used, so a lone call still behaves identically.
 
     Returns
     -------
     bytes or None
         COG GeoTIFF bytes, or ``None`` if the tile could not be computed
-        (missing DEM, missing weather, or unsupported metric).
+        (missing DEM, no nearby parcel, missing weather, or unsupported
+        metric).
     """
     # ------------------------------------------------------------------
     # 1. Fetch DEM tile
@@ -274,44 +316,51 @@ async def generate_cog_for_tile(
     aspect = aspect_degrees(elevations, pixel_size_deg)
 
     # ------------------------------------------------------------------
-    # 3. Fetch station weather
+    # 3. Nearest parcel → its weather from the broker (no defaults)
     # ------------------------------------------------------------------
-    weather = await fetch_station_weather(
-        tenant_id, tile_center_lat, tile_center_lon, date_from, date_to,
-    )
+    nearest_parcel = _nearest_parcel(parcels, tile_center_lat, tile_center_lon)
+    if nearest_parcel is None:
+        logger.warning(
+            "No parcel with usable coordinates for tile %d/%d/%d (tenant=%s)",
+            z, x, y, tenant_id,
+        )
+        return None
+    parcel_id = nearest_parcel["id"]
+
+    if weather_cache is None:
+        weather_cache = {}
+    if parcel_id in weather_cache:
+        weather = weather_cache[parcel_id]
+    else:
+        # A missing observation is cached too — re-asking Orion once per tile
+        # for a parcel that has no weather is the expensive half of the bug.
+        weather = await fetch_parcel_weather(tenant_id, parcel_id)
+        weather_cache[parcel_id] = weather
     if weather is None:
         logger.warning(
-            "No weather data for tile %d/%d/%d", z, x, y,
+            "No weather observation for parcel %s (tile %d/%d/%d, tenant=%s)",
+            parcel_id, z, x, y, tenant_id,
         )
         return None
 
-    t_avg = float(
-        weather.get("t_avg", weather.get("temperature_avg", 15.0))
-    )
-    t_min = float(
-        weather.get("t_min", weather.get("temperature_min", 10.0))
-    )
-    t_max = float(
-        weather.get("t_max", weather.get("temperature_max", 20.0))
-    )
-    rh_avg = float(
-        weather.get("rh_avg", weather.get("humidity", 60.0))
-    )
-    wind_speed_ms = float(
-        weather.get("wind_speed_ms", weather.get("wind_speed", 2.0))
-    )
-    solar_rad_w_m2 = float(
-        weather.get(
-            "solar_rad_w_m2",
-            weather.get("solar_radiation", 200.0),
+    try:
+        t_avg = require(weather, "t_avg", "temperature_avg")
+        t_min = require(weather, "t_min", "temperature_min")
+        t_max = require(weather, "t_max", "temperature_max")
+        rh_avg = require(weather, "rh_avg", "humidity")
+        wind_speed_ms = require(weather, "wind_speed_ms", "wind_speed")
+        solar_rad_w_m2 = require(weather, "solar_rad_w_m2", "solar_radiation")
+        precip_mm = require(weather, "precip_mm", "precipitation")
+        # The altitude the readings are already downscaled to — the per-pixel
+        # correction below is RELATIVE to this, never to the DEM tile's own grid.
+        station_elevation = require(weather, "reference_altitude_m")
+    except MissingWeatherInput as exc:
+        logger.error(
+            "Skipping tile %d/%d/%d (tenant=%s, parcel=%s): missing weather input, tried %s",
+            z, x, y, tenant_id, parcel_id, exc.keys,
         )
-    )
-    precip_mm = float(
-        weather.get("precip_mm", weather.get("precipitation", 0.0))
-    )
-    station_elevation = float(
-        weather.get("elevation_m", weather.get("elevation", 0.0))
-    )
+        return None
+
     doy = (
         int(weather["doy"])
         if "doy" in weather
@@ -504,8 +553,9 @@ async def _generate_and_upload_cogs(
         tenant_id, len(tiles), zoom,
     )
 
-    # Use the first parcel's id for soil lookup (tiles span aggregate bbox)
-    first_parcel_id = parcels[0]["id"] if parcels else ""
+    # One broker read per parcel for the whole run, shared across every
+    # metric and every tile that resolves to the same nearest parcel.
+    weather_cache: dict[str, dict | None] = {}
 
     for metric in settings.metrics:
         logger.info(
@@ -526,7 +576,8 @@ async def _generate_and_upload_cogs(
             cog_bytes = await generate_cog_for_tile(
                 tenant_id, metric, z_tile, x_tile, y_tile,
                 date_from, date_to, tile_center_lat, tile_center_lon,
-                parcel_id=first_parcel_id,
+                parcels=parcels,
+                weather_cache=weather_cache,
             )
 
             if cog_bytes is not None:
@@ -611,6 +662,25 @@ async def run_for_tenant(
             continue
 
         stats = compute_zonal_stats(tenant_id, geometry, settings.metrics)
+
+        # Weather can now legitimately be absent: when every tile of a metric
+        # returns None, `set_latest_date` never advances and this call — which
+        # passes no date — resolves to the PREVIOUS pointer. Publishing that
+        # would restate yesterday's pixels under a fresh `observedAt`. Stale
+        # data presented as current is worse than a gap: the gap is visible
+        # downstream, this is not. Spec §5.3: a record with an incomplete
+        # input set is not published.
+        stats_date = stats.get("date")
+        if stats_date != today:
+            logger.error(
+                "Not publishing AgriParcelRecord for parcel %s (tenant=%s): "
+                "zonal stats resolved to date=%r, not today's %s — the COG "
+                "pointer did not advance, so the record would republish stale "
+                "pixels under a fresh observedAt",
+                parcel_id, tenant_id, stats_date, today,
+            )
+            continue
+
         flat_metrics: dict[str, float] = {}
         for metric_name, metric_stats in stats.get("metrics", {}).items():
             if "error" in metric_stats or "mean" not in metric_stats:
@@ -624,6 +694,7 @@ async def run_for_tenant(
             metrics=flat_metrics,
             observed_at=observed_at,
         )
+        await guard_frozen_metrics(tenant_id, parcel_id, flat_metrics)
         await upsert_record(tenant_id, record)
         logger.info(
             "Persisted AgriParcelRecord for parcel %s / tenant %s",

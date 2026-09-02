@@ -7,7 +7,11 @@ which have no external dependencies.  Async integration tests that exercise
 
 from __future__ import annotations
 
+import logging
+from unittest.mock import AsyncMock
 
+import numpy as np
+import pytest
 
 from app.cog_generator import _bbox_to_tiles, _tile_to_bbox
 
@@ -153,24 +157,144 @@ class TestBboxToTiles:
 
 
 # ======================================================================
-# generate_cog_for_tile — minimal import / stub test
+# generate_cog_for_tile — comportamiento, no "es invocable"
+#
+# Esta función solo tenía tests de "callable / is async": por eso un cambio
+# de firma pasó desapercibido y en verde. Los dos invariantes de toda esta
+# rama son (1) sin meteo no se fabrica nada, y (2) la corrección de altitud
+# se hace RESPECTO A la altitud a la que ya está bajado el dato —
+# `location[2]` de WeatherObserved— nunca respecto al grid del DEM.
 # ======================================================================
 
 
+PARCEL = {"id": "urn:ngsi-ld:AgriParcel:p1", "lon": -1.65, "lat": 42.8}
+
+WEATHER = {
+    "t_avg": 21.0,
+    "t_min": 17.3,
+    "t_max": 32.2,
+    "rh_avg": 60.0,
+    "wind_speed_ms": 2.5,
+    "solar_rad_w_m2": 229.4,
+    "precip_mm": 0.0,
+    "reference_altitude_m": 572.8,   # tercera coordenada de location
+}
+
+# Elevaciones del tile MUY lejos de los 572.8 m de referencia: si la
+# corrección se hiciera contra el grid, el test lo vería.
+DEM_BASE_ELEVATION = 1200.0
+
+
+def _dem(rows: int = 8, cols: int = 8) -> dict:
+    return {
+        "elevations": [
+            [DEM_BASE_ELEVATION + r * 10.0 + c for c in range(cols)]
+            for r in range(rows)
+        ],
+        "origin_lon": -1.65,
+        "origin_lat": 42.8,
+        "pixel_size_deg": 0.0001,
+        "cols": cols,
+        "rows": rows,
+    }
+
+
+async def _tile(cg, metric="temperature_avg"):
+    return await cg.generate_cog_for_tile(
+        "asociacion-allotarra", metric, 14, 8117, 6038,
+        "2026-09-01", "2026-09-02", 42.8, -1.65, parcels=[PARCEL],
+    )
+
+
 class TestGenerateCogForTile:
-    """Async integration tests are stubbed — real HTTP calls avoided."""
+    """Comportamiento con y sin meteo — sin HTTP real."""
 
-    def test_module_imports(self):
-        """The module imports successfully."""
-        from app.cog_generator import generate_cog_for_tile, run_for_tenant
+    @pytest.mark.asyncio
+    async def test_absent_observation_yields_no_tile(self, monkeypatch):
+        from app import cog_generator as cg
 
-        assert callable(generate_cog_for_tile)
-        assert callable(run_for_tenant)
+        monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=_dem()))
+        monkeypatch.setattr(cg, "fetch_parcel_weather", AsyncMock(return_value=None))
+        assert await _tile(cg) is None
 
-    def test_generate_cog_is_coroutine(self):
-        """generate_cog_for_tile is an async function."""
-        from app.cog_generator import generate_cog_for_tile
+    @pytest.mark.asyncio
+    async def test_incomplete_weather_returns_none_and_fabricates_nothing(
+        self, monkeypatch, caplog,
+    ):
+        """Falta t_min: se salta el tile con log ERROR y la física NO se llama.
+        El bug original era exactamente esto resuelto con un 10.0."""
+        from app import cog_generator as cg
 
-        import asyncio
+        physics_calls: list = []
+        incomplete = {k: v for k, v in WEATHER.items() if k != "t_min"}
 
-        assert asyncio.iscoroutinefunction(generate_cog_for_tile)
+        monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=_dem()))
+        monkeypatch.setattr(cg, "fetch_parcel_weather", AsyncMock(return_value=incomplete))
+        monkeypatch.setattr(
+            cg, "correct_temperature", lambda *a: physics_calls.append(a),
+        )
+
+        with caplog.at_level(logging.ERROR):
+            result = await _tile(cg)
+
+        assert result is None
+        assert physics_calls == [], "no se calcula nada sobre una entrada ausente"
+        assert "t_min" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_altitude_correction_uses_the_observation_altitude(self, monkeypatch):
+        """`station_elevation` es `reference_altitude_m` (location[2]), no la
+        elevación del grid del DEM: la corrección es RELATIVA a la altitud a
+        la que el dato ya viene bajado."""
+        from app import cog_generator as cg
+
+        seen: dict = {}
+
+        def _spy(t_base, station_elevation_m, pixel_elevations):
+            seen["t_base"] = t_base
+            seen["station"] = station_elevation_m
+            return np.asarray(pixel_elevations, dtype=float) * 0.0 + t_base
+
+        monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=_dem()))
+        monkeypatch.setattr(cg, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+        monkeypatch.setattr(cg, "correct_temperature", _spy)
+
+        result = await _tile(cg)
+
+        assert result is not None and len(result) > 0
+        assert seen["t_base"] == 21.0
+        assert seen["station"] == 572.8
+        assert seen["station"] != DEM_BASE_ELEVATION
+
+    @pytest.mark.asyncio
+    async def test_weather_is_read_once_per_parcel_per_run(self, monkeypatch):
+        """2 GETs a Orion por (métrica x tile), sin caché, con un AsyncClient
+        nuevo cada vez: siete métricas por un número de tiles sin tope son
+        miles de conexiones por tenant y por cron contra un broker que ya
+        tuvo un deadlock por agotamiento de conexiones. La meteo es la misma
+        para las siete métricas y para todo tile con la misma parcela."""
+        from app import cog_generator as cg
+
+        reads: list[str] = []
+
+        async def _weather(tenant_id, parcel_id):
+            reads.append(parcel_id)
+            return dict(WEATHER)
+
+        monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=_dem()))
+        monkeypatch.setattr(cg, "fetch_parcel_weather", _weather)
+        monkeypatch.setattr(cg, "upload_cog", lambda *a, **kw: True)
+        monkeypatch.setattr(cg, "set_latest_date", lambda *a, **kw: True)
+        monkeypatch.setattr(
+            cg.settings, "metrics",
+            ["temperature_avg", "temperature_min", "frost_risk"],
+        )
+
+        await cg._generate_and_upload_cogs(
+            "asociacion-allotarra", [PARCEL], "2026-09-01", "2026-09-02", 14,
+            "2026-09-02",
+        )
+
+        assert reads == ["urn:ngsi-ld:AgriParcel:p1"], (
+            f"la meteo de una parcela se leyó {len(reads)} veces en un run"
+        )

@@ -19,6 +19,291 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Weather input extraction
+# ---------------------------------------------------------------------------
+
+
+class MissingWeatherInput(Exception):
+    """Falta una entrada meteorológica obligatoria.
+
+    Se lanza en vez de devolver un default. El pipeline calculó sobre constantes
+    durante tres meses porque un `.get(clave, 15.0)` convertía la ausencia en un
+    número plausible. Un hueco es honesto; un número inventado no.
+    """
+
+    def __init__(self, keys):
+        self.keys = tuple(keys)
+        super().__init__(f"missing weather input, tried: {', '.join(self.keys)}")
+
+
+def _as_float(value: Any) -> float | None:
+    """`float(value)` o `None` si el valor no es un escalar numérico.
+
+    Un `float()` desnudo sobre un dict anidado, una lista o `"n/a"` lanza
+    TypeError/ValueError, que escapa al handler de `MissingWeatherInput` y
+    aborta el run del tenant a mitad de métrica — algunos COGs subidos, el
+    puntero volteado, ningún registro escrito. Un valor malformado debe
+    saltarse como uno ausente, no derribar el run.
+    """
+    if value is None or isinstance(value, (dict, list, tuple, set, bool)):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def require(payload: dict, *keys) -> float:
+    """Primera clave presente entre `keys`. Lanza `MissingWeatherInput` si ninguna.
+
+    Acepta varios nombres porque el @context de la plataforma no es inyectivo: la
+    compactación devuelve el alias que el escritor no usó (`airTemperature` donde
+    el productor escribió `temperature`).
+
+    Un valor presente pero no convertible a float cuenta como ausente: se
+    prueba la siguiente clave y, si ninguna sirve, se lanza
+    `MissingWeatherInput` — nunca TypeError/ValueError, que nadie captura.
+    """
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        as_float = _as_float(value)
+        if as_float is not None:
+            return as_float
+        logger.warning(
+            "weather input %r present but not numeric (%r) — treating as missing",
+            key, value,
+        )
+    raise MissingWeatherInput(keys)
+
+
+async def _get_entity_keyvalues(tenant_id: str, entity_id: str) -> dict | None:
+    """GET a single NGSI-LD entity in ``keyValues`` form, or ``None`` on 404/error.
+
+    Same header construction as ``fetch_tenant_parcels`` (Link header carrying the
+    platform ``@context``) — without it Orion silently expands attribute names
+    against the default vocabulary and the request is a false-empty, not an error.
+    """
+    headers = {
+        "NGSILD-Tenant": tenant_id,
+        "Fiware-Service": tenant_id,
+        "Fiware-ServicePath": "/",
+        "Link": f'<{settings.context_url}>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{settings.orion_url}/ngsi-ld/v1/entities/{entity_id}",
+                params={"options": "keyValues"},
+                headers=headers,
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+    except Exception:
+        logger.exception(
+            "_get_entity_keyvalues(tenant=%s, entity=%s) failed",
+            tenant_id, entity_id,
+        )
+        return None
+
+
+async def fetch_parcel_weather(tenant_id: str, parcel_id: str) -> dict | None:
+    """Meteo por parcela desde el broker: WeatherObserved + WeatherForecast.
+
+    Devuelve un dict plano con las claves que el motor de física necesita, o None si
+    no hay observación. Una clave cuyo dato no exista se OMITE: quien la necesite
+    lanzará MissingWeatherInput y el tile se saltará con un log ruidoso.
+    """
+    suffix = parcel_id.split(":")[-1]
+    observed = await _get_entity_keyvalues(
+        tenant_id, f"urn:ngsi-ld:WeatherObserved:{tenant_id}:parcel-{suffix}"
+    )
+    if not observed:
+        return None
+    forecast = await _get_entity_keyvalues(
+        tenant_id, f"urn:ngsi-ld:WeatherForecast:{tenant_id}:parcel-{suffix}"
+    ) or {}
+
+    out: dict = {}
+
+    def _put(key, source, *names):
+        for name in names:
+            raw = source.get(name)
+            if raw is None:
+                continue
+            value = _as_float(raw)
+            if value is not None:
+                out[key] = value
+                return
+            logger.warning(
+                "%s=%r on %s is not numeric — omitting %s",
+                name, raw, parcel_id, key,
+            )
+
+    # Alias del @context: Orion devuelve el término que el productor NO usó.
+    _put("t_avg", observed, "airTemperature", "temperature")
+    _put("rh_avg", observed, "humidity", "relativeHumidity")
+    _put("wind_speed_ms", observed, "windSpeed")
+    _put("solar_rad_w_m2", observed, "solarRadiation")
+    _put("precip_mm", observed, "precipitation")
+
+    for key, attr in (("t_min", "dayMinimum"), ("t_max", "dayMaximum")):
+        block = forecast.get(attr) or {}
+        if isinstance(block, dict):
+            _put(key, block, "temperature")
+
+    coords = (observed.get("location") or {}).get("coordinates") or []
+    if len(coords) >= 3:
+        altitude = _as_float(coords[2])
+        if altitude is not None:
+            out["reference_altitude_m"] = altitude
+
+    observed_at = observed.get("dateObserved")
+    if isinstance(observed_at, dict):
+        observed_at = observed_at.get("@value")
+    if observed_at:
+        out["observed_at"] = observed_at
+
+    return out
+
+
+class HistoryReadFailed(Exception):
+    """The history read did not complete — this is NOT "no history yet".
+
+    Every non-404 outcome (a 400 on `orderBy`, an Orion 500, a timeout, a
+    malformed body) used to return `[]`, which `guard_frozen_metrics` cannot
+    tell apart from a brand-new parcel. A guard that quietly disables itself
+    on the first broken read is the same silent failure this whole branch
+    exists to remove, one level up. Raise; the caller logs it as loudly as a
+    frozen metric and skips only that one check.
+    """
+
+
+class MissingContextURL(HistoryReadFailed):
+    """`CONTEXT_URL` is not configured — refusing a history read that would
+    otherwise silently false-empty.
+
+    Without the platform `@context` Link header, Orion expands attribute and
+    type names against the default vocabulary and a query returns zero
+    matches — a broken query that LOOKS exactly like "no history yet" (see
+    `_get_entity_keyvalues`). A guard that can't tell "new parcel" from
+    "couldn't even ask the question" is not a guard; refuse instead of
+    returning `[]`.
+    """
+
+
+async def fetch_metric_history(
+    tenant_id: str, parcel_id: str, attr_name: str, limit: int = 5,
+) -> list[float]:
+    """Return up to *limit* prior published values of *attr_name* for one
+    parcel's own `AgriParcelRecord` history, oldest first.
+
+    Returns ``[]`` ONLY when there is genuinely no history (a 404, or no
+    record of this producer). Any read that did not complete raises
+    `HistoryReadFailed` — a transport failure must never be mistaken for a
+    new parcel, and neither must an unset `CONTEXT_URL` (`MissingContextURL`,
+    a subclass).
+
+    Ordering is done here, client-side, on the compact timestamp weather-map
+    itself writes into the record id. `orderBy=dateObserved:desc` is sent as
+    a server-side hint to narrow `limit` to the recent window, but it is NOT
+    verified against Orion-LD over a nested `{"@type":"DateTime"}` Property:
+    if it is rejected the read now fails loudly, and if it is silently
+    ignored the returned order is checked and reported. Correctness of the
+    order never depends on it.
+
+    `AgriParcelRecord` is shared with a field-photo pipeline (ids prefixed
+    `photo-`, also related to the same parcel via `hasAgriParcel`) — records
+    are filtered to weather-map's own `weather-` id prefix so a photo upload
+    is never read as a weather sample. Same broker-read shape as
+    `fetch_tenant_parcels` (manual `@context` Link header) combined with the
+    `q=hasAgriParcel==` + `orderBy` filter already used in `zones.py`.
+    """
+    if not settings.context_url:
+        raise MissingContextURL()
+
+    headers = {
+        "NGSILD-Tenant": tenant_id,
+        "Fiware-Service": tenant_id,
+        "Fiware-ServicePath": "/",
+        "Link": f'<{settings.context_url}>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{settings.orion_url}/ngsi-ld/v1/entities",
+                params={
+                    "type": "AgriParcelRecord",
+                    "q": f'hasAgriParcel=="{parcel_id}"',
+                    "attrs": attr_name,
+                    "options": "keyValues",
+                    "orderBy": "dateObserved:desc",
+                    "limit": limit,
+                },
+                headers=headers,
+            )
+            if resp.status_code == 404:
+                return []  # genuine absence: no record for this parcel
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        logger.exception(
+            "fetch_metric_history(tenant=%s, parcel=%s, attr=%s) failed",
+            tenant_id, parcel_id, attr_name,
+        )
+        raise HistoryReadFailed(
+            f"history read failed for {attr_name} on {parcel_id}: {exc!r}"
+        ) from exc
+
+    if not isinstance(data, list):
+        raise HistoryReadFailed(
+            f"history read for {attr_name} on {parcel_id} returned "
+            f"{type(data).__name__}, expected a list"
+        )
+
+    samples: list[tuple[str, float]] = []
+    for entity in data:
+        entity_id = entity.get("id", "")
+        if not entity_id.rsplit(":", 1)[-1].startswith("weather-"):
+            continue  # another producer's record (e.g. field-photo `photo-...`)
+        stamp = _record_timestamp(entity_id)
+        if stamp is None:
+            logger.warning(
+                "AgriParcelRecord %s carries no sortable timestamp in its id "
+                "— excluded from the variance history", entity_id,
+            )
+            continue
+        value = entity.get(attr_name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            samples.append((stamp, value))
+
+    as_received = [stamp for stamp, _ in samples]
+    samples.sort(key=lambda sample: sample[0])  # oldest first — the guard's contract
+    if len(samples) > 1 and as_received != [stamp for stamp, _ in reversed(samples)]:
+        logger.warning(
+            "Orion did not honour orderBy=dateObserved:desc for %s on %s — the "
+            "client-side sort fixed the order, but `limit` then selects an "
+            "arbitrary window and the variance guard sees less than the most "
+            "recent samples", attr_name, parcel_id,
+        )
+    return [float(value) for _, value in samples]
+
+
+def _record_timestamp(entity_id: str) -> str | None:
+    """Compact timestamp weather-map writes at the end of its own record ids.
+
+    `build_agri_parcel_record` builds
+    ``urn:ngsi-ld:AgriParcelRecord:weather-{tenant}-{parcel}-{YYYYMMDDHHMMSS}``.
+    Lexicographic order over that suffix IS chronological order, and it is a
+    value this module writes — unlike the server-side `orderBy`.
+    """
+    tail = entity_id.rsplit(":", 1)[-1].rsplit("-", 1)[-1]
+    return tail if tail.isdigit() else None
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -94,46 +379,6 @@ async def fetch_dem_tile(z: int, x: int, y: int) -> dict[str, Any] | None:
     except Exception:
         logger.exception(
             "fetch_dem_tile(z=%d, x=%d, y=%d) failed", z, x, y
-        )
-        return None
-
-
-async def fetch_station_weather(
-    tenant_id: str,
-    lat: float,
-    lon: float,
-    date_from: str,
-    date_to: str,
-) -> dict[str, Any] | None:
-    """Fetch weather data from the nearest station to (lat, lon).
-
-    Returns
-    -------
-    dict or None
-        JSON payload from the weather API, or ``None`` on failure.
-    """
-    params: dict[str, Any] = {
-        "lat": lat,
-        "lon": lon,
-        "date_from": date_from,
-        "date_to": date_to,
-    }
-    headers = {"X-Tenant-ID": tenant_id}
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{settings.weather_api_url}/api/weather/coordinates",
-                params=params,
-                headers=headers,
-            )
-            resp.raise_for_status()
-            return resp.json()
-    except Exception:
-        logger.exception(
-            "fetch_station_weather(tenant=%s, lat=%f, lon=%f) failed",
-            tenant_id,
-            lat,
-            lon,
         )
         return None
 

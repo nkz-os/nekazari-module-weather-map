@@ -7,8 +7,13 @@ never reach TimescaleDB.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
+
+from app.sources import HistoryReadFailed, MissingContextURL, fetch_metric_history
+
+logger = logging.getLogger(__name__)
 
 # weather-map internal metric name -> AgriParcelRecord attribute name.
 # Standard SDM names where they exist; custom scalar names otherwise.
@@ -32,6 +37,92 @@ _METRIC_TO_ATTR = {
     "temperature_avg": "airTemperatureAvg",
     "temperature_min": "airTemperatureMin",
 }
+
+
+class FrozenMetric(Exception):
+    """A published metric shows zero variance over its last 3 samples.
+
+    Raised instead of letting the value publish unremarked. This is the guard
+    that would have caught `airTemperatureAvg = 14.934`, identical to five
+    decimals, across 32 straight August days: no exception, no error log, no
+    failing test, percentiles and histograms computed faithfully over a
+    constant. Zero variance in 3 consecutive daily values is the same cheap
+    signature shared by a constant-fed pipeline, a frozen upstream source,
+    and a silent `.get(key, default)` — it doesn't matter which caused it.
+
+    Same calling convention as `MissingWeatherInput` in `sources.py`: the
+    caller must log at ERROR and skip that one metric — never let one frozen
+    metric abort the whole cron run.
+    """
+
+    def __init__(self, last_three: list[float]):
+        self.last_three = list(last_three)
+        super().__init__(f"metric frozen at {last_three[-1]!r} for 3 consecutive samples")
+
+
+def assert_metric_varies(history: list[float]) -> None:
+    """Raise `FrozenMetric` if the 3 most recent values in `history` are identical.
+
+    `AgriParcelRecord` is written once a day, so `history` is expected to be
+    the last N daily values for one metric on one parcel, oldest first. Fewer
+    than 3 samples is not enough to judge — two identical days happens in
+    genuinely stable weather — so this returns `None` rather than guessing.
+    """
+    if len(history) < 3:
+        return
+    last_three = history[-3:]
+    if len(set(last_three)) == 1:
+        raise FrozenMetric(last_three)
+
+
+async def guard_frozen_metrics(
+    tenant_id: str, parcel_id: str, metrics: dict[str, float],
+) -> None:
+    """Check each about-to-publish metric against its own history; log loud,
+    never block. Call this from the publish path, before the record is
+    upserted — the record still publishes either way.
+
+    A metric with fewer than 3 total samples (new parcel, or fewer than 2
+    prior days on record) stays silent: `assert_metric_varies` returns
+    `None` and nothing is logged — a new parcel is not a frozen one.
+
+    A `HistoryReadFailed` (or its `MissingContextURL` subclass) is a
+    different failure: the guard could not even ask the question, which must
+    not be mistaken for "no history yet" (see `fetch_metric_history`). Logged
+    at ERROR — as loudly as a frozen metric, because a guard that quietly
+    disables itself is the same silent outcome one level up. Only that one
+    metric's check is skipped; the record still publishes.
+    """
+    for metric_name, value in metrics.items():
+        attr = _METRIC_TO_ATTR.get(metric_name)
+        if attr is None or value is None or isinstance(value, (dict, list)):
+            continue
+        try:
+            history = await fetch_metric_history(tenant_id, parcel_id, attr)
+        except MissingContextURL:
+            logger.error(
+                "Cannot check %s for tenant=%s parcel=%s: CONTEXT_URL is not "
+                "configured, history read would false-empty — skipping the "
+                "variance check for this metric, publishing anyway",
+                attr, tenant_id, parcel_id,
+            )
+            continue
+        except HistoryReadFailed as exc:
+            logger.error(
+                "Cannot check %s for tenant=%s parcel=%s: history read failed "
+                "(%s) — a broken read is NOT 'no history yet'; skipping the "
+                "variance check for this metric, publishing anyway",
+                attr, tenant_id, parcel_id, exc,
+            )
+            continue
+        try:
+            assert_metric_varies(history + [float(value)])
+        except FrozenMetric:
+            logger.error(
+                "FROZEN METRIC: %s=%r repeated for 3 consecutive samples "
+                "(tenant=%s, parcel=%s) — publishing anyway, needs review",
+                attr, value, tenant_id, parcel_id,
+            )
 
 
 def _parcel_short(parcel_id: str) -> str:
