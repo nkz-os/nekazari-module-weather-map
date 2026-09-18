@@ -39,6 +39,7 @@ class Settings:
     
     auth_disabled: bool = os.getenv("AUTH_DISABLED", "false").lower() == "true"
     internal_service_secret: str = os.getenv("INTERNAL_SERVICE_SECRET", "")
+    tile_token_secret: str = os.getenv("TILE_TOKEN_SECRET", "")
     cors_origins: str = os.getenv("CORS_ORIGINS", "https://nekazari.robotika.cloud")
 
     @property

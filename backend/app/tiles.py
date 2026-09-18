@@ -23,6 +23,7 @@ from rasterio.windows import Window
 
 from app.auth import require_tenant
 from app.config import settings
+from app.tile_auth import make_tile_token, verify_tile_token
 from app.minio_io import download_cog, get_latest_date
 from app.color_scales import apply_color_scale
 from app.records import build_agri_parcel_record, guard_frozen_metrics
@@ -54,13 +55,32 @@ async def latest_raster_date(
     return {"metric": metric, "date": date}
 
 
+@router.get("/tiles-base/{metric}")
+async def tiles_base_url(metric: str, tenant_id: str = Depends(require_tenant)):
+    """Mint a short-lived signed token for Cesium tile requests.
+
+    Tile fetches are plain image requests without headers or credentials, so the
+    JWT/header auth used elsewhere cannot apply. This authenticated endpoint
+    returns a tenant/metric-bound token the tile route validates instead.
+    """
+    if metric not in settings.metrics:
+        raise HTTPException(status_code=404, detail=f"Unknown metric: {metric}")
+    if not settings.tile_token_secret:
+        raise HTTPException(
+            status_code=503, detail="Tile token secret is not configured"
+        )
+    token, expires = make_tile_token(tenant_id, metric)
+    return {"tenant": tenant_id, "token": token, "expires": expires}
+
+
 @router.get("/tiles/{metric}/{z}/{x}/{y}.png")
 async def serve_tile(
     metric: str,
     z: int,
     x: int,
     y: int,
-    tenant_id: str = Depends(require_tenant),
+    tenant: Optional[str] = Query(None, description="Tenant bound into the signed token"),
+    token: Optional[str] = Query(None, description="Short-lived signed tile token"),
     date: Optional[str] = Query(None),
 ):
     """Serve a PNG map tile for a given weather metric and zoom/tile coordinates.
@@ -98,11 +118,14 @@ async def serve_tile(
             status_code=404, detail=f"Unknown metric: {metric}"
         )
 
+    if not verify_tile_token(token, tenant, metric):
+        raise HTTPException(status_code=401, detail="Invalid or expired tile token")
+
     # -------------------------------------------------------------------
     # 2. Resolve date (latest if not specified)
     # -------------------------------------------------------------------
     if date is None:
-        date = get_latest_date(tenant_id, metric)
+        date = get_latest_date(tenant, metric)
         if date is None:
             raise HTTPException(
                 status_code=404,
@@ -112,7 +135,7 @@ async def serve_tile(
     # -------------------------------------------------------------------
     # 3. Download COG bytes
     # -------------------------------------------------------------------
-    cog_bytes = download_cog(tenant_id, metric, date, z, x, y)
+    cog_bytes = download_cog(tenant, metric, date, z, x, y)
     if cog_bytes is None:
         raise HTTPException(
             status_code=404, detail="Tile not found"

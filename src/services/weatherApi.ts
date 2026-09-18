@@ -12,3 +12,18 @@ export async function fetchLatestWeatherDate(metric: string): Promise<string | n
   const data = (await resp.json()) as { date?: string };
   return data.date ?? null;
 }
+
+export interface TileToken {
+  tenant: string;
+  token: string;
+  expires: number;
+}
+
+export async function fetchTileToken(metric: string): Promise<TileToken | null> {
+  const resp = await fetch(`${apiBase()}/api/weather-map/tiles-base/${encodeURIComponent(metric)}`, {
+    credentials: 'include',
+    headers: { Accept: 'application/json' },
+  });
+  if (!resp.ok) return null;
+  return (await resp.json()) as TileToken;
+}
