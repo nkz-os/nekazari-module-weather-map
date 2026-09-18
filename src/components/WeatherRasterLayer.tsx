@@ -1,7 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { useViewerOptional } from '@nekazari/sdk';
 import { useWeatherLayerContext } from '../services/weatherLayerContext';
-import { fetchLatestWeatherDate } from '../services/weatherApi';
+import { fetchLatestWeatherDate, fetchTileToken } from '../services/weatherApi';
 
 const API_BASE =
   (import.meta as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL
@@ -67,31 +67,41 @@ const WeatherRasterLayer: React.FC = () => {
     setStatus('loading');
     resolvedDateRef.current = date;
 
-    try {
-      // Tile requests are plain XHR from Cesium: mark the API host as trusted
-      // so the nkz_token cookie travels with them (require_tenant on backend).
-      const apiHost = new URL(API_BASE).hostname;
-      CesiumLib.TrustedServers.add(apiHost, 443);
+    (async () => {
+      try {
+        // Cesium tile requests are plain image GETs with no headers and no
+        // credentials, so they cannot use JWT/cookie auth. Mint a short-lived
+        // signed token (tenant+metric bound) and pass it in the query string.
+        const t = await fetchTileToken(metric);
+        if (cancelled) return;
+        if (!t || v?.isDestroyed?.()) {
+          setStatus('error');
+          return;
+        }
 
-      const provider = new CesiumLib.UrlTemplateImageryProvider({
-        url: `${API_BASE}/api/weather-map/tiles/${encodeURIComponent(metric)}/{z}/{x}/{y}.png?date=${encodeURIComponent(date)}`,
-        tilingScheme: new CesiumLib.WebMercatorTilingScheme(),
-        maximumLevel: TILE_LEVEL,
-        // Cut global 404 spam: weather COGs only cover EU tenants.
-        rectangle: CesiumLib.Rectangle.fromDegrees(-11.0, 34.0, 32.0, 62.0),
-        enablePickFeatures: false,
-      });
-      if (cancelled || v?.isDestroyed?.()) return;
-      const layer = v?.imageryLayers?.addImageryProvider(provider);
-      if (layer) {
-        layer.alpha = opacity;
-        layerRef.current = layer;
-        setStatus('ready');
+        const apiHost = new URL(API_BASE).hostname;
+        CesiumLib.TrustedServers.add(apiHost, 443);
+
+        const provider = new CesiumLib.UrlTemplateImageryProvider({
+          url: `${API_BASE}/api/weather-map/tiles/${encodeURIComponent(metric)}/{z}/{x}/{y}.png?date=${encodeURIComponent(date)}&tenant=${encodeURIComponent(t.tenant)}&token=${encodeURIComponent(t.token)}`,
+          tilingScheme: new CesiumLib.WebMercatorTilingScheme(),
+          maximumLevel: TILE_LEVEL,
+          // Cut global 404 spam: weather COGs only cover EU tenants.
+          rectangle: CesiumLib.Rectangle.fromDegrees(-11.0, 34.0, 32.0, 62.0),
+          enablePickFeatures: false,
+        });
+        if (cancelled || v?.isDestroyed?.()) return;
+        const layer = v?.imageryLayers?.addImageryProvider(provider);
+        if (layer) {
+          layer.alpha = opacity;
+          layerRef.current = layer;
+          setStatus('ready');
+        }
+      } catch (err) {
+        console.error('[WeatherMap] tile layer failed:', err);
+        if (!cancelled) setStatus('error');
       }
-    } catch (err) {
-      console.error('[WeatherMap] tile layer failed:', err);
-      if (!cancelled) setStatus('empty');
-    }
+    })();
 
     return () => {
       cancelled = true;
