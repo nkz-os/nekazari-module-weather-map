@@ -1,0 +1,8 @@
+name: Public Repo Hygiene
+
+on:
+  pull_request:
+
+jobs:
+  hygiene:
+    uses: nkz-os/nkz/.github/workflows/_public-repo-hygiene.yml@main
