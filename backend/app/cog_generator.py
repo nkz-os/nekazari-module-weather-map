@@ -18,6 +18,7 @@ import numpy as np
 import rasterio
 from nkz_platform_sdk.gis.terrain import aspect_degrees, slope_degrees
 from rasterio.crs import CRS
+from rasterio.features import geometry_mask
 from rasterio.transform import from_bounds
 
 from app.config import settings
@@ -326,6 +327,7 @@ async def generate_cog_for_tile(
         )
         return None
     parcel_id = nearest_parcel["id"]
+    parcel_geom = _parcel_geometry(nearest_parcel)
 
     if weather_cache is None:
         weather_cache = {}
@@ -493,6 +495,18 @@ async def generate_cog_for_tile(
         origin_lat + pixel_size_deg * rows,
         cols, rows,
     )
+
+    # Clip the raster to the parcel polygon: outside the parcel the
+    # per-parcel downscaling is not meaningful, and the other modules
+    # (vegetation, soil) serve parcel-clipped layers.
+    if parcel_geom is not None:
+        inside = geometry_mask(
+            [parcel_geom],
+            out_shape=(rows, cols),
+            transform=transform,
+            invert=True,
+        )
+        result = np.where(inside, result, np.nan)
 
     buffer = io.BytesIO()
     with rasterio.open(
