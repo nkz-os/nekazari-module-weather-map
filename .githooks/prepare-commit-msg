@@ -4,6 +4,10 @@ MSG_FILE="$1"
 tmp=$(mktemp)
 sed \
   -e '/^[Cc][Oo]-[Aa]uthored-[Bb]y:/d' \
+  -e '/^[Cc]laude-[Ss]ession:/d' \
+  -e '/claude\.ai\/code\/session/d' \
+  -e '/[Gg]enerated with .*[Cc]laude/d' \
+  -e '/noreply@anthropic\.com/d' \
   -e '/^[Mm]ade-[Ww]ith:/d' \
   -e '/^[Mm]ade [Ww]ith [Cc]ursor/d' \
   -e '/^[Mm]ade [Bb]y [Cc]ursor/d' \
