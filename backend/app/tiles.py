@@ -15,11 +15,9 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import cv2
-import numpy as np
+import rasterio
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-import rasterio
-from rasterio.windows import Window
 
 from app.auth import require_tenant
 from app.config import settings
@@ -146,13 +144,15 @@ async def serve_tile(
     # -------------------------------------------------------------------
     try:
         with rasterio.open(io.BytesIO(cog_bytes)) as src:
-            window = Window(0, 0, min(src.width, 256), min(src.height, 256))
-            band = src.read(1, window=window)
+            band = src.read(1)
+            # The COG is generated at 10 m resolution for the tile bbox, so it
+            # is ~245x194, not the 256x256 Cesium expects. Resize to fill the
+            # tile instead of padding top-left (which shifted the raster
+            # north-west and left it undersized).
             if band.shape != (256, 256):
-                padded = np.full((256, 256), np.nan, dtype=np.float32)
-                h, w = band.shape
-                padded[:h, :w] = band
-                band = padded
+                band = cv2.resize(
+                    band, (256, 256), interpolation=cv2.INTER_LINEAR
+                )
     except Exception:
         logger.exception("Failed to read COG tile %s/%s/%s/%s", metric, z, x, y)
         raise HTTPException(status_code=500, detail="Failed to read raster data")
