@@ -18,6 +18,7 @@ import numpy as np
 from app.config import settings
 from app.downscaler import compute_zones, correct_temperature, compute_eto
 from app.records import build_agri_parcel_zone
+from nkz_platform_sdk import OrionClient
 from app.sources import (
     MissingWeatherInput,
     fetch_dem_tile,
@@ -284,6 +285,46 @@ async def process_parcel(
     return entity_list
 
 
+async def _delete_stale_zones(
+    tenant_id: str,
+    parcel_id: str,
+    keep_ids: set[str],
+) -> None:
+    """Delete weather-map zones for a parcel whose id is no longer produced.
+
+    Only zones with the weather-map id scheme (``z<geohash>-e<band>-<sector>``)
+    are touched — hydrology TWI zones (``twi-*``) are left alone. Keeps the
+    broker free of orphaned zones when the DEM tile set or zoning parameters
+    change and a zone id disappears between runs.
+    """
+    orion = OrionClient(tenant_id)
+    try:
+        rows = await orion.query_entities(
+            type="AgriParcelZone",
+            q=f'(hasAgriParcel=="{parcel_id}")',
+            options="keyValues",
+            limit=200,
+        ) or []
+        deleted = 0
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            eid = r.get("id") or ""
+            zid = str(r.get("nkz:zoneId") or r.get("zoneId") or eid.split(":")[-1])
+            if not (zid.startswith("z") and "-e" in zid):
+                continue  # not a weather-map zone
+            if zid in keep_ids:
+                continue
+            await orion.delete_entity(eid)
+            deleted += 1
+        if deleted:
+            logger.info("Deleted %d stale zones for parcel %s", deleted, parcel_id)
+    except Exception:
+        logger.exception("Stale-zone reconciliation failed for %s", parcel_id)
+    finally:
+        await orion.close()
+
+
 async def run_for_tenant(tenant_id: str) -> None:
     """Run the full zone pipeline for a single tenant."""
     parcels = await fetch_tenant_parcels(tenant_id)
@@ -293,11 +334,18 @@ async def run_for_tenant(tenant_id: str) -> None:
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     all_entities: list[dict] = []
+    parcel_keep_ids: dict[str, set[str]] = {}
 
     for parcel in parcels:
         entities = await process_parcel(tenant_id, parcel, today)
         if entities:
             all_entities.extend(entities)
+            keep_ids = set()
+            for e in entities:
+                zid = (e.get("nkz:zoneId") or {}).get("value")
+                if zid:
+                    keep_ids.add(str(zid))
+            parcel_keep_ids[parcel["id"]] = keep_ids
 
     if all_entities:
         await upsert_agri_parcel_zones(tenant_id, all_entities)
@@ -305,6 +353,9 @@ async def run_for_tenant(tenant_id: str) -> None:
             "Upserted %d zone entities for tenant %s",
             len(all_entities), tenant_id,
         )
+
+    for parcel_id, keep_ids in parcel_keep_ids.items():
+        await _delete_stale_zones(tenant_id, parcel_id, keep_ids)
 
 
 async def main() -> None:
