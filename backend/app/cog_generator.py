@@ -46,6 +46,11 @@ from app.stats import compute_zonal_stats
 
 logger = logging.getLogger(__name__)
 
+# Parcel clip margin: the raster should cover the whole parcel with a little
+# slack outside the boundary (like the other raster modules). ~20 m in degrees.
+_CLIP_MARGIN_M = 20.0
+_CLIP_MARGIN_DEG = _CLIP_MARGIN_M / 111_320.0  # ~0.00018 degrees of latitude
+
 
 # ---------------------------------------------------------------------------
 # Tile / bbox helpers
@@ -496,12 +501,18 @@ async def generate_cog_for_tile(
         cols, rows,
     )
 
-    # Clip the raster to the parcel polygon: outside the parcel the
-    # per-parcel downscaling is not meaningful, and the other modules
-    # (vegetation, soil) serve parcel-clipped layers.
+    # Clip the raster to the parcel polygon plus a small margin: a hard clip
+    # on the exact boundary leaves edge pixels out and the raster does not
+    # cover the whole parcel. ~20 m of slack (as the other raster modules do)
+    # lets it cover the parcel with room to spare.
     if parcel_geom is not None:
+        from shapely.geometry import shape
+        poly = shape(parcel_geom)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        buffered = poly.buffer(_CLIP_MARGIN_DEG)
         inside = geometry_mask(
-            [parcel_geom],
+            [buffered],
             out_shape=(rows, cols),
             transform=transform,
             invert=True,
