@@ -556,17 +556,32 @@ async def _generate_and_upload_cogs(
 
     Extracted from ``run_for_tenant`` to allow independent testing/patching.
     """
-    centroids = [c for c in (_parcel_lonlat(p) for p in parcels) if c is not None]
-    if not centroids:
+    # Enumerate tiles from the parcel POLYGONS, not their centroids: a parcel
+    # that spans a tile boundary was only partly covered when the aggregate
+    # bbox was built from centroids — the tile covering the other half of the
+    # parcel was never generated.
+    from shapely.geometry import shape as _shape
+    bounds_list = []
+    for p in parcels:
+        geom = _parcel_geometry(p)
+        if geom is None:
+            continue
+        try:
+            b = _shape(geom).bounds  # (min_lon, min_lat, max_lon, max_lat)
+        except Exception:
+            continue
+        if b:
+            bounds_list.append(b)
+    if not bounds_list:
         logger.warning(
-            "Tenant '%s': no usable parcel coordinates, skipping COG generation",
+            "Tenant '%s': no usable parcel geometry, skipping COG generation",
             tenant_id,
         )
         return
-    lons = [c[0] for c in centroids]
-    lats = [c[1] for c in centroids]
-    min_lon, max_lon = min(lons), max(lons)
-    min_lat, max_lat = min(lats), max(lats)
+    min_lon = min(b[0] for b in bounds_list)
+    min_lat = min(b[1] for b in bounds_list)
+    max_lon = max(b[2] for b in bounds_list)
+    max_lat = max(b[3] for b in bounds_list)
     logger.info(
         "Parcel bbox for tenant '%s': %.4f, %.4f, %.4f, %.4f",
         tenant_id, min_lon, min_lat, max_lon, max_lat,
