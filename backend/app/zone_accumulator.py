@@ -71,6 +71,49 @@ def _geom_geojson_bbox(geometry: dict) -> tuple[float, float, float, float]:
         return (0.0, 0.0, 0.0, 0.0)
 
 
+def _zone_geometry(
+    mask: np.ndarray,
+    transform,
+    parcel_geom: dict[str, Any] | None,
+    simplify_tol: float,
+) -> dict[str, Any]:
+    """Polygonize a zone pixel mask, clip to the parcel, return GeoJSON.
+
+    A raw per-pixel polygonization emits thousands of tiny rings; unary_union +
+    simplify collapses them (same pattern as hydrology ``_compute_zones``). The
+    result is intersected with the parcel polygon so zones never bleed outside
+    the parcel boundary.
+    """
+    from rasterio.features import shapes as _rio_shapes
+    from shapely.geometry import shape as _shp_shape, mapping as _shp_mapping
+    from shapely.ops import unary_union as _union
+
+    polys = [
+        _shp_shape(g)
+        for g, v in _rio_shapes(mask.astype("uint8"), mask=mask, transform=transform)
+        if v == 1
+    ]
+    if not polys:
+        return {}
+
+    merged = _union(polys)
+    if merged.is_empty:
+        return {}
+
+    if parcel_geom and parcel_geom.get("type") in ("Polygon", "MultiPolygon"):
+        try:
+            merged = merged.intersection(_shp_shape(parcel_geom))
+        except Exception:
+            pass
+        if merged.is_empty:
+            return {}
+
+    merged = merged.simplify(tolerance=simplify_tol, preserve_topology=False)
+    if merged.is_empty or merged.geom_type not in ("Polygon", "MultiPolygon"):
+        return {}
+    return _shp_mapping(merged)
+
+
 async def process_parcel(
     tenant_id: str,
     parcel: dict[str, Any],
@@ -136,9 +179,20 @@ async def process_parcel(
             elevation_band_m=settings.zones_elevation_band_m,
         )
 
+        from rasterio.transform import Affine
+        # Pixel (row, col) -> (lon, lat): col 0 = origin_lon (west), row 0 =
+        # origin_lat (south) per the lon/lat linspaces above.
+        tile_transform = Affine(
+            td["pixel_size"], 0.0, td["origin_lon"],
+            0.0, td["pixel_size"], td["origin_lat"],
+        )
+
         for label in range(1, tile_labels.max() + 1):
             mask = (tile_labels == label)
             if np.sum(mask) == 0:
+                continue
+            zone_geom = _zone_geometry(mask, tile_transform, geometry, td["pixel_size"])
+            if not zone_geom:
                 continue
             zone_lon = float(np.mean(lon_g[mask]))
             zone_lat = float(np.mean(lat_g[mask]))
@@ -158,6 +212,7 @@ async def process_parcel(
                 "aspectSector": _SECTOR_NAMES[sector_idx],
                 "pixelCount": int(np.sum(mask)),
                 "centroid": [round(zone_lon, 6), round(zone_lat, 6)],
+                "geometry": zone_geom,
             })
 
     if not zones_all:
@@ -213,7 +268,7 @@ async def process_parcel(
             tenant_id=tenant_id,
             parcel_id=parcel_id,
             zone=zd,
-            geometry=geometry,
+            geometry=zd.get("geometry") or geometry,
             metrics=metrics,
             observed_at=observed_at,
             area_ha=area_ha,
