@@ -16,7 +16,9 @@ export interface WeatherLayerState {
 let state: WeatherLayerState = {
   metric: 'temperature_avg',
   date: '',
-  visible: false,
+  // Visible by default: the host's Layers panel switches the whole module on
+  // and off, so an active module shows its layer straight away.
+  visible: true,
   opacity: 0.7,
   status: 'idle',
 };
