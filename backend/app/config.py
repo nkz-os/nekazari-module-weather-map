@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 @dataclass
 class Settings:
     port: int = int(os.getenv("PORT", "8080"))
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")  # level for this module's own loggers; see app.logging_setup
     
     minio_endpoint: str = os.getenv("MINIO_ENDPOINT", "minio-service:9000")
     minio_access_key: str = os.getenv("MINIO_ACCESS_KEY", "")
