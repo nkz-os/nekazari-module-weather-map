@@ -8,11 +8,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.logging_setup import configure_logging
 from app.forecast import router as forecast_router
 from app.tiles import router as tiles_router
 from app.zones import router as zones_router
 
 logger = logging.getLogger(__name__)
+
+configure_logging(settings.log_level)
 
 app = FastAPI(
     title="Weather Map",
