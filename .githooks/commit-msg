@@ -3,6 +3,10 @@ MSG=$(cat "$1")
 
 CLEAN=$(printf "%s\n" "$MSG" | sed \
   -e '/^[Cc][Oo]-[Aa]uthored-[Bb]y:/d' \
+  -e '/^[Cc]laude-[Ss]ession:/d' \
+  -e '/claude\.ai\/code\/session/d' \
+  -e '/[Gg]enerated with .*[Cc]laude/d' \
+  -e '/noreply@anthropic\.com/d' \
   -e '/^[Mm]ade-[Ww]ith:/d' \
   -e '/^[Mm]ade [Ww]ith [Cc]ursor/d' \
   -e '/^[Mm]ade [Bb]y [Cc]ursor/d' \
@@ -14,6 +18,15 @@ if [ "$CLEAN" != "$MSG" ]; then
   printf "%s" "$CLEAN" > "$1"
   MSG="$CLEAN"
   echo "commit-msg: stripped agent attribution line(s)" >&2
+fi
+
+# Anything left that still smells of an agent is a hard stop, not a strip.
+if printf "%s" "$MSG" | grep -qEi "claude\.ai/code/session|Claude-Session|cursor\.com|anthropic\.com"; then
+  echo ""
+  echo "ERROR: agent attribution left in commit message."
+  echo "These repos are PUBLIC. No session URLs, no AI credits."
+  echo ""
+  exit 1
 fi
 
 LEN=$(printf "%s" "$MSG" | wc -c)
