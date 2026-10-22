@@ -1,0 +1,67 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: weather-map-backend
+  namespace: nekazari
+  labels:
+    app.kubernetes.io/name: weather-map
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: nekazari
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: weather-map
+      app.kubernetes.io/component: backend
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Same-namespace: Orion-LD, weather-api, elevation, MinIO, Redis, self
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 1026    # Orion-LD
+        - protocol: TCP
+          port: 8000    # weather-api
+        - protocol: TCP
+          port: 80      # elevation-api / internal services
+        - protocol: TCP
+          port: 9000    # MinIO
+        - protocol: TCP
+          port: 6379    # Redis
+        - protocol: TCP
+          port: 8080    # self (health checks)
+
+    # External HTTPS — Open-Meteo, Copernicus DEM, etc.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

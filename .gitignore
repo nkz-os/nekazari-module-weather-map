@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+node_modules/
+dist/
+.env
+.venv/
+
+# Security: sensitive files
+*.pem
+*.key
+apikey_*.txt
+*.apikey
+*-secret*
+*_api_key.txt

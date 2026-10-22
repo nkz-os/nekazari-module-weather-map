@@ -1,0 +1,59 @@
+"""Weather Map configuration from environment variables."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Settings:
+    port: int = int(os.getenv("PORT", "8080"))
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")  # level for this module's own loggers; see app.logging_setup
+    
+    minio_endpoint: str = os.getenv("MINIO_ENDPOINT", "minio-service:9000")
+    minio_access_key: str = os.getenv("MINIO_ACCESS_KEY", "")
+    minio_secret_key: str = os.getenv("MINIO_SECRET_KEY", "")
+    minio_bucket: str = os.getenv("MINIO_BUCKET", "nekazari-weather-map")
+    minio_secure: bool = os.getenv("MINIO_SECURE", "false").lower() == "true"
+    
+    elevation_service_url: str = os.getenv("ELEVATION_SERVICE_URL", "http://elevation-api-service:80")
+    weather_api_url: str = os.getenv("WEATHER_API_URL", "http://weather-api-service:8000")
+    orion_url: str = os.getenv("ORION_URL", "http://orion-ld-service:1026")
+    context_url: str = os.getenv("CONTEXT_URL", "")
+    postgres_url: str = os.getenv("POSTGRES_URL", "")
+    
+    cog_interval_days: int = int(os.getenv("COG_INTERVAL_DAYS", "5"))
+    cog_retention_periods: int = int(os.getenv("COG_RETENTION_PERIODS", "3"))
+    pmtiles_min_zoom: int = int(os.getenv("PMTILES_MIN_ZOOM", "10"))
+    pmtiles_max_zoom: int = int(os.getenv("PMTILES_MAX_ZOOM", "15"))
+    
+    redis_url: str = os.getenv("REDIS_URL", "redis://redis-service:6379/0")
+    dem_cache_ttl_days: int = int(os.getenv("DEM_CACHE_TTL_DAYS", "30"))
+
+    # Zone generation
+    zones_min_pixels: int = int(os.getenv("ZONES_MIN_PIXELS", "50"))
+    zones_max_count: int = int(os.getenv("ZONES_MAX_COUNT", "20"))
+    zones_elevation_band_m: float = float(os.getenv("ZONES_ELEVATION_BAND_M", "50.0"))
+    zones_cog_ttl_days: int = int(os.getenv("ZONES_COG_TTL_DAYS", "30"))
+    monitored_tenants: str = os.getenv("MONITORED_TENANTS", "")
+    
+    auth_disabled: bool = os.getenv("AUTH_DISABLED", "false").lower() == "true"
+    internal_service_secret: str = os.getenv("INTERNAL_SERVICE_SECRET", "")
+    tile_token_secret: str = os.getenv("TILE_TOKEN_SECRET", "")
+    cors_origins: str = os.getenv("CORS_ORIGINS", "")
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+    
+    tile_size: int = 256
+    tile_scale: float = 1.0
+    
+    metrics: list[str] = field(default_factory=lambda: [
+        "temperature_avg", "temperature_min", "solar_radiation",
+        "eto", "water_balance", "frost_risk", "soil_moisture",
+    ])
+
+
+settings = Settings()

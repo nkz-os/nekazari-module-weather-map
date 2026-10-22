@@ -1,0 +1,32 @@
+{
+  "title": "Weather Map",
+  "description": "Weather-derived raster overlays",
+  "metrics": {
+    "temperature_avg": "Avg Temperature",
+    "temperature_min": "Min Temperature",
+    "solar_radiation": "Solar Radiation",
+    "eto": "Reference ET",
+    "water_balance": "Water Balance",
+    "frost_risk": "Frost Risk",
+    "soil_moisture": "Soil Moisture"
+  },
+  "controls": {
+    "metric": "Metric",
+    "date": "Date",
+    "opacity": "Opacity",
+    "visible": "Visible"
+  },
+  "layerToggle": "Weather Layers",
+  "layer": {
+    "title": "Weather",
+    "status": {
+      "loading": "Loading…",
+      "empty": "No raster data for this metric",
+      "error": "Failed to load layer"
+    }
+  },
+  "attribution": {
+    "dataBy": "Weather data by",
+    "sources": "Forecasts: ECMWF IFS. History: contains modified Copernicus Climate Change Service information (ERA5)."
+  }
+}
