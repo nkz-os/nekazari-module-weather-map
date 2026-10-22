@@ -141,7 +141,11 @@ class _FakeClient:
 
 def _patch_client(monkeypatch, client):
     from app import sources
+    from app.config import settings
 
+    # CONTEXT_URL has no default: set one so these tests reach the HTTP path
+    # instead of stopping early at MissingContextURL.
+    monkeypatch.setattr(settings, "context_url", "http://context.example.com/ngsi-ld-context.json")
     monkeypatch.setattr(sources.httpx, "AsyncClient", lambda **kw: client)
     return client
 
