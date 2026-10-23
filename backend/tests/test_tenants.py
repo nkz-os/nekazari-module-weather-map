@@ -32,3 +32,19 @@ def test_postgres_url_empty_without_password(monkeypatch):
     monkeypatch.delenv("POSTGRES_URL", raising=False)
     monkeypatch.delenv("POSTGRES_PASSWORD", raising=False)
     assert tenants._postgres_url() == ""
+
+
+def test_db_discovery_reads_the_installations_view(monkeypatch):
+    import sys
+    from unittest.mock import MagicMock
+
+    conn = MagicMock()
+    cur = conn.cursor.return_value
+    cur.fetchall.return_value = [("tenant-a",)]
+    fake_psycopg2 = MagicMock()
+    fake_psycopg2.connect.return_value = conn
+    monkeypatch.setitem(sys.modules, "psycopg2", fake_psycopg2)
+    monkeypatch.setenv("POSTGRES_URL", "postgresql://u:p@db:5432/x")
+
+    assert tenants._discover_from_db() == ["tenant-a"]
+    assert "FROM module_installations" in cur.execute.call_args.args[0]
