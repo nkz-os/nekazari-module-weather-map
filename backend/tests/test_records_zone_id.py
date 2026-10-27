@@ -75,3 +75,9 @@ def test_multipolygon_centroid_inside_a_part():
     in_a = 0 <= lon <= 1 and 0 <= lat <= 1
     in_b = 10 <= lon <= 11 and 10 <= lat <= 11
     assert in_a or in_b
+
+
+def test_zone_version_int_equals_float():
+    a = {"type": "Polygon", "coordinates": [[[0, 0], [0, 1], [1, 1], [0, 0]]]}
+    b = {"type": "Polygon", "coordinates": [[[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.0, 0.0]]]}
+    assert zone_version(a) == zone_version(b)

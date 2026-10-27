@@ -281,8 +281,6 @@ async def process_parcel(
             metrics=metrics,
             observed_at=observed_at,
             area_ha=area_ha,
-            sensor_nearby=zd.get("sensor_nearby"),
-            sensor_distance_m=zd.get("sensor_distance_m"),
             zone_rank=zone_ranks[zd["id"]],
         )
         entity_list.append(entity)

@@ -159,8 +159,8 @@ def build_agri_parcel_record(
 def _round_coords(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_round_coords(v) for v in value]
-    if isinstance(value, float):
-        return round(value, 6)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return round(float(value), 6)
     return value
 
 
@@ -185,9 +185,11 @@ def _geometry_centroid(geometry: dict[str, Any]) -> list[float]:
 
         point = shape(geometry).representative_point()
         if point.is_empty:
+            logger.warning("zone centroid: empty geometry, falling back to [0, 0]")
             return [0.0, 0.0]
         return [round(point.x, 6), round(point.y, 6)]
     except Exception:
+        logger.warning("zone centroid failed, falling back to [0, 0]", exc_info=True)
         return [0.0, 0.0]
 
 

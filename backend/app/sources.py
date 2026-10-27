@@ -644,6 +644,33 @@ def _centroid(geometry: dict) -> tuple[float, float] | None:
 # ---------------------------------------------------------------------------
 
 
+_SENSOR_ATTRS = ("nkz:sensorNearby", "nkz:sensorDistanceM")
+
+
+async def _clear_stale_sensor_attrs(orion: Any, tenant_id: str, zones: list[dict]) -> None:
+    """Delete sensor attributes from zones with no device in range this run.
+
+    The batch upsert keeps attributes absent from the payload, so a device that
+    moved away or was removed would otherwise leave them on the zone forever.
+    An attribute that is already absent (404) is the normal case.
+    """
+    for zone in zones:
+        if "nkz:sensorNearby" in zone:
+            continue
+        for attr in _SENSOR_ATTRS:
+            try:
+                await orion.delete_entity_attr(zone["id"], attr)
+            except Exception as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 404:
+                    logger.debug("no %s to clear on %s", attr, zone["id"])
+                else:
+                    logger.warning(
+                        "clear %s on %s failed (tenant=%s)", attr, zone["id"], tenant_id,
+                        exc_info=True,
+                    )
+
+
 async def upsert_agri_parcel_zones(tenant_id: str, zones: list[dict]) -> None:
     """Batch upsert ``AgriParcelZone`` entities via Orion-LD SDK.
 
@@ -676,6 +703,7 @@ async def upsert_agri_parcel_zones(tenant_id: str, zones: list[dict]) -> None:
                 "upsert_agri_parcel_zones(tenant=%s): %d error(s)",
                 tenant_id, len(result["errors"]),
             )
+        await _clear_stale_sensor_attrs(orion, tenant_id, zones)
     except Exception:
         logger.exception(
             "upsert_agri_parcel_zones(tenant=%s) failed for %d zone(s)",
@@ -707,12 +735,18 @@ def _local_metric_geoms(zone_geom: dict, point_geom: dict):
     return transform(_proj, zone), transform(_proj, shape(point_geom))
 
 
-def _zone_device_distance_m(zone_geom: dict, device_geom: dict) -> float | None:
+def _zone_device_distance_m(
+    zone_geom: dict, device_geom: dict, device_id: str | None = None,
+) -> float | None:
     """Distance in metres from a device to the zone (0.0 when inside)."""
     try:
         zone_m, dev_m = _local_metric_geoms(zone_geom, device_geom)
         return float(zone_m.distance(dev_m))
     except Exception:
+        logger.warning(
+            "zone/device distance failed for device %s", device_id,
+            exc_info=True,
+        )
         return None
 
 
@@ -796,7 +830,7 @@ async def find_nearby_sensors(
         best_sensor: str | None = None
 
         for device in devices:
-            d = _zone_device_distance_m(loc, device["location"])
+            d = _zone_device_distance_m(loc, device["location"], device["id"])
             if d is None or d > SENSOR_NEARBY_MAX_M:
                 continue
             if d < best_dist:
@@ -805,8 +839,6 @@ async def find_nearby_sensors(
 
         if best_sensor is not None:
             dist = round(best_dist, 1)
-            zone_copy["sensor_nearby"] = best_sensor
-            zone_copy["sensor_distance_m"] = dist
             zone_copy["nkz:sensorNearby"] = {"type": "Property", "value": True}
             zone_copy["nkz:sensorDistanceM"] = {"type": "Property", "value": dist}
 

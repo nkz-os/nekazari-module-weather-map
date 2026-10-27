@@ -71,5 +71,69 @@ async def test_nearest_within_radius_wins():
     near = _device(_LON0 - 10 / (math.cos(math.radians(_LAT0)) * 111320.0), _LAT0 + _DLAT / 2, "urn:ngsi-ld:Device:near")
     far = _device(_LON0 - 40 / (math.cos(math.radians(_LAT0)) * 111320.0), _LAT0 + _DLAT / 2, "urn:ngsi-ld:Device:far")
     z = await _run([far, near])
-    assert z["sensor_nearby"] == "urn:ngsi-ld:Device:near"
+    assert "sensor_nearby" not in z
     assert z["nkz:sensorDistanceM"]["value"] == pytest.approx(10.0, abs=0.5)
+
+
+def _east(m):
+    return _LON0 - m / (math.cos(math.radians(_LAT0)) * 111320.0)
+
+
+@pytest.mark.asyncio
+async def test_boundary_50m_nearby_60m_not():
+    mid = _LAT0 + _DLAT / 2
+    z = await _run([_device(_east(49.5), mid)])
+    assert z["nkz:sensorNearby"]["value"] is True
+    z = await _run([_device(_east(60), mid)])
+    assert "nkz:sensorNearby" not in z
+
+
+@pytest.mark.asyncio
+async def test_final_payload_is_ngsi_only():
+    from app.records import build_agri_parcel_zone
+    e = build_agri_parcel_zone(
+        tenant_id="acme", parcel_id="urn:ngsi-ld:AgriParcel:p1",
+        zone={"id": "z1", "pixelCount": 10},
+        geometry=_POLY, metrics={"tMin": 1.0}, observed_at="2026-06-22T00:00:00Z",
+        zone_rank=1,
+    )
+    with _patch([_device(_LON0 + _DLON / 2, _LAT0 + _DLAT / 2)]):
+        out = (await find_nearby_sensors("acme", "p1", [e]))[0]
+    assert "nkz:sensorNearby" in out
+    for k, v in out.items():
+        if k in ("id", "type", "@context"):
+            continue
+        assert isinstance(v, dict) and v.get("type") in ("Property", "Relationship", "GeoProperty"), k
+
+
+class _FakeOrion:
+    def __init__(self, fail_404=False):
+        self.deleted = []
+        self.fail_404 = fail_404
+
+    async def upsert_entities_batch(self, zones):
+        return {"upserted": len(zones), "errors": []}
+
+    async def delete_entity_attr(self, eid, attr):
+        self.deleted.append((eid, attr))
+        if self.fail_404:
+            import httpx
+            req = httpx.Request("DELETE", "http://x")
+            raise httpx.HTTPStatusError("nf", request=req, response=httpx.Response(404, request=req))
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_404", [False, True])
+async def test_upsert_clears_sensor_attrs_only_where_no_sensor(fail_404):
+    from app.sources import upsert_agri_parcel_zones
+    fake = _FakeOrion(fail_404)
+    zones = [
+        {"id": "with", "nkz:sensorNearby": {"type": "Property", "value": True}},
+        {"id": "without"},
+    ]
+    with patch("app.sources.OrionClient", return_value=fake):
+        await upsert_agri_parcel_zones("acme", zones)
+    assert fake.deleted == [("without", "nkz:sensorNearby"), ("without", "nkz:sensorDistanceM")]
