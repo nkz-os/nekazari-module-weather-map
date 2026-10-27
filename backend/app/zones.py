@@ -66,13 +66,14 @@ async def get_zones_daily(
         try:
             rows = await conn.fetch(
                 """
-                SELECT DISTINCT ON (nkz_zone_id, DATE(observed_at))
-                    nkz_zone_id, DATE(observed_at) AS day, t_min, t_max, eto
+                SELECT DISTINCT ON (nkz_zone_id, (observed_at AT TIME ZONE 'UTC')::date)
+                    nkz_zone_id, (observed_at AT TIME ZONE 'UTC')::date AS day,
+                    observed_at, t_min, t_max, eto
                 FROM agriparcelzone
                 WHERE has_agri_parcel = $1
                   AND observed_at >= $2
                   AND observed_at < $3
-                ORDER BY nkz_zone_id, DATE(observed_at), observed_at DESC
+                ORDER BY nkz_zone_id, (observed_at AT TIME ZONE 'UTC')::date, observed_at DESC
                 """,
                 pid, start_dt, end_dt + timedelta(days=1),
             )
@@ -85,12 +86,20 @@ async def get_zones_daily(
     def _num(v: Any) -> float | None:
         return None if v is None else float(v)
 
+    # Defence in depth: whatever the SQL returns, the latest run of a
+    # (zone, day) wins.
+    latest: dict[tuple[str, str], Any] = {}
+    for row in rows:
+        key = (row["nkz_zone_id"], row["day"].isoformat())
+        prev = latest.get(key)
+        if prev is None or row["observed_at"] > prev["observed_at"]:
+            latest[key] = row
+
     zones: dict[str, list[dict[str, Any]]] = {}
     dates: set[str] = set()
-    for row in rows:
-        day = row["day"].isoformat()
+    for (zone_id, day), row in latest.items():
         dates.add(day)
-        zones.setdefault(row["nkz_zone_id"], []).append({
+        zones.setdefault(zone_id, []).append({
             "date": day,
             "tMin": _num(row["t_min"]),
             "tMax": _num(row["t_max"]),

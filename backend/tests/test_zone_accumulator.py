@@ -208,4 +208,15 @@ async def test_zone_stats_failure_is_isolated(zone_env, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
     assert entities and all("nkz:frostRisk" not in e for e in entities)
-    assert "minio down" in caplog.text or "radiation" in caplog.text.lower()
+    assert "Zonal radiation/frost failed" in caplog.text
+    assert "minio down" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_zone_without_geometry_skips_stats_no_parcel_fallback():
+    from app import zone_accumulator as za
+    from unittest.mock import patch
+
+    with patch.object(za, "compute_zonal_stats") as m:
+        assert await za._zone_cog_metrics("t", {"id": "z1"}) == {}
+    m.assert_not_called()

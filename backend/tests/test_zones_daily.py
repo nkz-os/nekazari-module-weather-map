@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import AsyncMock, patch
 
 from app.config import settings
@@ -12,8 +12,9 @@ PID = "urn:ngsi-ld:AgriParcel:demo-coop:p1"
 URL = "/api/weather-map/zones/p1/daily"
 
 
-def _row(zone, day, t_min, t_max, eto):
+def _row(zone, day, t_min, t_max, eto, hour=12):
     return {"nkz_zone_id": zone, "day": date.fromisoformat(day),
+            "observed_at": datetime.fromisoformat(f"{day}T{hour:02d}:00:00+00:00"),
             "t_min": t_min, "t_max": t_max, "eto": eto}
 
 
@@ -38,7 +39,7 @@ def _get(client, qs="?start=2026-06-01&end=2026-06-03", rows=(), parcel=True):
 def test_daily_reaches_handler_not_catch_all(client):
     conn, resp = _get(client)
     assert resp.status_code == 200
-    assert resp.json()["parcel_id"] == PID or resp.json()["parcel_id"].endswith("p1")
+    assert resp.json()["parcel_id"] == "urn:ngsi-ld:AgriParcel:p1"
     assert "zones" in resp.json() and "days" in resp.json()
     conn.fetch.assert_awaited_once()
 
@@ -64,8 +65,9 @@ def test_daily_groups_zones_by_date(client):
 def test_daily_sql_keeps_latest_run_per_day(client):
     conn, resp = _get(client)
     sql = conn.fetch.await_args.args[0]
-    assert "DISTINCT ON (nkz_zone_id, DATE(observed_at))" in sql
+    assert "DISTINCT ON (nkz_zone_id, (observed_at AT TIME ZONE 'UTC')::date)" in sql
     assert "observed_at DESC" in sql
+    assert "AT TIME ZONE 'UTC'" in sql and "DATE(" not in sql
     args = conn.fetch.await_args.args[1:]
     assert args[0] == "urn:ngsi-ld:AgriParcel:p1"
     assert args[1].date() == date(2026, 6, 1)
@@ -108,3 +110,15 @@ def test_daily_404_unknown_parcel(client):
 
 def test_daily_requires_auth(client):
     assert client.get(URL + "?start=2026-06-01&end=2026-06-03").status_code == 401
+
+
+def test_daily_last_run_wins_even_if_sql_returns_duplicates(client):
+    rows = [
+        _row("zA", "2026-06-01", 1.0, 2.0, 3.0, hour=18),
+        _row("zA", "2026-06-01", 9.0, 8.0, 7.0, hour=6),
+    ]
+    _, resp = _get(client, rows=rows)
+    body = resp.json()
+    assert body["zones"]["zA"] == [
+        {"date": "2026-06-01", "tMin": 1.0, "tMax": 2.0, "eto": 3.0}]
+    assert body["days"] == 1

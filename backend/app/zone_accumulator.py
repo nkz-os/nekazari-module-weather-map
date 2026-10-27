@@ -300,9 +300,15 @@ async def _zone_cog_metrics(tenant_id: str, zone: dict) -> dict[str, float]:
     Returns only the metrics the COGs actually hold; no COG, no data or any
     failure yields an empty dict (nothing is fabricated, other zones unaffected).
     """
+    geom = zone.get("geometry")
+    if not geom:
+        # Never fall back to the parcel geometry: that would label a parcel
+        # value as a zone value.
+        logger.debug("Zone %s has no own geometry; skipping radiation/frost", zone.get("id"))
+        return {}
     try:
         stats = await asyncio.to_thread(
-            compute_zonal_stats, tenant_id, zone["geometry"],
+            compute_zonal_stats, tenant_id, geom,
             ["solar_radiation", "frost_risk"],
         )
     except Exception as exc:
