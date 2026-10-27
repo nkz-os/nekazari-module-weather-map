@@ -152,3 +152,16 @@ def test_zone_metrics_filter_non_scalar():
     assert "tMin" not in entity
     assert "tMax" not in entity
     assert entity["eto"]["value"] == 4.2
+
+
+def test_zone_radiation_and_frost_attributes_and_omission():
+    from app.records import build_agri_parcel_zone
+
+    geom = {"type": "Polygon", "coordinates": [[[0, 0], [0, 1], [1, 1], [0, 0]]]}
+    kw = dict(tenant_id="acme", parcel_id="urn:ngsi-ld:AgriParcel:p1",
+              zone={"id": "z1"}, geometry=geom, observed_at="2026-06-22T00:00:00Z")
+    e = build_agri_parcel_zone(metrics={"solarRadiationWm2": 210.5, "frostRisk": 12.0}, **kw)
+    assert e["nkz:solarRadiationWm2"]["value"] == 210.5
+    assert e["nkz:frostRisk"]["value"] == 12.0
+    e = build_agri_parcel_zone(metrics={"solarRadiationWm2": None, "frostRisk": None}, **kw)
+    assert "nkz:solarRadiationWm2" not in e and "nkz:frostRisk" not in e

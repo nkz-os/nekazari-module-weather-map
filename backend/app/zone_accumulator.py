@@ -18,6 +18,7 @@ import numpy as np
 from app.config import settings
 from app.downscaler import compute_zones, correct_temperature, compute_eto
 from app.records import build_agri_parcel_zone
+from app.stats import compute_zonal_stats
 from nkz_platform_sdk import OrionClient
 from app.sources import (
     MissingWeatherInput,
@@ -272,6 +273,7 @@ async def process_parcel(
             "tMax": round(t_max_z, 1),
             "eto": round(float(eto[0]), 2),
         }
+        metrics.update(await _zone_cog_metrics(tenant_id, zd))
         area_ha = _compute_area_ha(zd["pixelCount"])
         entity = build_agri_parcel_zone(
             tenant_id=tenant_id,
@@ -290,6 +292,28 @@ async def process_parcel(
         entity_list = await find_nearby_sensors(tenant_id, parcel_id, entity_list)
 
     return entity_list
+
+
+async def _zone_cog_metrics(tenant_id: str, zone: dict) -> dict[str, float]:
+    """Mean solar radiation and frost risk over the zone polygon, from the COGs.
+
+    Returns only the metrics the COGs actually hold; no COG, no data or any
+    failure yields an empty dict (nothing is fabricated, other zones unaffected).
+    """
+    try:
+        stats = await asyncio.to_thread(
+            compute_zonal_stats, tenant_id, zone["geometry"],
+            ["solar_radiation", "frost_risk"],
+        )
+    except Exception as exc:
+        logger.warning("Zonal radiation/frost failed for zone %s: %s", zone.get("id"), exc)
+        return {}
+    out: dict[str, float] = {}
+    for metric, key in (("solar_radiation", "solarRadiationWm2"), ("frost_risk", "frostRisk")):
+        mean = ((stats.get("metrics") or {}).get(metric) or {}).get("mean")
+        if mean is not None:
+            out[key] = round(float(mean), 1)
+    return out
 
 
 async def _delete_stale_zones(

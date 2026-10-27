@@ -25,6 +25,8 @@ _ZONE_METRICS = {
     "tMax": "tMax",
     "eto": "eto",
     "waterBalance": "waterBalance",
+    "solarRadiationWm2": "nkz:solarRadiationWm2",
+    "frostRisk": "nkz:frostRisk",
 }
 
 
