@@ -100,7 +100,11 @@ async def test_final_payload_is_ngsi_only():
     with _patch([_device(_LON0 + _DLON / 2, _LAT0 + _DLAT / 2)]):
         out = (await find_nearby_sensors("acme", "p1", [e]))[0]
     assert "nkz:sensorNearby" in out
-    for k, v in out.items():
+    from app.sources import upsert_agri_parcel_zones
+    fake = _FakeOrion()
+    with patch("app.sources.OrionClient", return_value=fake):
+        await upsert_agri_parcel_zones("acme", [out])
+    for k, v in fake.sent[0].items():
         if k in ("id", "type", "@context"):
             continue
         assert isinstance(v, dict) and v.get("type") in ("Property", "Relationship", "GeoProperty"), k
@@ -110,8 +114,10 @@ class _FakeOrion:
     def __init__(self, fail_404=False):
         self.deleted = []
         self.fail_404 = fail_404
+        self.sent = []
 
     async def upsert_entities_batch(self, zones):
+        self.sent = zones
         return {"upserted": len(zones), "errors": []}
 
     async def delete_entity_attr(self, eid, attr):
@@ -131,9 +137,36 @@ async def test_upsert_clears_sensor_attrs_only_where_no_sensor(fail_404):
     from app.sources import upsert_agri_parcel_zones
     fake = _FakeOrion(fail_404)
     zones = [
-        {"id": "with", "nkz:sensorNearby": {"type": "Property", "value": True}},
-        {"id": "without"},
+        {"id": "with", "nkz:sensorNearby": {"type": "Property", "value": True}, "_sensor_lookup_ok": True},
+        {"id": "without", "_sensor_lookup_ok": True},
+        {"id": "unchecked"},
     ]
     with patch("app.sources.OrionClient", return_value=fake):
         await upsert_agri_parcel_zones("acme", zones)
     assert fake.deleted == [("without", "nkz:sensorNearby"), ("without", "nkz:sensorDistanceM")]
+    assert fake.sent and all("_sensor_lookup_ok" not in z for z in fake.sent)
+
+
+@pytest.mark.asyncio
+async def test_device_fetch_failure_clears_nothing():
+    from app.sources import upsert_agri_parcel_zones
+    orion = AsyncMock()
+    orion.query_entities = AsyncMock(side_effect=ValueError("orion down"))
+    orion.close = AsyncMock()
+    with patch("app.sources.OrionClient", return_value=orion):
+        out = await find_nearby_sensors("acme", "p1", [_zone()])
+    fake = _FakeOrion()
+    with patch("app.sources.OrionClient", return_value=fake):
+        await upsert_agri_parcel_zones("acme", out)
+    assert fake.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_zone_without_location_is_not_cleared():
+    from app.sources import upsert_agri_parcel_zones
+    with _patch([_device(_LON0, _LAT0)]):
+        out = await find_nearby_sensors("acme", "p1", [{"id": "noloc"}])
+    fake = _FakeOrion()
+    with patch("app.sources.OrionClient", return_value=fake):
+        await upsert_agri_parcel_zones("acme", out)
+    assert fake.deleted == []

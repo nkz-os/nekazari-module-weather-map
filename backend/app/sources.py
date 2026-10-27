@@ -647,15 +647,20 @@ def _centroid(geometry: dict) -> tuple[float, float] | None:
 _SENSOR_ATTRS = ("nkz:sensorNearby", "nkz:sensorDistanceM")
 
 
+_LOOKUP_OK_KEY = "_sensor_lookup_ok"
+
+
 async def _clear_stale_sensor_attrs(orion: Any, tenant_id: str, zones: list[dict]) -> None:
     """Delete sensor attributes from zones with no device in range this run.
 
     The batch upsert keeps attributes absent from the payload, so a device that
     moved away or was removed would otherwise leave them on the zone forever.
+    Only zones marked by a SUCCESSFUL device lookup are touched: a failed
+    lookup or a zone without location says nothing about its sensors.
     An attribute that is already absent (404) is the normal case.
     """
     for zone in zones:
-        if "nkz:sensorNearby" in zone:
+        if not zone.get(_LOOKUP_OK_KEY) or "nkz:sensorNearby" in zone:
             continue
         for attr in _SENSOR_ATTRS:
             try:
@@ -693,7 +698,10 @@ async def upsert_agri_parcel_zones(tenant_id: str, zones: list[dict]) -> None:
 
     orion = OrionClient(tenant_id)
     try:
-        result = await orion.upsert_entities_batch(zones)
+        payload = [
+            {k: v for k, v in z.items() if k != _LOOKUP_OK_KEY} for z in zones
+        ]
+        result = await orion.upsert_entities_batch(payload)
         logger.info(
             "upsert_agri_parcel_zones(tenant=%s): upserted %d zone(s)",
             tenant_id, result.get("upserted", 0),
@@ -790,16 +798,17 @@ async def find_nearby_sensors(
             attrs="location,name",
             options="keyValues",
         )
-        if isinstance(data, list):
-            for entity in data:
-                raw_loc = entity.get("location")
-                loc = _unwrap_location(raw_loc)
-                if loc is None:
-                    continue
-                devices.append({
-                    "id": entity.get("id"),
-                    "location": loc,
-                })
+        if not isinstance(data, list):
+            raise ValueError(f"unexpected Device query result: {type(data).__name__}")
+        for entity in data:
+            raw_loc = entity.get("location")
+            loc = _unwrap_location(raw_loc)
+            if loc is None:
+                continue
+            devices.append({
+                "id": entity.get("id"),
+                "location": loc,
+            })
     except Exception:
         logger.exception(
             "find_nearby_sensors(tenant=%s, parcel=%s): failed to fetch devices",
@@ -814,7 +823,6 @@ async def find_nearby_sensors(
             "find_nearby_sensors(tenant=%s, parcel=%s): no devices found",
             tenant_id, parcel_id,
         )
-        return list(zones)
 
     # Enrich each zone with the nearest device
     enriched: list[dict[str, Any]] = []
@@ -826,6 +834,9 @@ async def find_nearby_sensors(
             enriched.append(zone_copy)
             continue
 
+        # Lookup succeeded and this zone was evaluated: the upsert may clear
+        # stale sensor attributes on it. Private marker, stripped before send.
+        zone_copy[_LOOKUP_OK_KEY] = True
         best_dist = float("inf")
         best_sensor: str | None = None
 
