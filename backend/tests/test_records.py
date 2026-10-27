@@ -118,7 +118,7 @@ def test_build_agri_parcel_zone_with_sensor():
     )
     assert entity["nkz:sensorNearby"]["value"] is True
     assert entity["nkz:sensorDistanceM"]["value"] == 45.0
-    assert "nkz:areaHa" not in entity
+    assert entity["nkz:areaHa"]["value"] == round(SAMPLE_ZONE.get("pixelCount", 0) * 0.01, 2)
 
 
 def test_build_agri_parcel_zone_no_metrics():
@@ -136,8 +136,8 @@ def test_build_agri_parcel_zone_no_metrics():
     # No metric attributes
     for key in ("tMin", "tMax", "eto", "waterBalance"):
         assert key not in entity
-    # nkz:areaHa absent when not provided
-    assert "nkz:areaHa" not in entity
+    # nkz:areaHa derived from pixelCount when not provided
+    assert entity["nkz:areaHa"]["value"] == round(SAMPLE_ZONE.get("pixelCount", 0) * 0.01, 2)
 
 
 def test_zone_metrics_filter_non_scalar():

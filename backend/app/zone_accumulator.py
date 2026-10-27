@@ -38,6 +38,12 @@ PIXEL_AREA_HA = 0.01  # ~10m x 10m per pixel at zoom 14
 _SECTOR_NAMES = ["flat", "N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
 
+def _assign_zone_ranks(zones: list[dict[str, Any]]) -> dict[str, int]:
+    """1-based display rank by zone id: north first, ties west to east."""
+    ordered = sorted(zones, key=lambda z: (-z["centroid"][1], z["centroid"][0]))
+    return {z["id"]: i for i, z in enumerate(ordered, start=1)}
+
+
 def _compute_area_ha(pixel_count: int) -> float:
     """Convert pixel count to hectares (10m resolution → 0.01 ha/pixel)."""
     return pixel_count * PIXEL_AREA_HA
@@ -225,6 +231,8 @@ async def process_parcel(
         zones_all.sort(key=lambda z: z["pixelCount"], reverse=True)
         zones_all = zones_all[:settings.zones_max_count]
 
+    zone_ranks = _assign_zone_ranks(zones_all)
+
     # 4. Fetch weather from the broker (no defaults — see app.sources.require)
     weather = await fetch_parcel_weather(tenant_id, parcel_id)
     if weather is None:
@@ -275,6 +283,7 @@ async def process_parcel(
             area_ha=area_ha,
             sensor_nearby=zd.get("sensor_nearby"),
             sensor_distance_m=zd.get("sensor_distance_m"),
+            zone_rank=zone_ranks[zd["id"]],
         )
         entity_list.append(entity)
 

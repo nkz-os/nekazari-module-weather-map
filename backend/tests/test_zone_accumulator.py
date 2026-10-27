@@ -147,3 +147,13 @@ async def test_zone_correction_uses_the_observation_altitude(zone_env, monkeypat
     assert entities, "con meteo completa se esperan entidades AgriParcelZone"
     assert set(seen) == {572.8}
     assert DEM_BASE_ELEVATION not in seen
+
+
+def test_assign_zone_ranks_north_to_south_then_west_to_east():
+    from app.zone_accumulator import _assign_zone_ranks
+    zones = [
+        {"id": "s", "centroid": [0.0, 1.0]},
+        {"id": "ne", "centroid": [2.0, 5.0]},
+        {"id": "nw", "centroid": [1.0, 5.0]},
+    ]
+    assert _assign_zone_ranks(zones) == {"nw": 1, "ne": 2, "s": 3}

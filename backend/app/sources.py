@@ -685,6 +685,37 @@ async def upsert_agri_parcel_zones(tenant_id: str, zones: list[dict]) -> None:
         await orion.close()
 
 
+SENSOR_NEARBY_MAX_M = 50.0
+
+
+def _local_metric_geoms(zone_geom: dict, point_geom: dict):
+    """Project a zone geometry and a device geometry to local metres.
+
+    Equirectangular approximation around the zone centroid
+    (x = dlon*cos(lat0)*111320, y = dlat*110540): error < 1 % at zone scale.
+    """
+    from shapely.geometry import shape
+    from shapely.ops import transform
+
+    zone = shape(zone_geom)
+    lon0, lat0 = zone.centroid.x, zone.centroid.y
+    kx = math.cos(math.radians(lat0)) * 111320.0
+
+    def _proj(x, y, z=None):
+        return ((x - lon0) * kx, (y - lat0) * 110540.0)
+
+    return transform(_proj, zone), transform(_proj, shape(point_geom))
+
+
+def _zone_device_distance_m(zone_geom: dict, device_geom: dict) -> float | None:
+    """Distance in metres from a device to the zone (0.0 when inside)."""
+    try:
+        zone_m, dev_m = _local_metric_geoms(zone_geom, device_geom)
+        return float(zone_m.distance(dev_m))
+    except Exception:
+        return None
+
+
 async def find_nearby_sensors(
     tenant_id: str,
     parcel_id: str,
@@ -693,7 +724,8 @@ async def find_nearby_sensors(
     """Enrich zone descriptors with the nearest IoT sensor.
 
     Queries Orion-LD for ``Device`` entities associated with the tenant,
-    then for each zone finds the closest device by haversine distance.
+    then for each zone finds the closest device within SENSOR_NEARBY_MAX_M
+    of the zone (metres, 0 when inside); farther devices are ignored.
     Adds ``sensor_nearby`` (device URN) and ``sensor_distance_m``
     (distance in metres, rounded to 1 decimal) to each zone dict.
 
@@ -760,27 +792,23 @@ async def find_nearby_sensors(
             enriched.append(zone_copy)
             continue
 
-        zone_centroid = _centroid(loc)
-        if zone_centroid is None:
-            enriched.append(zone_copy)
-            continue
-
-        zone_lon, zone_lat = zone_centroid
         best_dist = float("inf")
         best_sensor: str | None = None
 
         for device in devices:
-            dev_centroid = _centroid(device["location"])
-            if dev_centroid is None:
+            d = _zone_device_distance_m(loc, device["location"])
+            if d is None or d > SENSOR_NEARBY_MAX_M:
                 continue
-            d = _haversine(zone_lon, zone_lat, dev_centroid[0], dev_centroid[1])
             if d < best_dist:
                 best_dist = d
                 best_sensor = device["id"]
 
         if best_sensor is not None:
+            dist = round(best_dist, 1)
             zone_copy["sensor_nearby"] = best_sensor
-            zone_copy["sensor_distance_m"] = round(best_dist, 1)
+            zone_copy["sensor_distance_m"] = dist
+            zone_copy["nkz:sensorNearby"] = {"type": "Property", "value": True}
+            zone_copy["nkz:sensorDistanceM"] = {"type": "Property", "value": dist}
 
         enriched.append(zone_copy)
 
