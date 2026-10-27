@@ -110,11 +110,23 @@ async def test_final_payload_is_ngsi_only():
         assert isinstance(v, dict) and v.get("type") in ("Property", "Relationship", "GeoProperty"), k
 
 
+_PARCEL = {"type": "Relationship", "object": "urn:ngsi-ld:AgriParcel:p1"}
+
+
 class _FakeOrion:
-    def __init__(self, fail_404=False):
+    def __init__(self, fail_404=False, listing=None, list_fails=False):
         self.deleted = []
         self.fail_404 = fail_404
         self.sent = []
+        self.listing = listing or []
+        self.list_fails = list_fails
+        self.queries = []
+
+    async def query_entities(self, **kw):
+        self.queries.append(kw)
+        if self.list_fails:
+            raise ValueError("orion down")
+        return self.listing
 
     async def upsert_entities_batch(self, zones):
         self.sent = zones
@@ -133,18 +145,63 @@ class _FakeOrion:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_404", [False, True])
-async def test_upsert_clears_sensor_attrs_only_where_no_sensor(fail_404):
+async def test_upsert_clears_sensor_attrs_only_where_carried(fail_404):
     from app.sources import upsert_agri_parcel_zones
-    fake = _FakeOrion(fail_404)
+    listing = [
+        {"id": "with", "nkz:sensorNearby": True},
+        {"id": "without", "nkz:sensorNearby": True, "nkz:sensorDistanceM": 3.0},
+        {"id": "clean"},
+        {"id": "unchecked", "nkz:sensorNearby": True},
+    ]
+    fake = _FakeOrion(fail_404, listing)
     zones = [
-        {"id": "with", "nkz:sensorNearby": {"type": "Property", "value": True}, "_sensor_lookup_ok": True},
-        {"id": "without", "_sensor_lookup_ok": True},
-        {"id": "unchecked"},
+        {"id": "with", "hasAgriParcel": _PARCEL, "nkz:sensorNearby": {"type": "Property", "value": True}, "_sensor_lookup_ok": True},
+        {"id": "without", "hasAgriParcel": _PARCEL, "_sensor_lookup_ok": True},
+        {"id": "clean", "hasAgriParcel": _PARCEL, "_sensor_lookup_ok": True},
+        {"id": "unchecked", "hasAgriParcel": _PARCEL},
     ]
     with patch("app.sources.OrionClient", return_value=fake):
         await upsert_agri_parcel_zones("acme", zones)
     assert fake.deleted == [("without", "nkz:sensorNearby"), ("without", "nkz:sensorDistanceM")]
+    assert len(fake.queries) == 1  # one listing per parcel
     assert fake.sent and all("_sensor_lookup_ok" not in z for z in fake.sent)
+
+
+@pytest.mark.asyncio
+async def test_failed_listing_clears_nothing():
+    from app.sources import upsert_agri_parcel_zones
+    fake = _FakeOrion(list_fails=True)
+    zones = [{"id": "z", "hasAgriParcel": _PARCEL, "_sensor_lookup_ok": True,
+              "_cog_checked": {"frostRisk", "solarRadiationWm2"}}]
+    with patch("app.sources.OrionClient", return_value=fake):
+        await upsert_agri_parcel_zones("acme", zones)
+    assert fake.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_stale_radiation_and_frost_cleared_only_when_checked_and_carried():
+    from app.sources import upsert_agri_parcel_zones
+    listing = [
+        {"id": "a", "nkz:solarRadiationWm2": 1.0, "nkz:frostRisk": 2.0},
+        {"id": "b", "https://nkz-os.org/ns/frostRisk": 2.0},
+        {"id": "c", "nkz:frostRisk": 2.0},
+        {"id": "d", "nkz:frostRisk": 2.0},
+    ]
+    fake = _FakeOrion(listing=listing)
+    zones = [
+        {"id": "a", "hasAgriParcel": _PARCEL, "_cog_checked": {"solarRadiationWm2", "frostRisk"}},
+        {"id": "b", "hasAgriParcel": _PARCEL, "_cog_checked": {"solarRadiationWm2", "frostRisk"}},
+        # lookup for frost failed: keep the value
+        {"id": "c", "hasAgriParcel": _PARCEL, "_cog_checked": {"solarRadiationWm2"}},
+        # fresh value this run: nothing to clear
+        {"id": "d", "hasAgriParcel": _PARCEL, "_cog_checked": {"frostRisk"},
+         "nkz:frostRisk": {"type": "Property", "value": 5.0}},
+    ]
+    with patch("app.sources.OrionClient", return_value=fake):
+        await upsert_agri_parcel_zones("acme", zones)
+    assert fake.deleted == [
+        ("a", "nkz:solarRadiationWm2"), ("a", "nkz:frostRisk"), ("b", "nkz:frostRisk")]
+    assert all("_cog_checked" not in z for z in fake.sent)
 
 
 @pytest.mark.asyncio
@@ -155,7 +212,7 @@ async def test_device_fetch_failure_clears_nothing():
     orion.close = AsyncMock()
     with patch("app.sources.OrionClient", return_value=orion):
         out = await find_nearby_sensors("acme", "p1", [_zone()])
-    fake = _FakeOrion()
+    fake = _FakeOrion(listing=[{"id": "urn:ngsi-ld:AgriParcelZone:acme:p1:z1", "nkz:sensorNearby": True}])
     with patch("app.sources.OrionClient", return_value=fake):
         await upsert_agri_parcel_zones("acme", out)
     assert fake.deleted == []
@@ -170,3 +227,25 @@ async def test_zone_without_location_is_not_cleared():
     with patch("app.sources.OrionClient", return_value=fake):
         await upsert_agri_parcel_zones("acme", out)
     assert fake.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_device_outside_expanded_bbox_never_projected():
+    far = _device(_LON0 + 0.01, _LAT0)       # ~800 m east
+    near = _device(_LON0 + _DLON / 2, _LAT0 + _DLAT / 2, "urn:ngsi-ld:Device:near")
+    with _patch([far, near]), patch("app.sources._project_device", wraps=__import__("app.sources", fromlist=["x"])._project_device) as spy:
+        z = (await find_nearby_sensors("acme", "p1", [_zone()]))[0]
+    assert spy.call_count == 1
+    assert z["nkz:sensorNearby"]["value"] is True
+
+
+@pytest.mark.asyncio
+async def test_device_query_limit_raised_and_cap_warned(caplog):
+    import logging
+    orion = AsyncMock()
+    orion.query_entities = AsyncMock(return_value=[_device(_LON0, _LAT0, f"d{i}") for i in range(1000)])
+    orion.close = AsyncMock()
+    with patch("app.sources.OrionClient", return_value=orion), caplog.at_level(logging.WARNING):
+        await find_nearby_sensors("acme", "p1", [_zone()])
+    assert orion.query_entities.await_args.kwargs["limit"] == 1000
+    assert "hit the 1000 cap" in caplog.text

@@ -28,6 +28,7 @@ from app.sources import (
     find_nearby_sensors,
     require,
     upsert_agri_parcel_zones,
+    COG_CHECKED_KEY,
 )
 from app.cog_generator import _bbox_to_tiles, _parcel_geometry, _parcel_lonlat
 from app.tenants import discover_tenants
@@ -273,7 +274,8 @@ async def process_parcel(
             "tMax": round(t_max_z, 1),
             "eto": round(float(eto[0]), 2),
         }
-        metrics.update(await _zone_cog_metrics(tenant_id, zd))
+        cog_values, cog_checked = await _zone_cog_metrics(tenant_id, zd)
+        metrics.update(cog_values)
         area_ha = _compute_area_ha(zd["pixelCount"])
         entity = build_agri_parcel_zone(
             tenant_id=tenant_id,
@@ -285,6 +287,9 @@ async def process_parcel(
             area_ha=area_ha,
             zone_rank=zone_ranks[zd["id"]],
         )
+        # Private marker (stripped before send): attributes whose COG lookup
+        # succeeded, so the upsert may clear stale values for them.
+        entity[COG_CHECKED_KEY] = cog_checked
         entity_list.append(entity)
 
     # 6. Enrich with sensors
@@ -294,32 +299,39 @@ async def process_parcel(
     return entity_list
 
 
-async def _zone_cog_metrics(tenant_id: str, zone: dict) -> dict[str, float]:
+_COG_METRICS = (("solar_radiation", "solarRadiationWm2"), ("frost_risk", "frostRisk"))
+
+
+async def _zone_cog_metrics(tenant_id: str, zone: dict) -> tuple[dict[str, float], set[str]]:
     """Mean solar radiation and frost risk over the zone polygon, from the COGs.
 
-    Returns only the metrics the COGs actually hold; no COG, no data or any
-    failure yields an empty dict (nothing is fabricated, other zones unaffected).
+    Each metric is requested on its own, so one missing COG does not hide the
+    other (the helper resolves the COG date from the first metric asked).
+    Returns ``(values, checked)``: ``values`` holds only what the COGs actually
+    contain (nothing is fabricated); ``checked`` names the attributes whose
+    lookup completed without error (including "no data"), i.e. those a stale
+    value may safely be cleared for. A zone without its own geometry or a
+    failure yields nothing checked for the affected metric.
     """
     geom = zone.get("geometry")
     if not geom:
         # Never fall back to the parcel geometry: that would label a parcel
         # value as a zone value.
         logger.debug("Zone %s has no own geometry; skipping radiation/frost", zone.get("id"))
-        return {}
-    try:
-        stats = await asyncio.to_thread(
-            compute_zonal_stats, tenant_id, geom,
-            ["solar_radiation", "frost_risk"],
-        )
-    except Exception as exc:
-        logger.warning("Zonal radiation/frost failed for zone %s: %s", zone.get("id"), exc)
-        return {}
+        return {}, set()
     out: dict[str, float] = {}
-    for metric, key in (("solar_radiation", "solarRadiationWm2"), ("frost_risk", "frostRisk")):
+    checked: set[str] = set()
+    for metric, key in _COG_METRICS:
+        try:
+            stats = await asyncio.to_thread(compute_zonal_stats, tenant_id, geom, [metric])
+        except Exception as exc:
+            logger.warning("Zonal radiation/frost failed for zone %s: %s", zone.get("id"), exc)
+            continue
+        checked.add(key)
         mean = ((stats.get("metrics") or {}).get(metric) or {}).get("mean")
         if mean is not None:
             out[key] = round(float(mean), 1)
-    return out
+    return out, checked
 
 
 async def _delete_stale_zones(

@@ -171,17 +171,34 @@ async def test_zone_gets_radiation_and_frost_from_cog(zone_env, monkeypatch):
     calls = []
 
     def _fake(tenant, geom, metrics, date=None):
-        calls.append((tenant, geom, tuple(metrics)))
-        return _stats(200.0, 30.0)
+        calls.append(tuple(metrics))
+        return {"metrics": {metrics[0]: {"mean": 200.0 if metrics[0] == "solar_radiation" else 30.0}}}
 
     monkeypatch.setattr(zone_env, "compute_zonal_stats", _fake)
     entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
     assert entities
-    assert len(calls) == len(entities)
-    assert calls[0][2] == ("solar_radiation", "frost_risk")
+    assert len(calls) == 2 * len(entities)
+    assert set(calls) == {("solar_radiation",), ("frost_risk",)}
     for e in entities:
         assert e["nkz:solarRadiationWm2"]["value"] == 200.0
         assert e["nkz:frostRisk"]["value"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_frost_published_when_solar_cog_is_missing(zone_env, monkeypatch):
+    monkeypatch.setattr(zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+
+    def _fake(tenant, geom, metrics, date=None):
+        if metrics[0] == "solar_radiation":
+            return {"error": "No COG data available", "metrics": {}}
+        return {"metrics": {"frost_risk": {"mean": 42.0}}}
+
+    monkeypatch.setattr(zone_env, "compute_zonal_stats", _fake)
+    entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
+    assert entities
+    for e in entities:
+        assert e["nkz:frostRisk"]["value"] == 42.0
+        assert "nkz:solarRadiationWm2" not in e
 
 
 @pytest.mark.asyncio
@@ -218,5 +235,5 @@ async def test_zone_without_geometry_skips_stats_no_parcel_fallback():
     from unittest.mock import patch
 
     with patch.object(za, "compute_zonal_stats") as m:
-        assert await za._zone_cog_metrics("t", {"id": "z1"}) == {}
+        assert await za._zone_cog_metrics("t", {"id": "z1"}) == ({}, set())
     m.assert_not_called()
