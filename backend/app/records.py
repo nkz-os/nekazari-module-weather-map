@@ -7,6 +7,8 @@ never reach TimescaleDB.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from typing import Any
@@ -23,6 +25,8 @@ _ZONE_METRICS = {
     "tMax": "tMax",
     "eto": "eto",
     "waterBalance": "waterBalance",
+    "solarRadiationWm2": "nkz:solarRadiationWm2",
+    "frostRisk": "nkz:frostRisk",
 }
 
 
@@ -154,25 +158,40 @@ def build_agri_parcel_record(
     return entity
 
 
+def _round_coords(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+        return [_round_coords(v) for v in value]
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return round(float(value), 6)
+    return value
+
+
+def zone_version(geometry: dict[str, Any]) -> str:
+    """8-hex fingerprint of a zone geometry, stable to the 6th decimal.
+
+    Other modules key their per-zone values on (zone id, version): a changed
+    outline under the same id must invalidate them.
+    """
+    canonical = {
+        "type": geometry.get("type"),
+        "coordinates": _round_coords(geometry.get("coordinates")),
+    }
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode()).hexdigest()[:8]
+
+
 def _geometry_centroid(geometry: dict[str, Any]) -> list[float]:
-    """Return [lon, lat] from a GeoJSON Polygon geometry (vertex mean)."""
+    """Return [lon, lat] of a point guaranteed inside a Polygon/MultiPolygon."""
     try:
-        if not isinstance(geometry, dict):
+        from shapely.geometry import shape
+
+        point = shape(geometry).representative_point()
+        if point.is_empty:
+            logger.warning("zone centroid: empty geometry, falling back to [0, 0]")
             return [0.0, 0.0]
-        ring = geometry.get("coordinates", [])
-        if not ring or not ring[0]:
-            return [0.0, 0.0]
-        coords = ring[0]
-        # Exclude closing duplicate vertex
-        if len(coords) > 1 and coords[0] == coords[-1]:
-            coords = coords[:-1]
-        if not coords:
-            return [0.0, 0.0]
-        n = len(coords)
-        lon = sum(c[0] for c in coords) / n
-        lat = sum(c[1] for c in coords) / n
-        return [round(lon, 6), round(lat, 6)]
-    except (KeyError, IndexError, TypeError, ZeroDivisionError):
+        return [round(point.x, 6), round(point.y, 6)]
+    except Exception:
+        logger.warning("zone centroid failed, falling back to [0, 0]", exc_info=True)
         return [0.0, 0.0]
 
 
@@ -187,6 +206,7 @@ def build_agri_parcel_zone(
     area_ha: float | None = None,
     sensor_nearby: bool | None = None,
     sensor_distance_m: float | None = None,
+    zone_rank: int | None = None,
 ) -> dict[str, Any]:
     """Return an NGSI-LD AgriParcelZone dict (no @context; added by the SDK).
 
@@ -209,6 +229,8 @@ def build_agri_parcel_zone(
             "value": {"@type": "DateTime", "@value": observed_at},
         },
         "nkz:zoneId": {"type": "Property", "value": zone_id},
+        "nkz:zoneType": {"type": "Property", "value": "management"},
+        "nkz:zoneVersion": {"type": "Property", "value": zone_version(geometry)},
         "nkz:centroid": {"type": "Property", "value": centroid},
         "nkz:elevationMean": {"type": "Property", "value": zone.get("elevationMean", 0.0)},
         "nkz:elevationMin": {"type": "Property", "value": zone.get("elevationMin", 0.0)},
@@ -217,8 +239,13 @@ def build_agri_parcel_zone(
         "nkz:pixelCount": {"type": "Property", "value": zone.get("pixelCount", 0)},
     }
 
-    if area_ha is not None:
-        entity["nkz:areaHa"] = {"type": "Property", "value": area_ha}
+    if area_ha is None:
+        # 10 m pixels -> 0.01 ha each (zone_accumulator.PIXEL_AREA_HA)
+        area_ha = round(zone.get("pixelCount", 0) * 0.01, 2)
+    entity["nkz:areaHa"] = {"type": "Property", "value": area_ha}
+
+    if zone_rank is not None:
+        entity["nkz:zoneRank"] = {"type": "Property", "value": zone_rank}
 
     if sensor_nearby is not None and sensor_distance_m is not None:
         entity["nkz:sensorNearby"] = {"type": "Property", "value": sensor_nearby}

@@ -644,6 +644,96 @@ def _centroid(geometry: dict) -> tuple[float, float] | None:
 # ---------------------------------------------------------------------------
 
 
+_SENSOR_ATTRS = ("nkz:sensorNearby", "nkz:sensorDistanceM")
+
+_LOOKUP_OK_KEY = "_sensor_lookup_ok"
+
+# Attributes (local names) whose COG lookup succeeded for this zone this run.
+COG_CHECKED_KEY = "_cog_checked"
+_COG_ATTRS = ("nkz:solarRadiationWm2", "nkz:frostRisk")
+_PRIVATE_KEYS = (_LOOKUP_OK_KEY, COG_CHECKED_KEY)
+_ZONE_LIST_LIMIT = 1000
+
+
+def _present(entity: dict, attr: str) -> bool:
+    """True when a keyValues entity carries *attr* (compact or full-IRI key)."""
+    local = attr.split(":", 1)[-1]
+    return any(
+        k == attr or k.endswith("/" + local) or k.endswith("#" + local)
+        for k in entity
+    )
+
+
+async def _list_carriers(orion: Any, tenant_id: str, parcel_urn: str) -> dict[str, dict] | None:
+    """Zone entities of a parcel as they currently are, by id (None on failure)."""
+    try:
+        rows = await orion.query_entities(
+            type="AgriParcelZone",
+            q=f'hasAgriParcel=="{parcel_urn}"',
+            options="keyValues",
+            limit=_ZONE_LIST_LIMIT,
+        )
+        if not isinstance(rows, list):
+            raise ValueError(f"unexpected zone listing: {type(rows).__name__}")
+        if len(rows) >= _ZONE_LIST_LIMIT:
+            logger.warning("zone listing for %s hit the %d cap", parcel_urn, _ZONE_LIST_LIMIT)
+        return {r["id"]: r for r in rows if isinstance(r, dict) and r.get("id")}
+    except Exception:
+        logger.warning(
+            "zone listing failed for %s (tenant=%s); stale attributes not cleared",
+            parcel_urn, tenant_id, exc_info=True,
+        )
+        return None
+
+
+async def _delete_attr(orion: Any, tenant_id: str, eid: str, attr: str) -> None:
+    try:
+        await orion.delete_entity_attr(eid, attr)
+    except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 404:
+            logger.debug("no %s to clear on %s", attr, eid)
+        else:
+            logger.warning(
+                "clear %s on %s failed (tenant=%s)", attr, eid, tenant_id, exc_info=True,
+            )
+
+
+async def _clear_stale_attrs(orion: Any, tenant_id: str, zones: list[dict]) -> None:
+    """Delete attributes this run no longer produces, only where they exist.
+
+    The batch upsert keeps attributes absent from the payload, so a device that
+    moved away, or a COG that no longer covers a zone, would leave stale values
+    forever. One listing per parcel finds the zones that currently carry the
+    attributes; only those get a DELETE. Sensor attributes are cleared only for
+    zones marked by a SUCCESSFUL device lookup, radiation/frost only for the
+    metrics whose COG lookup succeeded. A failed listing clears nothing.
+    """
+    parcels: dict[str, dict | None] = {}
+    for zone in zones:
+        if not (zone.get(_LOOKUP_OK_KEY) or zone.get(COG_CHECKED_KEY)):
+            continue
+        parcel = (zone.get("hasAgriParcel") or {}).get("object")
+        if parcel and parcel not in parcels:
+            parcels[parcel] = await _list_carriers(orion, tenant_id, parcel)
+
+    for zone in zones:
+        parcel = (zone.get("hasAgriParcel") or {}).get("object")
+        current = (parcels.get(parcel) or {}).get(zone["id"])
+        if current is None:
+            continue
+        stale: list[str] = []
+        if zone.get(_LOOKUP_OK_KEY) and "nkz:sensorNearby" not in zone:
+            stale += [a for a in _SENSOR_ATTRS if _present(current, a)]
+        checked = zone.get(COG_CHECKED_KEY) or set()
+        stale += [
+            a for a in _COG_ATTRS
+            if a.split(":", 1)[1] in checked and a not in zone and _present(current, a)
+        ]
+        for attr in stale:
+            await _delete_attr(orion, tenant_id, zone["id"], attr)
+
+
 async def upsert_agri_parcel_zones(tenant_id: str, zones: list[dict]) -> None:
     """Batch upsert ``AgriParcelZone`` entities via Orion-LD SDK.
 
@@ -666,7 +756,10 @@ async def upsert_agri_parcel_zones(tenant_id: str, zones: list[dict]) -> None:
 
     orion = OrionClient(tenant_id)
     try:
-        result = await orion.upsert_entities_batch(zones)
+        payload = [
+            {k: v for k, v in z.items() if k not in _PRIVATE_KEYS} for z in zones
+        ]
+        result = await orion.upsert_entities_batch(payload)
         logger.info(
             "upsert_agri_parcel_zones(tenant=%s): upserted %d zone(s)",
             tenant_id, result.get("upserted", 0),
@@ -676,6 +769,7 @@ async def upsert_agri_parcel_zones(tenant_id: str, zones: list[dict]) -> None:
                 "upsert_agri_parcel_zones(tenant=%s): %d error(s)",
                 tenant_id, len(result["errors"]),
             )
+        await _clear_stale_attrs(orion, tenant_id, zones)
     except Exception:
         logger.exception(
             "upsert_agri_parcel_zones(tenant=%s) failed for %d zone(s)",
@@ -683,6 +777,61 @@ async def upsert_agri_parcel_zones(tenant_id: str, zones: list[dict]) -> None:
         )
     finally:
         await orion.close()
+
+
+SENSOR_NEARBY_MAX_M = 50.0
+
+
+_BBOX_PAD_DEG = 0.001  # ~100 m: cheap prefilter well above SENSOR_NEARBY_MAX_M
+_DEVICE_LIST_LIMIT = 1000
+
+
+def _zone_projector(zone_geom: dict):
+    """Project a zone to local metres ONCE; return ``(zone_m, project, bbox)``.
+
+    Equirectangular approximation around the zone centroid
+    (x = dlon*cos(lat0)*111320, y = dlat*110540): error < 1 % at zone scale.
+    ``bbox`` is the zone's lon/lat bounds expanded by ``_BBOX_PAD_DEG``.
+    """
+    from shapely.geometry import shape
+    from shapely.ops import transform
+
+    zone = shape(zone_geom)
+    lon0, lat0 = zone.centroid.x, zone.centroid.y
+    kx = math.cos(math.radians(lat0)) * 111320.0
+
+    def _proj(x, y, z=None):
+        return ((x - lon0) * kx, (y - lat0) * 110540.0)
+
+    minx, miny, maxx, maxy = zone.bounds
+    bbox = (minx - _BBOX_PAD_DEG, miny - _BBOX_PAD_DEG,
+            maxx + _BBOX_PAD_DEG, maxy + _BBOX_PAD_DEG)
+    return transform(_proj, zone), _proj, bbox
+
+
+def _project_device(device_geom: dict, proj):
+    from shapely.geometry import shape
+    from shapely.ops import transform
+
+    return transform(proj, shape(device_geom))
+
+
+def _device_distance_m(zone_m, proj, device_geom: dict, device_id: str | None = None) -> float | None:
+    """Distance in metres from a device to the (already projected) zone."""
+    try:
+        return float(zone_m.distance(_project_device(device_geom, proj)))
+    except Exception:
+        logger.warning(
+            "zone/device distance failed for device %s", device_id, exc_info=True,
+        )
+        return None
+
+
+def _in_bbox(device_geom: dict, bbox) -> bool:
+    c = _centroid(device_geom)
+    if c is None:
+        return False
+    return bbox[0] <= c[0] <= bbox[2] and bbox[1] <= c[1] <= bbox[3]
 
 
 async def find_nearby_sensors(
@@ -693,7 +842,8 @@ async def find_nearby_sensors(
     """Enrich zone descriptors with the nearest IoT sensor.
 
     Queries Orion-LD for ``Device`` entities associated with the tenant,
-    then for each zone finds the closest device by haversine distance.
+    then for each zone finds the closest device within SENSOR_NEARBY_MAX_M
+    of the zone (metres, 0 when inside); farther devices are ignored.
     Adds ``sensor_nearby`` (device URN) and ``sensor_distance_m``
     (distance in metres, rounded to 1 decimal) to each zone dict.
 
@@ -723,17 +873,24 @@ async def find_nearby_sensors(
             type="Device",
             attrs="location,name",
             options="keyValues",
+            limit=_DEVICE_LIST_LIMIT,
         )
-        if isinstance(data, list):
-            for entity in data:
-                raw_loc = entity.get("location")
-                loc = _unwrap_location(raw_loc)
-                if loc is None:
-                    continue
-                devices.append({
-                    "id": entity.get("id"),
-                    "location": loc,
-                })
+        if not isinstance(data, list):
+            raise ValueError(f"unexpected Device query result: {type(data).__name__}")
+        if len(data) >= _DEVICE_LIST_LIMIT:
+            logger.warning(
+                "find_nearby_sensors(tenant=%s, parcel=%s): Device query hit the %d cap; "
+                "some devices may be ignored", tenant_id, parcel_id, _DEVICE_LIST_LIMIT,
+            )
+        for entity in data:
+            raw_loc = entity.get("location")
+            loc = _unwrap_location(raw_loc)
+            if loc is None:
+                continue
+            devices.append({
+                "id": entity.get("id"),
+                "location": loc,
+            })
     except Exception:
         logger.exception(
             "find_nearby_sensors(tenant=%s, parcel=%s): failed to fetch devices",
@@ -748,7 +905,6 @@ async def find_nearby_sensors(
             "find_nearby_sensors(tenant=%s, parcel=%s): no devices found",
             tenant_id, parcel_id,
         )
-        return list(zones)
 
     # Enrich each zone with the nearest device
     enriched: list[dict[str, Any]] = []
@@ -760,27 +916,33 @@ async def find_nearby_sensors(
             enriched.append(zone_copy)
             continue
 
-        zone_centroid = _centroid(loc)
-        if zone_centroid is None:
-            enriched.append(zone_copy)
-            continue
-
-        zone_lon, zone_lat = zone_centroid
+        # Lookup succeeded and this zone was evaluated: the upsert may clear
+        # stale sensor attributes on it. Private marker, stripped before send.
+        zone_copy[_LOOKUP_OK_KEY] = True
         best_dist = float("inf")
         best_sensor: str | None = None
 
+        try:
+            zone_m, proj, bbox = _zone_projector(loc)
+        except Exception:
+            logger.warning("zone projection failed for %s", zone.get("id"), exc_info=True)
+            enriched.append(zone_copy)
+            continue
+
         for device in devices:
-            dev_centroid = _centroid(device["location"])
-            if dev_centroid is None:
+            if not _in_bbox(device["location"], bbox):
                 continue
-            d = _haversine(zone_lon, zone_lat, dev_centroid[0], dev_centroid[1])
+            d = _device_distance_m(zone_m, proj, device["location"], device["id"])
+            if d is None or d > SENSOR_NEARBY_MAX_M:
+                continue
             if d < best_dist:
                 best_dist = d
                 best_sensor = device["id"]
 
         if best_sensor is not None:
-            zone_copy["sensor_nearby"] = best_sensor
-            zone_copy["sensor_distance_m"] = round(best_dist, 1)
+            dist = round(best_dist, 1)
+            zone_copy["nkz:sensorNearby"] = {"type": "Property", "value": True}
+            zone_copy["nkz:sensorDistanceM"] = {"type": "Property", "value": dist}
 
         enriched.append(zone_copy)
 

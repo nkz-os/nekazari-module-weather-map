@@ -18,6 +18,7 @@ import numpy as np
 from app.config import settings
 from app.downscaler import compute_zones, correct_temperature, compute_eto
 from app.records import build_agri_parcel_zone
+from app.stats import compute_zonal_stats
 from nkz_platform_sdk import OrionClient
 from app.sources import (
     MissingWeatherInput,
@@ -27,6 +28,7 @@ from app.sources import (
     find_nearby_sensors,
     require,
     upsert_agri_parcel_zones,
+    COG_CHECKED_KEY,
 )
 from app.cog_generator import _bbox_to_tiles, _parcel_geometry, _parcel_lonlat
 from app.tenants import discover_tenants
@@ -36,6 +38,12 @@ logger = logging.getLogger(__name__)
 PIXEL_AREA_HA = 0.01  # ~10m x 10m per pixel at zoom 14
 
 _SECTOR_NAMES = ["flat", "N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+
+
+def _assign_zone_ranks(zones: list[dict[str, Any]]) -> dict[str, int]:
+    """1-based display rank by zone id: north first, ties west to east."""
+    ordered = sorted(zones, key=lambda z: (-z["centroid"][1], z["centroid"][0]))
+    return {z["id"]: i for i, z in enumerate(ordered, start=1)}
 
 
 def _compute_area_ha(pixel_count: int) -> float:
@@ -225,6 +233,8 @@ async def process_parcel(
         zones_all.sort(key=lambda z: z["pixelCount"], reverse=True)
         zones_all = zones_all[:settings.zones_max_count]
 
+    zone_ranks = _assign_zone_ranks(zones_all)
+
     # 4. Fetch weather from the broker (no defaults — see app.sources.require)
     weather = await fetch_parcel_weather(tenant_id, parcel_id)
     if weather is None:
@@ -264,6 +274,8 @@ async def process_parcel(
             "tMax": round(t_max_z, 1),
             "eto": round(float(eto[0]), 2),
         }
+        cog_values, cog_checked = await _zone_cog_metrics(tenant_id, zd)
+        metrics.update(cog_values)
         area_ha = _compute_area_ha(zd["pixelCount"])
         entity = build_agri_parcel_zone(
             tenant_id=tenant_id,
@@ -273,9 +285,11 @@ async def process_parcel(
             metrics=metrics,
             observed_at=observed_at,
             area_ha=area_ha,
-            sensor_nearby=zd.get("sensor_nearby"),
-            sensor_distance_m=zd.get("sensor_distance_m"),
+            zone_rank=zone_ranks[zd["id"]],
         )
+        # Private marker (stripped before send): attributes whose COG lookup
+        # succeeded, so the upsert may clear stale values for them.
+        entity[COG_CHECKED_KEY] = cog_checked
         entity_list.append(entity)
 
     # 6. Enrich with sensors
@@ -283,6 +297,41 @@ async def process_parcel(
         entity_list = await find_nearby_sensors(tenant_id, parcel_id, entity_list)
 
     return entity_list
+
+
+_COG_METRICS = (("solar_radiation", "solarRadiationWm2"), ("frost_risk", "frostRisk"))
+
+
+async def _zone_cog_metrics(tenant_id: str, zone: dict) -> tuple[dict[str, float], set[str]]:
+    """Mean solar radiation and frost risk over the zone polygon, from the COGs.
+
+    Each metric is requested on its own, so one missing COG does not hide the
+    other (the helper resolves the COG date from the first metric asked).
+    Returns ``(values, checked)``: ``values`` holds only what the COGs actually
+    contain (nothing is fabricated); ``checked`` names the attributes whose
+    lookup completed without error (including "no data"), i.e. those a stale
+    value may safely be cleared for. A zone without its own geometry or a
+    failure yields nothing checked for the affected metric.
+    """
+    geom = zone.get("geometry")
+    if not geom:
+        # Never fall back to the parcel geometry: that would label a parcel
+        # value as a zone value.
+        logger.debug("Zone %s has no own geometry; skipping radiation/frost", zone.get("id"))
+        return {}, set()
+    out: dict[str, float] = {}
+    checked: set[str] = set()
+    for metric, key in _COG_METRICS:
+        try:
+            stats = await asyncio.to_thread(compute_zonal_stats, tenant_id, geom, [metric])
+        except Exception as exc:
+            logger.warning("Zonal radiation/frost failed for zone %s: %s", zone.get("id"), exc)
+            continue
+        checked.add(key)
+        mean = ((stats.get("metrics") or {}).get(metric) or {}).get("mean")
+        if mean is not None:
+            out[key] = round(float(mean), 1)
+    return out, checked
 
 
 async def _delete_stale_zones(

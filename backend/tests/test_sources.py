@@ -406,9 +406,11 @@ class TestFindNearbySensors:
             result = await find_nearby_sensors("test-tenant", "parcel-1", zones)
 
         assert len(result) == 1
-        assert result[0]["sensor_nearby"] == "urn:ngsi-ld:Device:sensor-1"
-        assert isinstance(result[0]["sensor_distance_m"], float)
-        assert result[0]["sensor_distance_m"] > 0
+        assert "sensor_nearby" not in result[0]
+        assert "sensor_distance_m" not in result[0]
+        assert result[0]["nkz:sensorNearby"]["value"] is True
+        assert isinstance(result[0]["nkz:sensorDistanceM"]["value"], float)
+        assert result[0]["nkz:sensorDistanceM"]["value"] > 0
 
     @pytest.mark.asyncio
     async def test_find_nearby_sensors_fetch_fails(self):

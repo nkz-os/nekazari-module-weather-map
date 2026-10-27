@@ -2,7 +2,7 @@
 from __future__ import annotations
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncpg
@@ -18,12 +18,97 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/weather-map", tags=["zones"])
 
 _SAFE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_MAX_DAILY_SPAN_DAYS = 400
 
 
 def _parcel_urn(parcel_id: str) -> str:
     if parcel_id.startswith("urn:"):
         return parcel_id
     return f"urn:ngsi-ld:AgriParcel:{parcel_id}"
+
+
+@router.get("/zones/{parcel_id:path}/daily")
+async def get_zones_daily(
+    parcel_id: str,
+    start: str = Query(..., description="First day (YYYY-MM-DD)"),
+    end: str = Query(..., description="Last day, inclusive (YYYY-MM-DD)"),
+    tenant_id: str = Depends(require_tenant),
+) -> dict[str, Any]:
+    """Daily downscaled tMin/tMax/eto per zone; the latest run of each day wins.
+
+    Declared before ``/zones/{parcel_id:path}`` so ``.../daily`` is not
+    swallowed by the catch-all.
+    """
+    if not (_SAFE_DATE_RE.match(start) and _SAFE_DATE_RE.match(end)):
+        raise HTTPException(status_code=400, detail="start and end must be YYYY-MM-DD")
+    try:
+        start_dt = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_dt = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="start and end must be valid dates")
+    if end_dt < start_dt:
+        raise HTTPException(status_code=400, detail="end must not precede start")
+    if (end_dt - start_dt).days > _MAX_DAILY_SPAN_DAYS:
+        raise HTTPException(
+            status_code=400, detail=f"range exceeds {_MAX_DAILY_SPAN_DAYS} days",
+        )
+
+    if not settings.postgres_url:
+        raise HTTPException(status_code=503, detail="POSTGRES_URL not configured")
+
+    pid = _parcel_urn(parcel_id)
+    parcel = await fetch_agri_parcel(tenant_id, pid)
+    if parcel is None:
+        raise HTTPException(status_code=404, detail=f"Parcel not found: {parcel_id}")
+
+    try:
+        conn = await asyncpg.connect(settings.postgres_url)
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT ON (nkz_zone_id, (observed_at AT TIME ZONE 'UTC')::date)
+                    nkz_zone_id, (observed_at AT TIME ZONE 'UTC')::date AS day,
+                    observed_at, t_min, t_max, eto
+                FROM agriparcelzone
+                WHERE has_agri_parcel = $1
+                  AND observed_at >= $2
+                  AND observed_at < $3
+                ORDER BY nkz_zone_id, (observed_at AT TIME ZONE 'UTC')::date, observed_at DESC
+                """,
+                pid, start_dt, end_dt + timedelta(days=1),
+            )
+        finally:
+            await conn.close()
+    except Exception as exc:
+        logger.exception("Daily zone query failed for %s", pid)
+        raise HTTPException(status_code=502, detail="Database query failed") from exc
+
+    def _num(v: Any) -> float | None:
+        return None if v is None else float(v)
+
+    # Defence in depth: whatever the SQL returns, the latest run of a
+    # (zone, day) wins.
+    latest: dict[tuple[str, str], Any] = {}
+    for row in rows:
+        key = (row["nkz_zone_id"], row["day"].isoformat())
+        prev = latest.get(key)
+        if prev is None or row["observed_at"] > prev["observed_at"]:
+            latest[key] = row
+
+    zones: dict[str, list[dict[str, Any]]] = {}
+    dates: set[str] = set()
+    for (zone_id, day), row in latest.items():
+        dates.add(day)
+        zones.setdefault(zone_id, []).append({
+            "date": day,
+            "tMin": _num(row["t_min"]),
+            "tMax": _num(row["t_max"]),
+            "eto": _num(row["eto"]),
+        })
+    for series in zones.values():
+        series.sort(key=lambda d: d["date"])
+
+    return {"parcel_id": pid, "days": len(dates), "zones": zones}
 
 
 @router.get("/zones/{parcel_id:path}")

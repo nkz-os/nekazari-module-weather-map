@@ -98,6 +98,7 @@ def zone_env(monkeypatch):
         return list(zones)
 
     monkeypatch.setattr(za, "find_nearby_sensors", _no_sensors)
+    monkeypatch.setattr(za, "compute_zonal_stats", lambda *a, **k: {"error": "no cog", "metrics": {}})
     return za
 
 
@@ -147,3 +148,92 @@ async def test_zone_correction_uses_the_observation_altitude(zone_env, monkeypat
     assert entities, "con meteo completa se esperan entidades AgriParcelZone"
     assert set(seen) == {572.8}
     assert DEM_BASE_ELEVATION not in seen
+
+
+def test_assign_zone_ranks_north_to_south_then_west_to_east():
+    from app.zone_accumulator import _assign_zone_ranks
+    zones = [
+        {"id": "s", "centroid": [0.0, 1.0]},
+        {"id": "ne", "centroid": [2.0, 5.0]},
+        {"id": "nw", "centroid": [1.0, 5.0]},
+    ]
+    assert _assign_zone_ranks(zones) == {"nw": 1, "ne": 2, "s": 3}
+
+
+def _stats(mean_sr, mean_fr):
+    return {"date": "2026-09-02", "metrics": {
+        "solar_radiation": {"mean": mean_sr}, "frost_risk": {"mean": mean_fr}}}
+
+
+@pytest.mark.asyncio
+async def test_zone_gets_radiation_and_frost_from_cog(zone_env, monkeypatch):
+    monkeypatch.setattr(zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+    calls = []
+
+    def _fake(tenant, geom, metrics, date=None):
+        calls.append(tuple(metrics))
+        return {"metrics": {metrics[0]: {"mean": 200.0 if metrics[0] == "solar_radiation" else 30.0}}}
+
+    monkeypatch.setattr(zone_env, "compute_zonal_stats", _fake)
+    entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
+    assert entities
+    assert len(calls) == 2 * len(entities)
+    assert set(calls) == {("solar_radiation",), ("frost_risk",)}
+    for e in entities:
+        assert e["nkz:solarRadiationWm2"]["value"] == 200.0
+        assert e["nkz:frostRisk"]["value"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_frost_published_when_solar_cog_is_missing(zone_env, monkeypatch):
+    monkeypatch.setattr(zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+
+    def _fake(tenant, geom, metrics, date=None):
+        if metrics[0] == "solar_radiation":
+            return {"error": "No COG data available", "metrics": {}}
+        return {"metrics": {"frost_risk": {"mean": 42.0}}}
+
+    monkeypatch.setattr(zone_env, "compute_zonal_stats", _fake)
+    entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
+    assert entities
+    for e in entities:
+        assert e["nkz:frostRisk"]["value"] == 42.0
+        assert "nkz:solarRadiationWm2" not in e
+
+
+@pytest.mark.asyncio
+async def test_zone_radiation_absent_without_cog(zone_env, monkeypatch):
+    monkeypatch.setattr(zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+    monkeypatch.setattr(
+        zone_env, "compute_zonal_stats",
+        lambda *a, **k: {"error": "No COG data available", "metrics": {}},
+    )
+    entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
+    assert entities
+    for e in entities:
+        assert "nkz:solarRadiationWm2" not in e and "nkz:frostRisk" not in e
+
+
+@pytest.mark.asyncio
+async def test_zone_stats_failure_is_isolated(zone_env, monkeypatch, caplog):
+    monkeypatch.setattr(zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+
+    def _boom(*a, **k):
+        raise RuntimeError("minio down")
+
+    monkeypatch.setattr(zone_env, "compute_zonal_stats", _boom)
+    with caplog.at_level(logging.WARNING):
+        entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
+    assert entities and all("nkz:frostRisk" not in e for e in entities)
+    assert "Zonal radiation/frost failed" in caplog.text
+    assert "minio down" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_zone_without_geometry_skips_stats_no_parcel_fallback():
+    from app import zone_accumulator as za
+    from unittest.mock import patch
+
+    with patch.object(za, "compute_zonal_stats") as m:
+        assert await za._zone_cog_metrics("t", {"id": "z1"}) == ({}, set())
+    m.assert_not_called()
