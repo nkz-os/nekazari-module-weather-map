@@ -40,9 +40,34 @@ PIXEL_AREA_HA = 0.01  # ~10m x 10m per pixel at zoom 14
 _SECTOR_NAMES = ["flat", "N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
 
+def _dedupe_zone_ids(zones: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return zones with unique ids, deterministically.
+
+    Distinct zones can share geohash, elevation band and aspect sector. Within a
+    group of equal ids, members are ordered north first, ties west to east; the
+    first keeps the bare id and the rest get ``-2``, ``-3``...
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for z in zones:
+        groups.setdefault(z["id"], []).append(z)
+    renamed: dict[int, str] = {}
+    for zid, members in groups.items():
+        if len(members) < 2:
+            continue
+        members = sorted(members, key=lambda z: (-z["centroid"][1], z["centroid"][0]))
+        for n, z in enumerate(members[1:], start=2):
+            renamed[id(z)] = f"{zid}-{n}"
+    if not renamed:
+        return zones
+    return [{**z, "id": renamed[id(z)]} if id(z) in renamed else z for z in zones]
+
+
 def _assign_zone_ranks(zones: list[dict[str, Any]]) -> dict[str, int]:
     """1-based display rank by zone id: north first, ties west to east."""
-    ordered = sorted(zones, key=lambda z: (-z["centroid"][1], z["centroid"][0]))
+    deduped = _dedupe_zone_ids(zones)
+    if deduped is not zones:
+        logger.error("Duplicate zone ids reached rank assignment; de-duplicating")
+    ordered = sorted(deduped, key=lambda z: (-z["centroid"][1], z["centroid"][0]))
     return {z["id"]: i for i, z in enumerate(ordered, start=1)}
 
 
@@ -233,6 +258,7 @@ async def process_parcel(
         zones_all.sort(key=lambda z: z["pixelCount"], reverse=True)
         zones_all = zones_all[:settings.zones_max_count]
 
+    zones_all = _dedupe_zone_ids(zones_all)
     zone_ranks = _assign_zone_ranks(zones_all)
 
     # 4. Fetch weather from the broker (no defaults — see app.sources.require)
