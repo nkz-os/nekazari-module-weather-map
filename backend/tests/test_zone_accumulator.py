@@ -160,6 +160,71 @@ def test_assign_zone_ranks_north_to_south_then_west_to_east():
     assert _assign_zone_ranks(zones) == {"nw": 1, "ne": 2, "s": 3}
 
 
+def _colliding_zones():
+    return [
+        {"id": "zabc-e1-N", "centroid": [1.0, 1.0]},
+        {"id": "zabc-e1-N", "centroid": [2.0, 5.0]},
+        {"id": "zabc-e1-N", "centroid": [1.0, 5.0]},
+        {"id": "zxyz-e2-S", "centroid": [0.0, 3.0]},
+    ]
+
+
+def test_dedupe_zone_ids_suffixes_in_north_then_west_order():
+    from app.zone_accumulator import _dedupe_zone_ids
+    out = _dedupe_zone_ids(_colliding_zones())
+    by_centroid = {tuple(z["centroid"]): z["id"] for z in out}
+    assert by_centroid[(1.0, 5.0)] == "zabc-e1-N"
+    assert by_centroid[(2.0, 5.0)] == "zabc-e1-N-2"
+    assert by_centroid[(1.0, 1.0)] == "zabc-e1-N-3"
+    assert by_centroid[(0.0, 3.0)] == "zxyz-e2-S"
+    assert len({z["id"] for z in out}) == len(out)
+
+
+def test_dedupe_zone_ids_is_noop_for_unique_ids():
+    from app.zone_accumulator import _dedupe_zone_ids
+    zones = [{"id": "a", "centroid": [0.0, 0.0]}, {"id": "b", "centroid": [1.0, 1.0]}]
+    assert _dedupe_zone_ids(zones) is zones
+
+
+def test_assign_zone_ranks_stays_contiguous_with_duplicate_ids(caplog):
+    from app.zone_accumulator import _assign_zone_ranks
+    with caplog.at_level(logging.ERROR):
+        ranks = _assign_zone_ranks(_colliding_zones())
+    assert sorted(ranks.values()) == [1, 2, 3, 4]
+    assert len(ranks) == 4
+    assert "Duplicate zone ids" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_colliding_zone_ids_yield_distinct_entities(zone_env, monkeypatch):
+    monkeypatch.setattr(
+        zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)),
+    )
+    monkeypatch.setattr(zone_env.geohash2, "encode", lambda *a, **k: "samecel")
+    monkeypatch.setattr(zone_env.settings, "zones_elevation_band_m", 100000.0)
+
+    def _two_labels(elev, aspect, slope, **kwargs):
+        labels = np.zeros(elev.shape, dtype=int)
+        labels[: elev.shape[0] // 2, :] = 1
+        labels[elev.shape[0] // 2 :, :] = 2
+        return [], labels
+
+    monkeypatch.setattr(zone_env, "compute_zones", _two_labels)
+    monkeypatch.setattr(
+        zone_env, "_zone_geometry",
+        lambda *a, **k: {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]},
+    )
+
+    entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
+
+    ids = [e["id"] for e in entities]
+    assert len(ids) == len(set(ids))
+    assert len(entities) >= 2
+    assert any(i.endswith("-2") for i in ids), "test must exercise a collision"
+    ranks = sorted(e["nkz:zoneRank"]["value"] for e in entities)
+    assert ranks == list(range(1, len(entities) + 1))
+
+
 def _stats(mean_sr, mean_fr):
     return {"date": "2026-09-02", "metrics": {
         "solar_radiation": {"mean": mean_sr}, "frost_risk": {"mean": mean_fr}}}
