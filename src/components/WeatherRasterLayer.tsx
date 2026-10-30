@@ -3,9 +3,14 @@ import { useViewerOptional } from '@nekazari/sdk';
 import { useWeatherLayerContext } from '../services/weatherLayerContext';
 import { fetchLatestWeatherDate, fetchTileToken } from '../services/weatherApi';
 
-const API_BASE =
-  (import.meta as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL
-  || '';
+const API_ORIGIN = (
+  (typeof window !== 'undefined'
+    ? (window as { __ENV__?: { VITE_API_URL?: string } }).__ENV__?.VITE_API_URL
+    : undefined)
+  ?? (import.meta as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL
+  ?? ''
+).replace(/\/$/, '');
+
 // Backend COGs are generated at a single zoom level (14); Cesium upsamples
 // beyond it and misses (transparent 404s) below it.
 const TILE_LEVEL = 14;
@@ -79,11 +84,13 @@ const WeatherRasterLayer: React.FC = () => {
           return;
         }
 
-        const apiHost = new URL(API_BASE).hostname;
-        CesiumLib.TrustedServers.add(apiHost, 443);
+        if (API_ORIGIN) {
+          const apiHost = new URL(API_ORIGIN).hostname;
+          CesiumLib.TrustedServers.add(apiHost, 443);
+        }
 
         const provider = new CesiumLib.UrlTemplateImageryProvider({
-          url: `${API_BASE}/api/weather-map/tiles/${encodeURIComponent(metric)}/{z}/{x}/{y}.png?date=${encodeURIComponent(date)}&tenant=${encodeURIComponent(t.tenant)}&token=${encodeURIComponent(t.token)}`,
+          url: `${API_ORIGIN}/api/weather-map/tiles/${encodeURIComponent(metric)}/{z}/{x}/{y}.png?date=${encodeURIComponent(date)}&tenant=${encodeURIComponent(t.tenant)}&token=${encodeURIComponent(t.token)}`,
           tilingScheme: new CesiumLib.WebMercatorTilingScheme(),
           maximumLevel: TILE_LEVEL,
           // Cut global 404 spam: weather COGs only cover EU tenants.
