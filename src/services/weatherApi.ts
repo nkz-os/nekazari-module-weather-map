@@ -1,6 +1,13 @@
-function apiBase(): string {
-  return (import.meta as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL
-    || '';
+export function apiBase(): string {
+  const runtimeUrl =
+    typeof window !== 'undefined'
+      ? (window as { __ENV__?: { VITE_API_URL?: string } }).__ENV__?.VITE_API_URL
+      : undefined;
+  return (
+    runtimeUrl
+    ?? (import.meta as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL
+    ?? ''
+  ).replace(/\/$/, '');
 }
 
 function getAuthToken(): string | null {
