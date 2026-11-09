@@ -243,20 +243,70 @@ async def test_history_is_sorted_client_side_oldest_first(monkeypatch):
     assert values == [18.0, 19.0, 21.0]
 
 
+class _PagedClient(_FakeClient):
+    """Serves `pages` in order, one per GET; records every request."""
+
+    def __init__(self, pages):
+        super().__init__()
+        self._pages = list(pages)
+
+    async def get(self, url, params=None, headers=None):
+        self.calls.append({"url": url, "params": params or {}})
+        offset = int((params or {}).get("offset", 0))
+        page = self._pages[offset // _PAGE] if offset // _PAGE < len(self._pages) else []
+        return _FakeResponse(200, page)
+
+
+_PAGE = 1000
+
+
 @pytest.mark.asyncio
-async def test_ignored_server_ordering_is_reported(monkeypatch, caplog):
-    """Si Orion no honra el `orderBy`, el orden nuestro lo arregla, pero el
-    hecho se registra: un `limit` sobre un orden arbitrario elige una
-    ventana arbitraria y eso debilita el guard."""
-    payload = [
-        _record("20260830120000", "airTemperatureAvg", 18.0),
-        _record("20260831120000", "airTemperatureAvg", 19.0),
-        _record("20260901120000", "airTemperatureAvg", 21.0),
-    ]  # ascendente = NO es el desc que pedimos
-    _patch_client(monkeypatch, _FakeClient(response=_FakeResponse(200, payload)))
-    with caplog.at_level(logging.WARNING):
-        await fetch_metric_history("t", "urn:ngsi-ld:AgriParcel:p1", "airTemperatureAvg")
-    assert "orderBy" in caplog.text
+async def test_history_read_sends_no_order_by(monkeypatch):
+    """Orion-LD answers 501 to `orderBy` on this query: never send it."""
+    client = _patch_client(
+        monkeypatch,
+        _FakeClient(response=_FakeResponse(200, [_record("20260901120000", "airTemperatureAvg", 21.0)])),
+    )
+    await fetch_metric_history("t", "urn:ngsi-ld:AgriParcel:p1", "airTemperatureAvg")
+    assert client.calls
+    assert all("orderBy" not in c["params"] for c in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_history_paginates_and_keeps_most_recent(monkeypatch):
+    """All of the parcel's records are read (page after page) and the last
+    `limit` by timestamp in the id are kept, oldest first."""
+    page1 = [_record(f"2026{m:02d}01120000", "airTemperatureAvg", float(m)) for m in range(1, 10)]
+    page1 += [_record(f"2026{m:02d}02120000", "airTemperatureAvg", 100.0 + m) for m in range(1, 10)]
+    page1 = (page1 * 60)[:_PAGE]  # a full page forces a second request
+    page2 = [
+        _record("20261101120000", "airTemperatureAvg", 201.0),
+        _record("20261102120000", "airTemperatureAvg", 202.0),
+        _record("20261103120000", "airTemperatureAvg", 203.0),
+    ]
+    client = _patch_client(monkeypatch, _PagedClient([page1, page2]))
+    values = await fetch_metric_history(
+        "t", "urn:ngsi-ld:AgriParcel:p1", "airTemperatureAvg", limit=2,
+    )
+    assert values == [202.0, 203.0]
+    assert len(client.calls) == 2
+    assert [c["params"].get("offset", 0) for c in client.calls] == [0, _PAGE]
+
+
+@pytest.mark.asyncio
+async def test_frozen_constant_metric_is_reported(monkeypatch, caplog):
+    """Five identical prior values + the one about to publish: FROZEN METRIC."""
+    from app import records
+
+    async def _history(tenant_id, parcel_id, attr_name, limit=5):
+        return [14.934] * 5
+
+    monkeypatch.setattr(records, "fetch_metric_history", _history)
+    with caplog.at_level(logging.ERROR):
+        await guard_frozen_metrics(
+            "demo-coop", "urn:ngsi-ld:AgriParcel:p1", {"temperature_avg": 14.934},
+        )
+    assert "FROZEN METRIC" in caplog.text
 
 
 @pytest.mark.asyncio

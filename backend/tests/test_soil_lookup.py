@@ -115,3 +115,29 @@ async def test_several_entities_warns_and_uses_most_recent(monkeypatch, caplog):
         out = await sources.fetch_parcel_hydraulics("tenant-a", "p1")
     assert out["field_capacity"] == pytest.approx(30.0)
     assert "2 AgriSoilExtended" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_organic_carbon_percent_is_converted_to_organic_matter(monkeypatch):
+    """organicCarbon is % weight: 1.45 % OC is 2.5 % OM (x 1.724)."""
+    seen = {}
+
+    def _ptf(sand, clay, om):
+        seen["om"] = om
+        return {"field_capacity": 28.0, "wilting_point": 14.0, "awc": 14.0}
+
+    monkeypatch.setattr(sources, "saxton_rawls_ptf", _ptf)
+    _patch_orion(monkeypatch, [_entity({"sand": 40, "clay": 20, "organicCarbon": 1.45})])
+    assert await sources.fetch_parcel_hydraulics("tenant-a", "p1") is not None
+    assert seen["om"] == pytest.approx(2.5, abs=0.01)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oc", [14.5, 0, -1.0, 12.0])
+async def test_implausible_organic_matter_is_unavailable(monkeypatch, caplog, oc):
+    """OM outside (0, 20] % (e.g. g/kg written as %) is never fed to the PTF."""
+    import logging
+    _patch_orion(monkeypatch, [_entity({"sand": 40, "clay": 20, "organicCarbon": oc})])
+    with caplog.at_level(logging.WARNING):
+        assert await sources.fetch_parcel_hydraulics("tenant-a", "p1") is None
+    assert "organicCarbon" in caplog.text

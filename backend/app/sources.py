@@ -249,6 +249,9 @@ class MissingContextURL(HistoryReadFailed):
     """
 
 
+_HISTORY_PAGE = 1000  # Orion-LD's maximum page size
+
+
 async def fetch_metric_history(
     tenant_id: str, parcel_id: str, attr_name: str, limit: int = 5,
 ) -> list[float]:
@@ -261,20 +264,19 @@ async def fetch_metric_history(
     new parcel, and neither must an unset `CONTEXT_URL` (`MissingContextURL`,
     a subclass).
 
-    Ordering is done here, client-side, on the compact timestamp weather-map
-    itself writes into the record id. `orderBy=dateObserved:desc` is sent as
-    a server-side hint to narrow `limit` to the recent window, but it is NOT
-    verified against Orion-LD over a nested `{"@type":"DateTime"}` Property:
-    if it is rejected the read now fails loudly, and if it is silently
-    ignored the returned order is checked and reported. Correctness of the
-    order never depends on it.
+    Orion-LD answers 501 to `orderBy` on this query, so none is sent: every
+    record of the parcel is read page by page and ordered here, client-side,
+    on the compact timestamp weather-map itself writes into the record id;
+    the last *limit* are kept. The link is queried as `hasAgriParcel`; records
+    are stored as `refAgriParcel`, but both names share one IRI so the query
+    matches them (checked against the live broker).
 
     `AgriParcelRecord` is shared with a field-photo pipeline (ids prefixed
     `photo-`, also related to the same parcel via `hasAgriParcel`) — records
     are filtered to weather-map's own `weather-` id prefix so a photo upload
     is never read as a weather sample. Same broker-read shape as
-    `fetch_tenant_parcels` (manual `@context` Link header) combined with the
-    `q=hasAgriParcel==` + `orderBy` filter already used in `zones.py`.
+    `fetch_tenant_parcels` (manual `@context` Link header) plus the
+    `q=hasAgriParcel==` filter.
     """
     if not settings.context_url:
         raise MissingContextURL()
@@ -285,24 +287,38 @@ async def fetch_metric_history(
         "Fiware-ServicePath": "/",
         "Link": f'<{settings.context_url}>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
     }
+    data: list = []
+    offset = 0
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{settings.orion_url}/ngsi-ld/v1/entities",
-                params={
-                    "type": "AgriParcelRecord",
-                    "q": f'hasAgriParcel=="{parcel_id}"',
-                    "attrs": attr_name,
-                    "options": "keyValues",
-                    "orderBy": "dateObserved:desc",
-                    "limit": limit,
-                },
-                headers=headers,
-            )
-            if resp.status_code == 404:
-                return []  # genuine absence: no record for this parcel
-            resp.raise_for_status()
-            data = resp.json()
+            while True:
+                resp = await client.get(
+                    f"{settings.orion_url}/ngsi-ld/v1/entities",
+                    params={
+                        "type": "AgriParcelRecord",
+                        "q": f'hasAgriParcel=="{parcel_id}"',
+                        "attrs": attr_name,
+                        "options": "keyValues",
+                        "limit": _HISTORY_PAGE,
+                        "offset": offset,
+                    },
+                    headers=headers,
+                )
+                if resp.status_code == 404:
+                    break  # genuine absence: no (more) records for this parcel
+                resp.raise_for_status()
+                page = resp.json()
+                if not isinstance(page, list):
+                    raise HistoryReadFailed(
+                        f"history read for {attr_name} on {parcel_id} returned "
+                        f"{type(page).__name__}, expected a list"
+                    )
+                data.extend(page)
+                if len(page) < _HISTORY_PAGE:
+                    break
+                offset += _HISTORY_PAGE
+    except HistoryReadFailed:
+        raise
     except Exception as exc:
         logger.exception(
             "fetch_metric_history(tenant=%s, parcel=%s, attr=%s) failed",
@@ -311,12 +327,6 @@ async def fetch_metric_history(
         raise HistoryReadFailed(
             f"history read failed for {attr_name} on {parcel_id}: {exc!r}"
         ) from exc
-
-    if not isinstance(data, list):
-        raise HistoryReadFailed(
-            f"history read for {attr_name} on {parcel_id} returned "
-            f"{type(data).__name__}, expected a list"
-        )
 
     samples: list[tuple[str, float]] = []
     for entity in data:
@@ -334,15 +344,8 @@ async def fetch_metric_history(
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             samples.append((stamp, value))
 
-    as_received = [stamp for stamp, _ in samples]
     samples.sort(key=lambda sample: sample[0])  # oldest first — the guard's contract
-    if len(samples) > 1 and as_received != [stamp for stamp, _ in reversed(samples)]:
-        logger.warning(
-            "Orion did not honour orderBy=dateObserved:desc for %s on %s — the "
-            "client-side sort fixed the order, but `limit` then selects an "
-            "arbitrary window and the variance guard sees less than the most "
-            "recent samples", attr_name, parcel_id,
-        )
+    samples = samples[-limit:]
     return [float(value) for _, value in samples]
 
 
@@ -449,6 +452,7 @@ def _attr_value(entity: dict, name: str) -> Any:
 # factor 1.724 (OM = OC x 1.724). GENERAL KNOWLEDGE, not verified against a
 # primary source here: verify before relying on it.
 _OC_TO_OM = 1.724
+_OM_MAX_PCT = 20.0  # plausible upper bound for mineral topsoil organic matter
 
 
 def _fraction(h: dict, attr: str) -> float | None:
@@ -532,7 +536,18 @@ async def fetch_parcel_hydraulics(
         oc = _as_float(h.get("organicCarbon"))
         if sand is None or clay is None or oc is None:
             return None
-        out = saxton_rawls_ptf(sand, clay, oc * _OC_TO_OM)
+        # organicCarbon is % weight (live AgriSoilExtended horizons and the soil
+        # module's writer agree). Anything giving OM outside (0, 20] % is a unit
+        # slip (e.g. g/kg) or noise: unavailable, never fed to the PTF.
+        om = oc * _OC_TO_OM
+        if not 0.0 < om <= _OM_MAX_PCT:
+            logger.warning(
+                "Soil organicCarbon=%r gives organic matter %.1f %%, outside "
+                "(0, %.0f] %%; hydraulics unavailable for parcel %s",
+                oc, om, _OM_MAX_PCT, parcel_id,
+            )
+            return None
+        out = saxton_rawls_ptf(sand, clay, om)
 
     if not (out["awc"] > 0 and out["field_capacity"] > out["wilting_point"] >= 0):
         logger.warning("Unusable hydraulics for parcel %s: %s", parcel_id, out)
