@@ -1,6 +1,6 @@
 """Tile server endpoint — reads precomputed COGs from MinIO and serves PNG tiles.
 
-DEPRECATED: superseded by the backend tile endpoint.
+DEPRECATED: this module is superseded by the backend tile endpoint (not itself deprecated).
 """
 
 from __future__ import annotations

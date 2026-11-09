@@ -324,6 +324,34 @@ class TestSoilMoistureWithoutSoil:
         assert await _tile(cg, "soil_moisture") is not None
 
     @pytest.mark.asyncio
+    async def test_no_usable_geometry_clears_all_pointers(self, monkeypatch, caplog):
+        import logging
+        from app import cog_generator as cg
+
+        cleared: list = []
+        monkeypatch.setattr(cg, "clear_latest_pointer", lambda t, m: cleared.append((t, m)))
+        monkeypatch.setattr(cg.settings, "metrics", ["temperature_avg", "eto"])
+        with caplog.at_level(logging.WARNING):
+            await cg._generate_and_upload_cogs(
+                "tenant-a", [{"id": "p"}], "2026-09-01", "2026-09-02", 14, "2026-09-02",
+            )
+        assert cleared == [("tenant-a", "temperature_avg"), ("tenant-a", "eto")]
+        assert "tenant-a" in caplog.text and "clearing raster pointers" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_no_parcels_clears_all_pointers(self, monkeypatch, caplog):
+        import logging
+        from app import cog_generator as cg
+
+        cleared: list = []
+        monkeypatch.setattr(cg, "clear_latest_pointer", lambda t, m: cleared.append((t, m)))
+        monkeypatch.setattr(cg.settings, "metrics", ["temperature_avg", "eto"])
+        with caplog.at_level(logging.WARNING):
+            await cg.run_for_tenant("tenant-a", [], "2026-09-01", "2026-09-02")
+        assert cleared == [("tenant-a", "temperature_avg"), ("tenant-a", "eto")]
+        assert "tenant-a" in caplog.text and "No parcels" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_metric_with_no_tiles_clears_latest_pointer(self, monkeypatch):
         from app import cog_generator as cg
 

@@ -534,6 +534,13 @@ async def generate_cog_for_tile(
     return buffer.getvalue()
 
 
+def _clear_all_pointers(tenant_id: str) -> None:
+    """A skipped run publishes nothing, so no metric may keep an older raster
+    as current."""
+    for metric in settings.metrics:
+        clear_latest_pointer(tenant_id, metric)
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator helpers
 # ---------------------------------------------------------------------------
@@ -569,9 +576,11 @@ async def _generate_and_upload_cogs(
             bounds_list.append(b)
     if not bounds_list:
         logger.warning(
-            "Tenant '%s': no usable parcel geometry, skipping COG generation",
+            "Tenant '%s': no usable parcel geometry, skipping COG generation; "
+            "clearing raster pointers",
             tenant_id,
         )
+        _clear_all_pointers(tenant_id)
         return
     min_lon = min(b[0] for b in bounds_list)
     min_lat = min(b[1] for b in bounds_list)
@@ -678,9 +687,11 @@ async def run_for_tenant(
     # 3. Guard: no parcels
     if not parcels:
         logger.warning(
-            "No parcels for tenant '%s' — skipping COG generation",
+            "No parcels for tenant '%s' — skipping COG generation; "
+            "clearing raster pointers",
             tenant_id,
         )
+        _clear_all_pointers(tenant_id)
         return
 
     # 4. Generate and upload COGs for all metrics / tiles
@@ -701,20 +712,17 @@ async def run_for_tenant(
 
         stats = compute_zonal_stats(tenant_id, geometry, settings.metrics)
 
-        # Weather can now legitimately be absent: when every tile of a metric
-        # returns None, `set_latest_date` never advances and this call — which
-        # passes no date — resolves to the PREVIOUS pointer. Publishing that
-        # would restate yesterday's pixels under a fresh `observedAt`. Stale
-        # data presented as current is worse than a gap: the gap is visible
-        # downstream, this is not. Spec §5.3: a record with an incomplete
-        # input set is not published.
+        # A metric with no tile today has its pointer cleared, so zonal stats
+        # carry no date (or an older one if a clear failed). Never publish a
+        # record whose stats are not from today's raster: stale data under a
+        # fresh `observedAt` is worse than a gap, which is visible downstream.
+        # Spec §5.3: a record with an incomplete input set is not published.
         stats_date = stats.get("date")
         if stats_date != today:
             logger.error(
                 "Not publishing AgriParcelRecord for parcel %s (tenant=%s): "
-                "zonal stats resolved to date=%r, not today's %s — the COG "
-                "pointer did not advance, so the record would republish stale "
-                "pixels under a fresh observedAt",
+                "zonal stats resolved to date=%r, not today's %s — the record "
+                "would republish stale pixels under a fresh observedAt",
                 parcel_id, tenant_id, stats_date, today,
             )
             continue
