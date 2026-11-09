@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 
 NO_DATA_ERROR = "No data for parcel at this metric/date"
 
+# Metrics that stay accepted by name but are not produced: the per-parcel value
+# will come from crop-health's daily water balance. Callers get the no-data
+# error plus the reason, never a 400.
+UNAVAILABLE_METRICS = {
+    "soil_moisture": "Not available: no stateful soil water balance in weather-map",
+}
+
 # Metrics a parcel-level scalar can stand in for when no raster covers the
 # parcel yet: (key in the scalars dict, source). "observed" = running
 # WeatherObserved, "forecast" = WeatherForecast dayMinimum, the same inputs the
@@ -233,6 +240,14 @@ def compute_zonal_stats(
     dict
         ``{"parcel_geojson": …, "date": …, "metrics": {metric: {…}}}``.
     """
+    unavailable = {
+        m: {"error": NO_DATA_ERROR, "reason": UNAVAILABLE_METRICS[m]}
+        for m in metrics if m in UNAVAILABLE_METRICS
+    }
+    metrics = [m for m in metrics if m not in UNAVAILABLE_METRICS]
+    if unavailable and not metrics:
+        return {"parcel_geojson": geometry, "date": None, "metrics": unavailable}
+
     resolved_date = date
     if not resolved_date:
         # First requested metric that has a pointer: a metric without tiles
@@ -301,4 +316,5 @@ def compute_zonal_stats(
 
         result["metrics"][metric] = stats
 
+    result["metrics"].update(unavailable)
     return result

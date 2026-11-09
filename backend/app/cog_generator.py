@@ -40,7 +40,7 @@ from app.sources import (
     require,
     upsert_record,
 )
-from app.stats import compute_zonal_stats
+from app.stats import UNAVAILABLE_METRICS, compute_zonal_stats
 
 logger = logging.getLogger(__name__)
 
@@ -602,6 +602,12 @@ async def _generate_and_upload_cogs(
     weather_cache: dict[str, dict | None] = {}
 
     for metric in settings.metrics:
+        if metric in UNAVAILABLE_METRICS:
+            # Not published: clear any old pointer so it is not served as
+            # current. fetch_parcel_hydraulics and the PTF are kept for reuse
+            # but this job must not call them.
+            clear_latest_pointer(tenant_id, metric)
+            continue
         logger.info(
             "Generating COGs for metric '%s' / tenant '%s'",
             metric, tenant_id,

@@ -293,7 +293,7 @@ async def parcel_zonal_stats(
 
     # 3b. Label the payload: a raster is a forecast snapshot, not a measurement.
     # The model that produced it is not known here, so none is claimed.
-    if "date" in stats:
+    if stats.get("date"):
         stats["valid_date"] = stats["date"]
         stats["kind"] = "forecast_snapshot"
 

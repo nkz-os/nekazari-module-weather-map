@@ -352,6 +352,32 @@ class TestSoilMoistureWithoutSoil:
         assert "tenant-a" in caplog.text and "No parcels" in caplog.text
 
     @pytest.mark.asyncio
+    async def test_job_makes_no_soil_tiles_and_clears_pointer(self, monkeypatch):
+        from app import cog_generator as cg
+
+        seen: list = []
+
+        async def _fake_tile(tenant_id, metric, *a, **kw):
+            seen.append(metric)
+            return b"cog"
+
+        hydraulics = AsyncMock(return_value=None)
+        monkeypatch.setattr(cg, "generate_cog_for_tile", _fake_tile)
+        monkeypatch.setattr(cg, "fetch_parcel_hydraulics", hydraulics)
+        monkeypatch.setattr(cg, "upload_cog", lambda *a, **kw: True)
+        monkeypatch.setattr(cg, "set_latest_date", lambda *a, **kw: True)
+        cleared: list = []
+        monkeypatch.setattr(cg, "clear_latest_pointer", lambda t, m: cleared.append((t, m)))
+        monkeypatch.setattr(cg.settings, "metrics", ["temperature_avg", "soil_moisture"])
+
+        await cg._generate_and_upload_cogs(
+            "tenant-a", [PARCEL], "2026-09-01", "2026-09-02", 14, "2026-09-02",
+        )
+        assert seen and set(seen) == {"temperature_avg"}
+        assert cleared == [("tenant-a", "soil_moisture")]
+        hydraulics.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_metric_with_no_tiles_clears_latest_pointer(self, monkeypatch):
         from app import cog_generator as cg
 

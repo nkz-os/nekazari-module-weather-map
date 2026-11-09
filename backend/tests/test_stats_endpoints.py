@@ -426,3 +426,23 @@ class TestNoRasterAndSources:
         ids = [c.args[1] for c in get.await_args_list]
         assert [i.split(":")[2] for i in ids] == expected
         assert not any(i.endswith("-daily") or "daily" in i for i in ids)
+
+
+class TestSoilMoistureUnavailable:
+    """soil_moisture stays accepted but reports no data with a reason."""
+
+    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
+    def test_get_stats_soil_moisture_is_unavailable_not_400(self, mock_fetch, client):
+        mock_fetch.return_value = SAMPLE_PARCEL
+
+        resp = client.get(
+            "/api/weather-map/stats/demo-field-1",
+            params={"metrics": "soil_moisture"},
+            headers=AUTH_HEADERS,
+        )
+
+        assert resp.status_code == 200
+        entry = resp.json()["metrics"]["soil_moisture"]
+        assert entry["error"] == "No data for parcel at this metric/date"
+        assert "Not available" in entry["reason"]
+        assert "mean" not in entry

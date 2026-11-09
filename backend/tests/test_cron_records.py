@@ -180,3 +180,27 @@ async def test_record_omits_soil_moisture_when_unavailable():
     record = upsert.await_args.args[1]
     assert "eto" in record
     assert "soilMoistureVwc" not in record
+
+
+@pytest.mark.asyncio
+async def test_record_omits_soil_moisture(monkeypatch):
+    """Real zonal stats: soil_moisture has no raster and no record attribute."""
+    from app import stats as stats_mod
+
+    monkeypatch.setattr(cog_generator.settings, "metrics", ["eto", "soil_moisture"])
+    monkeypatch.setattr(stats_mod.settings, "metrics", ["eto", "soil_moisture"])
+    monkeypatch.setattr(stats_mod, "get_latest_date", lambda t, m: _today() if m == "eto" else None)
+    import numpy as np
+    monkeypatch.setattr(stats_mod, "_collect_pixels", lambda *a, **kw: np.array([3.0, 4.0]))
+    parcels = [{"id": "urn:ngsi-ld:AgriParcel:p1", "lon": -1.5, "lat": 42.0}]
+    upsert = AsyncMock()
+    with patch.multiple(
+        cog_generator,
+        upsert_record=upsert,
+        _generate_and_upload_cogs=AsyncMock(return_value=None),
+        _parcel_geometry=lambda parcel: PARCEL_GEOMETRY,
+    ):
+        await cog_generator.run_for_tenant("demo-coop", parcels, "2026-06-01", "2026-06-10")
+    record = upsert.await_args.args[1]
+    assert "soilMoistureVwc" not in record
+    assert "eto" in record
