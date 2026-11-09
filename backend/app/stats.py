@@ -22,6 +22,51 @@ from app.minio_io import download_cog, get_latest_date
 
 logger = logging.getLogger(__name__)
 
+NO_DATA_ERROR = "No data for parcel at this metric/date"
+
+# Metrics a parcel-level scalar can stand in for when no raster covers the
+# parcel yet, and the key of the flat broker weather dict each one reads.
+_SCALAR_FALLBACK_KEYS = {
+    "temperature_avg": "t_avg",
+    "temperature_min": "t_min",
+    "solar_radiation": "solar_rad_w_m2",
+    "frost_risk": "t_min",
+}
+
+
+def scalar_fallback(metric: str, weather: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Parcel-level scalar for *metric*, or None when the broker lacks the input.
+
+    Never a default: a missing key yields None and the caller keeps its error.
+    The frost risk goes through the same function the raster uses, on one
+    pixel (no relative-elevation pooling, so the scalar is the no-pooling case).
+    """
+    key = _SCALAR_FALLBACK_KEYS.get(metric)
+    if key is None or not weather:
+        return None
+    raw = weather.get(key)
+    if raw is None:
+        return None
+    value = float(raw)
+    if metric == "frost_risk":
+        from app.downscaler import compute_frost_risk
+
+        value = float(compute_frost_risk(np.array([value]), np.array([0.0]))[0])
+    return {
+        "mean": value, "min": value, "max": value,
+        "std": None, "fallback": "parcel_scalar",
+    }
+
+
+def needs_scalar_fallback(stats: dict[str, Any]) -> list[str]:
+    """Metrics of *stats* that carry the no-data error and have a scalar fallback."""
+    return [
+        m for m, v in stats.get("metrics", {}).items()
+        if m in _SCALAR_FALLBACK_KEYS
+        and isinstance(v, dict) and v.get("error") == NO_DATA_ERROR
+    ]
+
+
 # ── Water-balance thresholds ──────────────────────────────────────
 # Used by the ``water_balance`` metric family only.
 DEFICIT_THRESHOLD_MM = -5.0       # pixels <= this are "in deficit"
@@ -189,7 +234,7 @@ def compute_zonal_stats(
         pixels = _collect_pixels(tenant_id, geometry, metric, resolved_date)
         if pixels is None or len(pixels) == 0:
             result["metrics"][metric] = {
-                "error": "No data for parcel at this metric/date",
+                "error": NO_DATA_ERROR,
             }
             continue
 

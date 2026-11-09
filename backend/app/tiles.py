@@ -25,8 +25,13 @@ from app.tile_auth import make_tile_token, verify_tile_token
 from app.minio_io import download_cog, get_latest_date
 from app.color_scales import apply_color_scale
 from app.records import build_agri_parcel_record, guard_frozen_metrics
-from app.stats import compute_zonal_stats
-from app.sources import fetch_agri_parcel, fetch_entity_attr, upsert_record
+from app.stats import compute_zonal_stats, needs_scalar_fallback, scalar_fallback
+from app.sources import (
+    fetch_agri_parcel,
+    fetch_entity_attr,
+    fetch_parcel_weather,
+    upsert_record,
+)
 
 warnings.warn(
     "tiles.py is deprecated. Use PMTiles from MinIO instead (see pmtiles_generator.py).",
@@ -290,6 +295,24 @@ async def parcel_zonal_stats(
         raise HTTPException(
             status_code=500, detail="Failed to compute zonal statistics"
         )
+
+    # 3b. Label the payload: a raster is a forecast snapshot, not a measurement.
+    # The model that produced it is not known here, so none is claimed.
+    if "date" in stats:
+        stats["valid_date"] = stats["date"]
+        stats["kind"] = "forecast_snapshot"
+
+    # 3c. Parcel not yet covered by a raster: a marked parcel scalar from the
+    # broker. Only for the latest raster (an explicit date asks for that raster)
+    # and never invented: no broker value, the error stays.
+    if date is None:
+        pending = needs_scalar_fallback(stats)
+        if pending:
+            weather = await fetch_parcel_weather(tenant_id, parcel_id)
+            for metric in pending:
+                fallback = scalar_fallback(metric, weather)
+                if fallback is not None:
+                    stats["metrics"][metric] = fallback
 
     # 4. Read phenology params from Orion-LD (if crop+stage provided)
     phenology = None
