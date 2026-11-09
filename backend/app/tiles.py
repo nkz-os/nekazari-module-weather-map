@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import io
 import logging
-import warnings
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -33,12 +32,6 @@ from app.sources import (
     fetch_entity_attr,
     fetch_parcel_scalars,
     upsert_record,
-)
-
-warnings.warn(
-    "tiles.py is deprecated. Use the backend tile endpoint instead.",
-    DeprecationWarning,
-    stacklevel=2,
 )
 
 logger = logging.getLogger(__name__)
