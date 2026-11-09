@@ -445,6 +445,27 @@ def _attr_value(entity: dict, name: str) -> Any:
     return attr
 
 
+# Organic matter (% weight) from organic carbon (% weight): the Van Bemmelen
+# factor 1.724 (OM = OC x 1.724). GENERAL KNOWLEDGE, not verified against a
+# primary source here: verify before relying on it.
+_OC_TO_OM = 1.724
+
+
+def _fraction(h: dict, attr: str) -> float | None:
+    """A water-content attribute as a fraction in (0, 1), or None.
+
+    Orion stores m3/m3. A value outside (0, 1) (e.g. a percentage written
+    by mistake) is rejected with a WARNING instead of being scaled.
+    """
+    v = _as_float(h.get(attr))
+    if v is None:
+        return None
+    if not 0.0 < v < 1.0:
+        logger.warning("Soil attribute %s=%r is not a fraction in (0, 1); ignored", attr, v)
+        return None
+    return v
+
+
 async def fetch_parcel_hydraulics(
     tenant_id: str, parcel_id: str
 ) -> dict[str, float] | None:
@@ -452,17 +473,18 @@ async def fetch_parcel_hydraulics(
 
     Reads the top horizon (``horizons[0]``, as the risk module does). Orion
     stores water contents as fractions (m3/m3); the result is in % vol:
-    ``{"field_capacity", "wilting_point", "awc"}``. If the horizon carries
-    no water contents but has sand and clay (% weight), they come from the
-    Saxton & Rawls pedotransfer function. Returns ``None`` when there is no
-    entity or no usable data — never a default.
+    ``{"field_capacity", "wilting_point", "awc"}``. If the horizon has no
+    valid water contents but has sand, clay and organic carbon, they come
+    from the Saxton & Rawls pedotransfer function. Returns ``None`` when
+    there is no entity or no usable data: never a default.
     """
     orion = OrionClient(tenant_id)
     try:
         rows = await orion.query_entities(
             type="AgriSoilExtended",
             q=f'refAgriParcel=="{parcel_id}"|hasAgriParcel=="{parcel_id}"',
-            limit=1,
+            limit=5,
+            options="sysAttrs",
         )
     except Exception:
         logger.exception(
@@ -475,14 +497,27 @@ async def fetch_parcel_hydraulics(
 
     if not rows:
         return None
-    horizons = _attr_value(rows[0], "horizons")
+    entity = rows[0]
+    if len(rows) > 1:
+        dated = [r for r in rows if _attr_value(r, "modifiedAt") or r.get("modifiedAt")]
+        if dated:
+            entity = max(
+                dated, key=lambda r: str(_attr_value(r, "modifiedAt") or r.get("modifiedAt")),
+            )
+        logger.warning(
+            "%d AgriSoilExtended match parcel %s; using %s",
+            len(rows), parcel_id,
+            "the most recently modified" if dated else "the first",
+        )
+    horizons = _attr_value(entity, "horizons")
     if not (isinstance(horizons, list) and horizons and isinstance(horizons[0], dict)):
         return None
     h = horizons[0]
 
-    fc = _as_float(h.get("fieldCapacity"))
-    wp = _as_float(h.get("wiltingPoint"))
-    awc = _as_float(h.get("availableWaterCapacity"))
+    fc = _fraction(h, "fieldCapacity")
+    wp = _fraction(h, "wiltingPoint")
+    awc = _fraction(h, "availableWaterCapacity")
+    out = None
     if fc is not None and wp is not None:
         if awc is None:
             awc = fc - wp
@@ -494,9 +529,10 @@ async def fetch_parcel_hydraulics(
     else:
         sand = _as_float(h.get("sand"))
         clay = _as_float(h.get("clay"))
-        if sand is None or clay is None:
+        oc = _as_float(h.get("organicCarbon"))
+        if sand is None or clay is None or oc is None:
             return None
-        out = saxton_rawls_ptf(sand, clay)
+        out = saxton_rawls_ptf(sand, clay, oc * _OC_TO_OM)
 
     if not (out["awc"] > 0 and out["field_capacity"] > out["wilting_point"] >= 0):
         logger.warning("Unusable hydraulics for parcel %s: %s", parcel_id, out)

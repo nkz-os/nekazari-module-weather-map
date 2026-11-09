@@ -362,7 +362,7 @@ def compute_soil_moisture(
 # ---------------------------------------------------------------------------
 
 def saxton_rawls_ptf(
-    sand_pct: float, clay_pct: float, om_pct: float = 2.5,
+    sand_pct: float, clay_pct: float, om_pct: float,
 ) -> dict:
     """Estimate hydraulic parameters from soil texture (Saxton & Rawls PTF).
 
@@ -378,8 +378,8 @@ def saxton_rawls_ptf(
     sand_pct, clay_pct : float
         Sand and clay content (% weight); converted internally to fractions.
     om_pct : float
-        Organic matter (% weight). The 2.5 default is the paper's reference
-        value for its texture table, used only when no measurement exists.
+        Organic matter (% weight). Required: there is no default, an absent
+        measurement means the PTF cannot be evaluated.
 
     Returns
     -------

@@ -1,12 +1,13 @@
-"""Test that cog_generator does NOT call fetch_agri_soil with an empty parcel id."""
+"""Soil hydraulics lookup (AgriSoilExtended) and the no-defaults contract."""
 import inspect
+
 import app.cog_generator as cog
 
 
-def test_cog_generator_does_not_call_fetch_agri_soil_with_empty_parcel():
+def test_cog_generator_has_no_legacy_agrisoil_or_texture_defaults():
     src = inspect.getsource(cog)
-    assert 'fetch_agri_soil(tenant_id, "")' not in src
-    assert "fetch_agri_soil(tenant_id, '')" not in src
+    assert "fetch_agri_soil" not in src
+    assert "get_texture_defaults" not in src
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +55,7 @@ async def test_hydraulics_read_from_extended_horizon(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_hydraulics_fall_back_to_ptf_with_texture_only(monkeypatch):
-    _patch_orion(monkeypatch, [_entity({"sand": 40, "silt": 40, "clay": 20})])
+    _patch_orion(monkeypatch, [_entity({"sand": 40, "silt": 40, "clay": 20, "organicCarbon": 1.45})])
     out = await sources.fetch_parcel_hydraulics("tenant-a", "urn:ngsi-ld:AgriParcel:p1")
     assert out["field_capacity"] == pytest.approx(28, abs=1)
     assert out["wilting_point"] == pytest.approx(14, abs=1)
@@ -73,3 +74,44 @@ async def test_hydraulics_none_when_orion_fails(monkeypatch):
     orion = _patch_orion(monkeypatch, [])
     orion.query_entities = AsyncMock(side_effect=RuntimeError("boom"))
     assert await sources.fetch_parcel_hydraulics("tenant-a", "p1") is None
+
+
+@pytest.mark.asyncio
+async def test_texture_without_organic_carbon_is_unavailable(monkeypatch):
+    _patch_orion(monkeypatch, [_entity({"sand": 40, "silt": 40, "clay": 20})])
+    assert await sources.fetch_parcel_hydraulics("tenant-a", "p1") is None
+
+
+@pytest.mark.asyncio
+async def test_percent_valued_water_content_is_rejected(monkeypatch, caplog):
+    import logging
+    _patch_orion(monkeypatch, [_entity({
+        "availableWaterCapacity": 13.0, "fieldCapacity": 27.0, "wiltingPoint": 14.0,
+    })])
+    with caplog.at_level(logging.WARNING):
+        assert await sources.fetch_parcel_hydraulics("tenant-a", "p1") is None
+    assert "fieldCapacity" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_out_of_range_water_content_falls_to_ptf_with_texture(monkeypatch):
+    _patch_orion(monkeypatch, [_entity({
+        "fieldCapacity": 27.0, "wiltingPoint": 14.0,
+        "sand": 40, "clay": 20, "organicCarbon": 1.45,
+    })])
+    out = await sources.fetch_parcel_hydraulics("tenant-a", "p1")
+    assert out["field_capacity"] == pytest.approx(28, abs=1)
+
+
+@pytest.mark.asyncio
+async def test_several_entities_warns_and_uses_most_recent(monkeypatch, caplog):
+    import logging
+    old = _entity({"fieldCapacity": 0.20, "wiltingPoint": 0.10})
+    old["modifiedAt"] = "2026-01-01T00:00:00Z"
+    new = _entity({"fieldCapacity": 0.30, "wiltingPoint": 0.15})
+    new["modifiedAt"] = "2026-06-01T00:00:00Z"
+    _patch_orion(monkeypatch, [old, new])
+    with caplog.at_level(logging.WARNING):
+        out = await sources.fetch_parcel_hydraulics("tenant-a", "p1")
+    assert out["field_capacity"] == pytest.approx(30.0)
+    assert "2 AgriSoilExtended" in caplog.text

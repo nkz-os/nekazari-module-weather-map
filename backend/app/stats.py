@@ -233,7 +233,14 @@ def compute_zonal_stats(
     dict
         ``{"parcel_geojson": …, "date": …, "metrics": {metric: {…}}}``.
     """
-    resolved_date = date or get_latest_date(tenant_id, metrics[0] if metrics else "temperature_avg")
+    resolved_date = date
+    if not resolved_date:
+        # First requested metric that has a pointer: a metric without tiles
+        # (pointer cleared) must not hide the others.
+        for candidate in metrics or ["temperature_avg"]:
+            resolved_date = get_latest_date(tenant_id, candidate)
+            if resolved_date:
+                break
     if not resolved_date:
         return {"error": "No COG data available", "metrics": {}}
 

@@ -24,6 +24,9 @@ WEATHER_KEYS = {
     "solar_rad_w_m2", "solar_radiation", "precip_mm", "precipitation",
     "elevation_m", "elevation", "reference_altitude_m",
     "eto", "eto_mm", "et0", "evapotranspiration",
+    # soil path
+    "sand", "silt", "clay", "organicCarbon", "sand_pct", "clay_pct", "om_pct",
+    "fieldCapacity", "wiltingPoint", "availableWaterCapacity",
 }
 
 
@@ -162,3 +165,14 @@ def test_detector_ignores_a_non_numeric_fallback():
     """`or None` y `or {}` no fabrican un número: propagan la ausencia."""
     assert _offenders_in_tree(ast.parse('x = entry.get("eto_mm") or None')) == []
     assert _offenders_in_tree(ast.parse('x = forecast.get("t_min") or {}')) == []
+
+
+def test_detector_catches_a_fabricated_soil_default():
+    bad = _offenders_in_tree(ast.parse('x = horizon.get("organicCarbon", 1.5)'))
+    assert [(k, d) for _, k, d in bad] == [("organicCarbon", 1.5)]
+
+
+def test_ptf_requires_organic_matter_explicitly():
+    import inspect
+    from app.downscaler import saxton_rawls_ptf
+    assert inspect.signature(saxton_rawls_ptf).parameters["om_pct"].default is inspect.Parameter.empty
