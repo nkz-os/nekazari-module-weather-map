@@ -8,13 +8,11 @@ puntero ANTERIOR. El registro publicaba los píxeles de ayer bajo un
 `observedAt` fresco: dato viejo presentado como actual, que es peor que un
 hueco porque el hueco sí se ve aguas abajo.
 
-Estos tests tampoco tocan la red: `fetch_metric_history` y la generación de
-PMTiles van mockeados. Sin eso ambos ejercían la rama `except` contra un DNS
+Estos tests tampoco tocan la red: `fetch_metric_history` va mockeado. Sin eso
+ejercía la rama `except` contra un DNS
 real y el CI seguía verde con el guard permanentemente roto.
 """
 
-import sys
-import types
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -38,12 +36,6 @@ def _no_network(monkeypatch):
         return []
 
     monkeypatch.setattr(records, "fetch_metric_history", _no_history)
-
-    # run_for_tenant importa pmtiles_generator dentro de la función y traga
-    # cualquier excepción; sin este stub el paso final hablaría con MinIO.
-    stub = types.ModuleType("app.pmtiles_generator")
-    stub.generate_all_pmtiles = lambda *a, **kw: {}
-    monkeypatch.setitem(sys.modules, "app.pmtiles_generator", stub)
 
 
 def _run(parcels, stats, upsert):
@@ -82,6 +74,25 @@ async def test_run_for_tenant_persists_record_for_each_parcel():
             "demo-coop", parcels, "2026-06-01", "2026-06-10",
         )
     assert upsert.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_invoke_pmtiles(monkeypatch):
+    """The run has no PMTiles step: no generator module, nothing imports it."""
+    import importlib.util
+    import sys
+
+    assert importlib.util.find_spec("app.pmtiles_generator") is None
+    monkeypatch.setitem(sys.modules, "app.pmtiles_generator", None)  # import would raise
+    parcels = [{"id": "urn:ngsi-ld:AgriParcel:p1", "lon": -1.5, "lat": 42.0}]
+    upsert = AsyncMock()
+    stats = {"date": _today(), "metrics": {"eto": {"mean": 3.5}}}
+    with _run(parcels, stats, upsert), patch.object(cog_generator.logger, "error") as err:
+        await cog_generator.run_for_tenant(
+            "demo-coop", parcels, "2026-06-01", "2026-06-10",
+        )
+    upsert.assert_awaited()
+    assert not any("PMTiles" in str(c) for c in err.call_args_list)
 
 
 @pytest.mark.asyncio
@@ -149,3 +160,47 @@ async def test_one_stale_parcel_does_not_block_a_fresh_one():
     assert upsert.await_count == 1
     published = upsert.await_args.args[1]
     assert "fresh" in published["hasAgriParcel"]["object"]
+
+
+@pytest.mark.asyncio
+async def test_record_omits_soil_moisture_when_unavailable():
+    parcels = [{"id": "urn:ngsi-ld:AgriParcel:p1", "lon": -1.5, "lat": 42.0}]
+    upsert = AsyncMock()
+    stats = {
+        "date": _today(),
+        "metrics": {
+            "eto": {"mean": 4.2},
+            "soil_moisture": {"error": "no data"},
+        },
+    }
+    with _run(parcels, stats, upsert):
+        await cog_generator.run_for_tenant(
+            "demo-coop", parcels, "2026-06-01", "2026-06-10",
+        )
+    record = upsert.await_args.args[1]
+    assert "eto" in record
+    assert "soilMoistureVwc" not in record
+
+
+@pytest.mark.asyncio
+async def test_record_omits_soil_moisture(monkeypatch):
+    """Real zonal stats: soil_moisture has no raster and no record attribute."""
+    from app import stats as stats_mod
+
+    monkeypatch.setattr(cog_generator.settings, "metrics", ["eto", "soil_moisture"])
+    monkeypatch.setattr(stats_mod.settings, "metrics", ["eto", "soil_moisture"])
+    monkeypatch.setattr(stats_mod, "get_latest_date", lambda t, m: _today() if m == "eto" else None)
+    import numpy as np
+    monkeypatch.setattr(stats_mod, "_collect_pixels", lambda *a, **kw: np.array([3.0, 4.0]))
+    parcels = [{"id": "urn:ngsi-ld:AgriParcel:p1", "lon": -1.5, "lat": 42.0}]
+    upsert = AsyncMock()
+    with patch.multiple(
+        cog_generator,
+        upsert_record=upsert,
+        _generate_and_upload_cogs=AsyncMock(return_value=None),
+        _parcel_geometry=lambda parcel: PARCEL_GEOMETRY,
+    ):
+        await cog_generator.run_for_tenant("demo-coop", parcels, "2026-06-01", "2026-06-10")
+    record = upsert.await_args.args[1]
+    assert "soilMoistureVwc" not in record
+    assert "eto" in record

@@ -29,20 +29,18 @@ from app.downscaler import (
     compute_water_balance,
     compute_frost_risk,
     compute_soil_moisture,
-    saxton_rawls_ptf,
-    get_texture_defaults,
 )
-from app.minio_io import set_latest_date, upload_cog
+from app.minio_io import clear_latest_pointer, set_latest_date, upload_cog
 from app.records import build_agri_parcel_record, guard_frozen_metrics
 from app.sources import (
     MissingWeatherInput,
-    fetch_agri_soil,
+    fetch_parcel_hydraulics,
     fetch_dem_tile,
     fetch_parcel_weather,
     require,
     upsert_record,
 )
-from app.stats import compute_zonal_stats
+from app.stats import UNAVAILABLE_METRICS, compute_zonal_stats
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +260,7 @@ async def generate_cog_for_tile(
         Date range (``"YYYY-MM-DD"``).
     tile_center_lat, tile_center_lon : float
         Centre of the tile — used to pick the nearest parcel (weather base)
-        and, for ``soil_moisture``, the matching AgriSoil entity.
+        and, for ``soil_moisture``, the matching soil hydraulics.
     parcels : list[dict]
         Tenant's parcels. The tile's weather (and soil) comes from the
         parcel NEAREST to the tile centre, never ``parcels[0]``.
@@ -447,17 +445,14 @@ async def generate_cog_for_tile(
         result = compute_frost_risk(t_min_corrected, elevations)
 
     elif metric == "soil_moisture":
-        soil = await fetch_agri_soil(tenant_id, parcel_id)
-        if soil is not None and soil.get("sand_pct") is not None:
-            ptf = saxton_rawls_ptf(soil["sand_pct"], soil["clay_pct"])
-        else:
+        ptf = await fetch_parcel_hydraulics(tenant_id, parcel_id)
+        if ptf is None:
             logger.warning(
-                "No AgriSoil for %s; using texture defaults", parcel_id
+                "No soil hydraulics for parcel %s (tile %d/%d/%d, tenant=%s): "
+                "soil_moisture unavailable",
+                parcel_id, z, x, y, tenant_id,
             )
-            defaults = get_texture_defaults()
-            ptf = saxton_rawls_ptf(
-                defaults["sand_pct"], defaults["clay_pct"],
-            )
+            return None
 
         t_avg_corrected = correct_temperature(
             t_avg, station_elevation, elevations,
@@ -539,6 +534,13 @@ async def generate_cog_for_tile(
     return buffer.getvalue()
 
 
+def _clear_all_pointers(tenant_id: str) -> None:
+    """A skipped run publishes nothing, so no metric may keep an older raster
+    as current."""
+    for metric in settings.metrics:
+        clear_latest_pointer(tenant_id, metric)
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator helpers
 # ---------------------------------------------------------------------------
@@ -574,9 +576,11 @@ async def _generate_and_upload_cogs(
             bounds_list.append(b)
     if not bounds_list:
         logger.warning(
-            "Tenant '%s': no usable parcel geometry, skipping COG generation",
+            "Tenant '%s': no usable parcel geometry, skipping COG generation; "
+            "clearing raster pointers",
             tenant_id,
         )
+        _clear_all_pointers(tenant_id)
         return
     min_lon = min(b[0] for b in bounds_list)
     min_lat = min(b[1] for b in bounds_list)
@@ -598,6 +602,12 @@ async def _generate_and_upload_cogs(
     weather_cache: dict[str, dict | None] = {}
 
     for metric in settings.metrics:
+        if metric in UNAVAILABLE_METRICS:
+            # Not published: clear any old pointer so it is not served as
+            # current. fetch_parcel_hydraulics and the PTF are kept for reuse
+            # but this job must not call them.
+            clear_latest_pointer(tenant_id, metric)
+            continue
         logger.info(
             "Generating COGs for metric '%s' / tenant '%s'",
             metric, tenant_id,
@@ -642,6 +652,9 @@ async def _generate_and_upload_cogs(
 
         if success_count > 0:
             set_latest_date(tenant_id, metric, today)
+        else:
+            # No tiles today: do not keep serving an older raster as current.
+            clear_latest_pointer(tenant_id, metric)
 
 
 # ---------------------------------------------------------------------------
@@ -680,9 +693,11 @@ async def run_for_tenant(
     # 3. Guard: no parcels
     if not parcels:
         logger.warning(
-            "No parcels for tenant '%s' — skipping COG generation",
+            "No parcels for tenant '%s' — skipping COG generation; "
+            "clearing raster pointers",
             tenant_id,
         )
+        _clear_all_pointers(tenant_id)
         return
 
     # 4. Generate and upload COGs for all metrics / tiles
@@ -703,20 +718,17 @@ async def run_for_tenant(
 
         stats = compute_zonal_stats(tenant_id, geometry, settings.metrics)
 
-        # Weather can now legitimately be absent: when every tile of a metric
-        # returns None, `set_latest_date` never advances and this call — which
-        # passes no date — resolves to the PREVIOUS pointer. Publishing that
-        # would restate yesterday's pixels under a fresh `observedAt`. Stale
-        # data presented as current is worse than a gap: the gap is visible
-        # downstream, this is not. Spec §5.3: a record with an incomplete
-        # input set is not published.
+        # A metric with no tile today has its pointer cleared, so zonal stats
+        # carry no date (or an older one if a clear failed). Never publish a
+        # record whose stats are not from today's raster: stale data under a
+        # fresh `observedAt` is worse than a gap, which is visible downstream.
+        # Spec §5.3: a record with an incomplete input set is not published.
         stats_date = stats.get("date")
         if stats_date != today:
             logger.error(
                 "Not publishing AgriParcelRecord for parcel %s (tenant=%s): "
-                "zonal stats resolved to date=%r, not today's %s — the COG "
-                "pointer did not advance, so the record would republish stale "
-                "pixels under a fresh observedAt",
+                "zonal stats resolved to date=%r, not today's %s — the record "
+                "would republish stale pixels under a fresh observedAt",
                 parcel_id, tenant_id, stats_date, today,
             )
             continue
@@ -740,11 +752,3 @@ async def run_for_tenant(
             "Persisted AgriParcelRecord for parcel %s / tenant %s",
             parcel_id, tenant_id,
         )
-
-    # ── Generate PMTiles from the newly computed COGs ────────────────
-    try:
-        from app.pmtiles_generator import generate_all_pmtiles as _gen_pmtiles
-        pmtiles_urls = _gen_pmtiles(tenant_id, today, zoom)
-        logger.info("PMTiles generated for tenant '%s': %s", tenant_id, pmtiles_urls)
-    except Exception as exc:
-        logger.error("PMTiles generation failed for tenant '%s': %s", tenant_id, exc)

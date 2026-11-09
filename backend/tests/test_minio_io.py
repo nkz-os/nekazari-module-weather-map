@@ -73,3 +73,24 @@ class TestLatestPointerPath:
         """Pointer file lives under cogs/."""
         path = latest_pointer_path("t1", "m")
         assert path.startswith("cogs/")
+
+
+class TestClearLatestPointer:
+    def test_removes_the_pointer_object(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from app import minio_io
+
+        client = MagicMock()
+        monkeypatch.setattr(minio_io, "_get_client", lambda: client)
+        minio_io.clear_latest_pointer("tenant-a", "soil_moisture")
+        kw = client.remove_object.call_args.kwargs
+        assert kw["object_name"] == "cogs/tenant-a/soil_moisture/latest.txt"
+
+    def test_failure_is_swallowed(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from app import minio_io
+
+        client = MagicMock()
+        client.remove_object.side_effect = RuntimeError("x")
+        monkeypatch.setattr(minio_io, "_get_client", lambda: client)
+        minio_io.clear_latest_pointer("tenant-a", "soil_moisture")

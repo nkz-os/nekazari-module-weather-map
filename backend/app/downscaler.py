@@ -361,66 +361,56 @@ def compute_soil_moisture(
 # 7. Saxton–Rawls pedotransfer function
 # ---------------------------------------------------------------------------
 
-def saxton_rawls_ptf(sand_pct: float, clay_pct: float) -> dict:
-    """Estimate hydraulic parameters from soil texture (Saxton–Rawls PTF).
+def saxton_rawls_ptf(
+    sand_pct: float, clay_pct: float, om_pct: float,
+) -> dict:
+    """Estimate hydraulic parameters from soil texture (Saxton & Rawls PTF).
+
+    Equations 1 and 2 of Saxton, K.E. and Rawls, W.J. (2006), "Soil water
+    characteristic estimates by texture and organic matter for hydrologic
+    solutions", Soil Science Society of America Journal 70(5): 1569-1578.
+    The reference was checked against the publisher's record (volume, pages,
+    authors); the coefficients are checked numerically against the loam row of
+    the paper's table (see tests).
 
     Parameters
     ----------
-    sand_pct : float
-        Sand content (% weight).
-    clay_pct : float
-        Clay content (% weight).
+    sand_pct, clay_pct : float
+        Sand and clay content (% weight); converted internally to fractions.
+    om_pct : float
+        Organic matter (% weight). Required: there is no default, an absent
+        measurement means the PTF cannot be evaluated.
 
     Returns
     -------
     dict
-        ``field_capacity`` — water content at −33 kPa (% vol)\n
-        ``wilting_point``  — water content at −1500 kPa (% vol)\n
+        ``field_capacity`` — water content at -33 kPa (% vol)\n
+        ``wilting_point``  — water content at -1500 kPa (% vol)\n
         ``awc``           — available water capacity (% vol)
     """
-    # θ at −1500 kPa (wilting point)
-    theta_1500 = (
-        -0.024 * sand_pct
-        + 0.487 * clay_pct
-        + 0.006 * sand_pct * clay_pct
-        + 0.005 * sand_pct * clay_pct
-        + 0.013
-    )
-    theta_1500 = max(theta_1500, 0.01)
+    s = sand_pct / 100.0
+    c = clay_pct / 100.0
+    om = om_pct
 
-    # θ at −33 kPa (field capacity)
-    theta_33 = (
-        -0.251 * sand_pct
-        + 0.195 * clay_pct
-        + 0.011 * sand_pct * clay_pct
-        + 0.006 * (sand_pct * clay_pct)
-        + 0.027
+    # theta at -1500 kPa (wilting point), first and second approximation
+    t1500_t = (
+        -0.024 * s + 0.487 * c + 0.006 * om
+        + 0.005 * s * om - 0.013 * c * om + 0.068 * s * c + 0.031
     )
-    # Ensure FC ≥ WP + 0.01
-    theta_33 = max(theta_33, theta_1500 + 0.01)
+    theta_1500 = t1500_t + (0.14 * t1500_t - 0.02)
 
-    awc = theta_33 - theta_1500
+    # theta at -33 kPa (field capacity), first and second approximation
+    t33_t = (
+        -0.251 * s + 0.195 * c + 0.011 * om
+        + 0.006 * s * om - 0.027 * c * om + 0.452 * s * c + 0.299
+    )
+    theta_33 = t33_t + (1.283 * t33_t ** 2 - 0.374 * t33_t - 0.015)
 
     return {
-        "field_capacity": theta_33,
-        "wilting_point": theta_1500,
-        "awc": awc,
+        "field_capacity": theta_33 * 100.0,
+        "wilting_point": theta_1500 * 100.0,
+        "awc": (theta_33 - theta_1500) * 100.0,
     }
-
-
-# ---------------------------------------------------------------------------
-# 8. Texture defaults (loam)
-# ---------------------------------------------------------------------------
-
-def get_texture_defaults() -> dict:
-    """Return default soil texture values (loam).
-
-    Returns
-    -------
-    dict
-        ``sand_pct``, ``silt_pct``, ``clay_pct``.
-    """
-    return {"sand_pct": 50.0, "silt_pct": 30.0, "clay_pct": 20.0}
 
 
 # ---------------------------------------------------------------------------

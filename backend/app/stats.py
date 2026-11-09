@@ -22,6 +22,75 @@ from app.minio_io import download_cog, get_latest_date
 
 logger = logging.getLogger(__name__)
 
+NO_DATA_ERROR = "No data for parcel at this metric/date"
+
+# Metrics that stay accepted by name but are not produced: the per-parcel value
+# will come from crop-health's daily water balance. Callers get the no-data
+# error plus the reason, never a 400.
+UNAVAILABLE_METRICS = {
+    "soil_moisture": "Not available: no stateful soil water balance in weather-map",
+}
+
+# Metrics a parcel-level scalar can stand in for when no raster covers the
+# parcel yet: (key in the scalars dict, source). "observed" = running
+# WeatherObserved, "forecast" = WeatherForecast dayMinimum, the same inputs the
+# raster job reads.
+_SCALAR_FALLBACK = {
+    "temperature_avg": ("t_avg", "observed"),
+    "solar_radiation": ("solar_rad_w_m2", "observed"),
+    "temperature_min": ("t_min", "forecast"),
+    "frost_risk": ("t_min", "forecast"),
+}
+FALLBACK_METRICS = tuple(_SCALAR_FALLBACK)
+
+
+def fallback_sources(metrics: list[str]) -> tuple[bool, bool]:
+    """(needs WeatherObserved, needs WeatherForecast) for *metrics*."""
+    srcs = {_SCALAR_FALLBACK[m][1] for m in metrics if m in _SCALAR_FALLBACK}
+    return "observed" in srcs, "forecast" in srcs
+
+
+def scalar_fallback(metric: str, scalars: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Parcel-level scalar for *metric*, or None when the broker lacks the input.
+
+    Reads the same inputs as the raster job (running WeatherObserved for
+    temperature_avg and solar_radiation; WeatherForecast dayMinimum for
+    temperature_min and frost_risk). Never a default: a missing key yields None
+    and the caller keeps its error. Frost risk goes through the raster's own
+    function on a single pixel; relative elevation is then 0, i.e. the maximum
+    cold-air pooling term (2 C). The metric carries its own time: `observed_at`
+    is the source's timestamp, `valid_date` its date part.
+    """
+    spec = _SCALAR_FALLBACK.get(metric)
+    if spec is None or not scalars:
+        return None
+    key, source = spec
+    raw = scalars.get(key)
+    if raw is None:
+        return None
+    value = float(raw)
+    if metric == "frost_risk":
+        from app.downscaler import compute_frost_risk
+
+        value = float(compute_frost_risk(np.array([value]), np.array([0.0]))[0])
+    stamp = scalars.get("observed_at" if source == "observed" else "valid_from")
+    return {
+        "mean": value, "min": value, "max": value,
+        "std": None, "fallback": "parcel_scalar",
+        "valid_date": stamp[:10] if stamp else None,
+        "observed_at": stamp,
+    }
+
+
+def needs_scalar_fallback(stats: dict[str, Any]) -> list[str]:
+    """Metrics of *stats* that carry the no-data error and have a scalar fallback."""
+    return [
+        m for m, v in stats.get("metrics", {}).items()
+        if m in _SCALAR_FALLBACK
+        and isinstance(v, dict) and v.get("error") == NO_DATA_ERROR
+    ]
+
+
 # ── Water-balance thresholds ──────────────────────────────────────
 # Used by the ``water_balance`` metric family only.
 DEFICIT_THRESHOLD_MM = -5.0       # pixels <= this are "in deficit"
@@ -171,7 +240,22 @@ def compute_zonal_stats(
     dict
         ``{"parcel_geojson": …, "date": …, "metrics": {metric: {…}}}``.
     """
-    resolved_date = date or get_latest_date(tenant_id, metrics[0] if metrics else "temperature_avg")
+    unavailable = {
+        m: {"error": NO_DATA_ERROR, "reason": UNAVAILABLE_METRICS[m]}
+        for m in metrics if m in UNAVAILABLE_METRICS
+    }
+    metrics = [m for m in metrics if m not in UNAVAILABLE_METRICS]
+    if unavailable and not metrics:
+        return {"parcel_geojson": geometry, "date": None, "metrics": unavailable}
+
+    resolved_date = date
+    if not resolved_date:
+        # First requested metric that has a pointer: a metric without tiles
+        # (pointer cleared) must not hide the others.
+        for candidate in metrics or ["temperature_avg"]:
+            resolved_date = get_latest_date(tenant_id, candidate)
+            if resolved_date:
+                break
     if not resolved_date:
         return {"error": "No COG data available", "metrics": {}}
 
@@ -189,7 +273,7 @@ def compute_zonal_stats(
         pixels = _collect_pixels(tenant_id, geometry, metric, resolved_date)
         if pixels is None or len(pixels) == 0:
             result["metrics"][metric] = {
-                "error": "No data for parcel at this metric/date",
+                "error": NO_DATA_ERROR,
             }
             continue
 
@@ -232,4 +316,5 @@ def compute_zonal_stats(
 
         result["metrics"][metric] = stats
 
+    result["metrics"].update(unavailable)
     return result

@@ -1,16 +1,10 @@
 """Tile server endpoint — reads precomputed COGs from MinIO and serves PNG tiles.
-
-DEPRECATED: Use PMTiles instead (see pmtiles_generator.py).
-Tile serving is being migrated to static PMTiles served directly from MinIO,
-eliminating the need for this on-demand tile renderer.
-Will be removed in a future version once PMTiles are stable.
 """
 
 from __future__ import annotations
 
 import io
 import logging
-import warnings
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -25,13 +19,19 @@ from app.tile_auth import make_tile_token, verify_tile_token
 from app.minio_io import download_cog, get_latest_date
 from app.color_scales import apply_color_scale
 from app.records import build_agri_parcel_record, guard_frozen_metrics
-from app.stats import compute_zonal_stats
-from app.sources import fetch_agri_parcel, fetch_entity_attr, upsert_record
-
-warnings.warn(
-    "tiles.py is deprecated. Use PMTiles from MinIO instead (see pmtiles_generator.py).",
-    DeprecationWarning,
-    stacklevel=2,
+from app.stats import (
+    FALLBACK_METRICS,
+    NO_DATA_ERROR,
+    compute_zonal_stats,
+    fallback_sources,
+    needs_scalar_fallback,
+    scalar_fallback,
+)
+from app.sources import (
+    fetch_agri_parcel,
+    fetch_entity_attr,
+    fetch_parcel_scalars,
+    upsert_record,
 )
 
 logger = logging.getLogger(__name__)
@@ -290,6 +290,41 @@ async def parcel_zonal_stats(
         raise HTTPException(
             status_code=500, detail="Failed to compute zonal statistics"
         )
+
+    # 3b. Label the payload: a raster is a forecast snapshot, not a measurement.
+    # The model that produced it is not known here, so none is claimed.
+    if stats.get("date"):
+        stats["valid_date"] = stats["date"]
+        stats["kind"] = "forecast_snapshot"
+
+    # 3c. Parcel not covered by a raster: a marked parcel scalar from the
+    # broker, each with its own time. Only for the latest raster (an explicit
+    # date asks for that raster) and never invented: no broker value, the error
+    # stays.
+    if date is None:
+        no_raster = "error" in stats and not stats.get("metrics")
+        if no_raster:
+            pending = [m for m in metric_list if m in FALLBACK_METRICS]
+        else:
+            pending = needs_scalar_fallback(stats)
+        if pending:
+            obs, fc = fallback_sources(pending)
+            scalars = await fetch_parcel_scalars(
+                tenant_id, parcel_id, observed=obs, forecast=fc
+            )
+            resolved = {m: scalar_fallback(m, scalars) for m in pending}
+            resolved = {m: v for m, v in resolved.items() if v is not None}
+            if no_raster and resolved:
+                stats.pop("error", None)
+                stats["date"] = None
+                stats["valid_date"] = None
+                stats["kind"] = "parcel_scalar"
+                stats["metrics"] = {
+                    m: dict(resolved.get(m) or {"error": NO_DATA_ERROR})
+                    for m in metric_list
+                }
+            elif not no_raster:
+                stats["metrics"].update(resolved)
 
     # 4. Read phenology params from Orion-LD (if crop+stage provided)
     phenology = None

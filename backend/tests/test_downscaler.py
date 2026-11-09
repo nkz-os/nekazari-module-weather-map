@@ -1,5 +1,6 @@
 """Tests for the Weather Map downscaler physics engine."""
 
+import pytest
 import numpy as np
 
 from app.downscaler import (
@@ -10,7 +11,6 @@ from app.downscaler import (
     compute_frost_risk,
     compute_soil_moisture,
     saxton_rawls_ptf,
-    get_texture_defaults,
     discretize_aspect,
     compute_zones,
 )
@@ -355,23 +355,36 @@ class TestSoilMoisture:
 class TestSaxtonRawls:
     """Saxton-Rawls pedotransfer function."""
 
+    def test_ptf_loam_matches_saxton_rawls_table(self):
+        p = saxton_rawls_ptf(40.0, 20.0, om_pct=2.5)
+        assert p["field_capacity"] == pytest.approx(28, abs=1)
+        assert p["wilting_point"] == pytest.approx(14, abs=1)
+        assert p["awc"] == pytest.approx(14, abs=2)
+
+    def test_ptf_orders_sand_loam_clay(self):
+        sand = saxton_rawls_ptf(85.0, 5.0, om_pct=2.5)
+        loam = saxton_rawls_ptf(40.0, 20.0, om_pct=2.5)
+        clay = saxton_rawls_ptf(20.0, 60.0, om_pct=2.5)
+        assert sand["field_capacity"] < loam["field_capacity"] < clay["field_capacity"]
+        assert sand["wilting_point"] < loam["wilting_point"] < clay["wilting_point"]
+
     def test_sand(self):
         """85% sand → low FC and WP."""
-        result = saxton_rawls_ptf(sand_pct=85.0, clay_pct=5.0)
+        result = saxton_rawls_ptf(sand_pct=85.0, clay_pct=5.0, om_pct=2.5)
         assert result["wilting_point"] < 10.0
         assert result["field_capacity"] < 20.0
         assert result["awc"] > 0
 
     def test_clay(self):
         """20% sand, 60% clay → high FC and WP."""
-        result = saxton_rawls_ptf(sand_pct=20.0, clay_pct=60.0)
+        result = saxton_rawls_ptf(sand_pct=20.0, clay_pct=60.0, om_pct=2.5)
         assert result["wilting_point"] > 15.0
         assert result["field_capacity"] > 25.0
         assert result["awc"] > 0
 
     def test_key_structure(self):
         """Returns expected keys."""
-        result = saxton_rawls_ptf(sand_pct=50.0, clay_pct=20.0)
+        result = saxton_rawls_ptf(sand_pct=50.0, clay_pct=20.0, om_pct=2.5)
         assert "field_capacity" in result
         assert "wilting_point" in result
         assert "awc" in result
@@ -379,45 +392,21 @@ class TestSaxtonRawls:
     def test_fc_gt_wp(self):
         """Field capacity always > wilting point."""
         for sand, clay in [(10, 80), (80, 10), (40, 40), (30, 50)]:
-            result = saxton_rawls_ptf(sand, clay)
+            result = saxton_rawls_ptf(sand, clay, om_pct=2.5)
             assert result["field_capacity"] > result["wilting_point"], f"sand={sand}, clay={clay}"
 
     def test_awc_positive(self):
         """AWC always positive."""
         for sand, clay in [(10, 80), (80, 10), (40, 40), (30, 50)]:
-            result = saxton_rawls_ptf(sand, clay)
+            result = saxton_rawls_ptf(sand, clay, om_pct=2.5)
             assert result["awc"] > 0, f"sand={sand}, clay={clay}"
 
     def test_in_bounds(self):
         """Values are reasonable percentages."""
-        result = saxton_rawls_ptf(sand_pct=50.0, clay_pct=20.0)
+        result = saxton_rawls_ptf(sand_pct=50.0, clay_pct=20.0, om_pct=2.5)
         assert 0 <= result["wilting_point"] <= 100
         assert 0 <= result["field_capacity"] <= 100
         assert 0 <= result["awc"] <= 100
-
-
-class TestTextureDefaults:
-    """Default texture values."""
-
-    def test_returns_dict(self):
-        """Returns a dict with expected keys."""
-        result = get_texture_defaults()
-        assert isinstance(result, dict)
-        assert "sand_pct" in result
-        assert "silt_pct" in result
-        assert "clay_pct" in result
-
-    def test_loam_values(self):
-        """Defaults are loam (50/30/20)."""
-        result = get_texture_defaults()
-        assert result["sand_pct"] == 50.0
-        assert result["silt_pct"] == 30.0
-        assert result["clay_pct"] == 20.0
-
-    def test_sums_to_100(self):
-        """Texture percentages sum to 100."""
-        result = get_texture_defaults()
-        assert abs(result["sand_pct"] + result["silt_pct"] + result["clay_pct"] - 100.0) < 0.01
 
 
 # ---------------------------------------------------------------------------

@@ -298,3 +298,99 @@ class TestGenerateCogForTile:
         assert reads == ["urn:ngsi-ld:AgriParcel:p1"], (
             f"la meteo de una parcela se leyó {len(reads)} veces en un run"
         )
+
+
+class TestSoilMoistureWithoutSoil:
+    @pytest.mark.asyncio
+    async def test_no_soil_makes_metric_unavailable_no_defaults(self, monkeypatch):
+        from app import cog_generator as cg
+
+        monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=_dem()))
+        monkeypatch.setattr(cg, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+        monkeypatch.setattr(cg, "fetch_parcel_hydraulics", AsyncMock(return_value=None))
+        assert await _tile(cg, "soil_moisture") is None
+        assert not hasattr(cg, "get_texture_defaults")
+
+    @pytest.mark.asyncio
+    async def test_soil_moisture_uses_real_hydraulics(self, monkeypatch):
+        from app import cog_generator as cg
+
+        monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=_dem()))
+        monkeypatch.setattr(cg, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+        monkeypatch.setattr(
+            cg, "fetch_parcel_hydraulics",
+            AsyncMock(return_value={"field_capacity": 30.0, "wilting_point": 15.0, "awc": 15.0}),
+        )
+        assert await _tile(cg, "soil_moisture") is not None
+
+    @pytest.mark.asyncio
+    async def test_no_usable_geometry_clears_all_pointers(self, monkeypatch, caplog):
+        import logging
+        from app import cog_generator as cg
+
+        cleared: list = []
+        monkeypatch.setattr(cg, "clear_latest_pointer", lambda t, m: cleared.append((t, m)))
+        monkeypatch.setattr(cg.settings, "metrics", ["temperature_avg", "eto"])
+        with caplog.at_level(logging.WARNING):
+            await cg._generate_and_upload_cogs(
+                "tenant-a", [{"id": "p"}], "2026-09-01", "2026-09-02", 14, "2026-09-02",
+            )
+        assert cleared == [("tenant-a", "temperature_avg"), ("tenant-a", "eto")]
+        assert "tenant-a" in caplog.text and "clearing raster pointers" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_no_parcels_clears_all_pointers(self, monkeypatch, caplog):
+        import logging
+        from app import cog_generator as cg
+
+        cleared: list = []
+        monkeypatch.setattr(cg, "clear_latest_pointer", lambda t, m: cleared.append((t, m)))
+        monkeypatch.setattr(cg.settings, "metrics", ["temperature_avg", "eto"])
+        with caplog.at_level(logging.WARNING):
+            await cg.run_for_tenant("tenant-a", [], "2026-09-01", "2026-09-02")
+        assert cleared == [("tenant-a", "temperature_avg"), ("tenant-a", "eto")]
+        assert "tenant-a" in caplog.text and "No parcels" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_job_makes_no_soil_tiles_and_clears_pointer(self, monkeypatch):
+        from app import cog_generator as cg
+
+        seen: list = []
+
+        async def _fake_tile(tenant_id, metric, *a, **kw):
+            seen.append(metric)
+            return b"cog"
+
+        hydraulics = AsyncMock(return_value=None)
+        monkeypatch.setattr(cg, "generate_cog_for_tile", _fake_tile)
+        monkeypatch.setattr(cg, "fetch_parcel_hydraulics", hydraulics)
+        monkeypatch.setattr(cg, "upload_cog", lambda *a, **kw: True)
+        monkeypatch.setattr(cg, "set_latest_date", lambda *a, **kw: True)
+        cleared: list = []
+        monkeypatch.setattr(cg, "clear_latest_pointer", lambda t, m: cleared.append((t, m)))
+        monkeypatch.setattr(cg.settings, "metrics", ["temperature_avg", "soil_moisture"])
+
+        await cg._generate_and_upload_cogs(
+            "tenant-a", [PARCEL], "2026-09-01", "2026-09-02", 14, "2026-09-02",
+        )
+        assert seen and set(seen) == {"temperature_avg"}
+        assert cleared == [("tenant-a", "soil_moisture")]
+        hydraulics.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_metric_with_no_tiles_clears_latest_pointer(self, monkeypatch):
+        from app import cog_generator as cg
+
+        monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=_dem()))
+        monkeypatch.setattr(cg, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+        monkeypatch.setattr(cg, "fetch_parcel_hydraulics", AsyncMock(return_value=None))
+        monkeypatch.setattr(cg, "upload_cog", lambda *a, **kw: True)
+        monkeypatch.setattr(cg, "set_latest_date", lambda *a, **kw: True)
+        cleared: list = []
+        monkeypatch.setattr(cg, "clear_latest_pointer", lambda t, m: cleared.append((t, m)))
+        monkeypatch.setattr(cg.settings, "metrics", ["temperature_avg", "soil_moisture"])
+
+        await cg._generate_and_upload_cogs(
+            "tenant-a", [PARCEL], "2026-09-01", "2026-09-02", 14, "2026-09-02",
+        )
+        assert cleared == [("tenant-a", "soil_moisture")]

@@ -1,7 +1,7 @@
 """HTTP clients for external services: eu-elevation, weather-api, Orion-LD.
 
-Provides async functions that fetch DEM tiles, station weather, AgriSoil
-entities from Orion-LD, and a stub for tenant parcels.  Every function
+Provides async functions that fetch DEM tiles, station weather, soil
+hydraulics (AgriSoilExtended) from Orion-LD, and a stub for tenant parcels.  Every function
 returns ``None`` on error — callers check for ``None`` rather than catching.
 """
 
@@ -15,6 +15,7 @@ import httpx
 from nkz_platform_sdk import OrionClient
 
 from app.config import settings
+from app.downscaler import saxton_rawls_ptf
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,59 @@ async def fetch_parcel_weather(tenant_id: str, parcel_id: str) -> dict | None:
     return out
 
 
+async def fetch_parcel_scalars(
+    tenant_id: str, parcel_id: str, *, observed: bool, forecast: bool,
+) -> dict:
+    """Parcel scalars for the `/stats` fallback, reading only what is asked for.
+
+    Same inputs the raster job uses in `fetch_parcel_weather`: the running
+    WeatherObserved (`parcel-<id>`) for `t_avg` and `solar_rad_w_m2`, and the
+    WeatherForecast `dayMinimum` for `t_min`. The closed-day `-daily` entity is
+    never read. Each read happens only when its flag is set. A key whose data is
+    absent is omitted. `observed_at` / `valid_from` carry the source's own time.
+    """
+    suffix = parcel_id.split(":")[-1]
+    out: dict = {}
+
+    def _num(raw):
+        return _as_float(raw) if raw is not None else None
+
+    def _stamp(raw):
+        if isinstance(raw, dict):
+            raw = raw.get("@value")
+        return raw if isinstance(raw, str) and raw else None
+
+    if observed:
+        obs = await _get_entity_keyvalues(
+            tenant_id, f"urn:ngsi-ld:WeatherObserved:{tenant_id}:parcel-{suffix}"
+        ) or {}
+        for key, names in (
+            ("t_avg", ("airTemperature", "temperature")),
+            ("solar_rad_w_m2", ("solarRadiation",)),
+        ):
+            for name in names:
+                value = _num(obs.get(name))
+                if value is not None:
+                    out[key] = value
+                    break
+        stamp = _stamp(obs.get("dateObserved"))
+        if stamp:
+            out["observed_at"] = stamp
+    if forecast:
+        fc = await _get_entity_keyvalues(
+            tenant_id, f"urn:ngsi-ld:WeatherForecast:{tenant_id}:parcel-{suffix}"
+        ) or {}
+        block = fc.get("dayMinimum")
+        if isinstance(block, dict):
+            value = _num(block.get("temperature"))
+            if value is not None:
+                out["t_min"] = value
+        stamp = _stamp(fc.get("validFrom"))
+        if stamp:
+            out["valid_from"] = stamp
+    return out
+
+
 class HistoryReadFailed(Exception):
     """The history read did not complete — this is NOT "no history yet".
 
@@ -195,6 +249,9 @@ class MissingContextURL(HistoryReadFailed):
     """
 
 
+_HISTORY_PAGE = 1000  # Orion-LD's maximum page size
+
+
 async def fetch_metric_history(
     tenant_id: str, parcel_id: str, attr_name: str, limit: int = 5,
 ) -> list[float]:
@@ -207,20 +264,19 @@ async def fetch_metric_history(
     new parcel, and neither must an unset `CONTEXT_URL` (`MissingContextURL`,
     a subclass).
 
-    Ordering is done here, client-side, on the compact timestamp weather-map
-    itself writes into the record id. `orderBy=dateObserved:desc` is sent as
-    a server-side hint to narrow `limit` to the recent window, but it is NOT
-    verified against Orion-LD over a nested `{"@type":"DateTime"}` Property:
-    if it is rejected the read now fails loudly, and if it is silently
-    ignored the returned order is checked and reported. Correctness of the
-    order never depends on it.
+    Orion-LD answers 501 to `orderBy` on this query, so none is sent: every
+    record of the parcel is read page by page and ordered here, client-side,
+    on the compact timestamp weather-map itself writes into the record id;
+    the last *limit* are kept. The link is queried as `hasAgriParcel`; records
+    are stored as `refAgriParcel`, but both names share one IRI so the query
+    matches them (checked against the live broker).
 
     `AgriParcelRecord` is shared with a field-photo pipeline (ids prefixed
     `photo-`, also related to the same parcel via `hasAgriParcel`) — records
     are filtered to weather-map's own `weather-` id prefix so a photo upload
     is never read as a weather sample. Same broker-read shape as
-    `fetch_tenant_parcels` (manual `@context` Link header) combined with the
-    `q=hasAgriParcel==` + `orderBy` filter already used in `zones.py`.
+    `fetch_tenant_parcels` (manual `@context` Link header) plus the
+    `q=hasAgriParcel==` filter.
     """
     if not settings.context_url:
         raise MissingContextURL()
@@ -231,24 +287,38 @@ async def fetch_metric_history(
         "Fiware-ServicePath": "/",
         "Link": f'<{settings.context_url}>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"',
     }
+    data: list = []
+    offset = 0
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{settings.orion_url}/ngsi-ld/v1/entities",
-                params={
-                    "type": "AgriParcelRecord",
-                    "q": f'hasAgriParcel=="{parcel_id}"',
-                    "attrs": attr_name,
-                    "options": "keyValues",
-                    "orderBy": "dateObserved:desc",
-                    "limit": limit,
-                },
-                headers=headers,
-            )
-            if resp.status_code == 404:
-                return []  # genuine absence: no record for this parcel
-            resp.raise_for_status()
-            data = resp.json()
+            while True:
+                resp = await client.get(
+                    f"{settings.orion_url}/ngsi-ld/v1/entities",
+                    params={
+                        "type": "AgriParcelRecord",
+                        "q": f'hasAgriParcel=="{parcel_id}"',
+                        "attrs": attr_name,
+                        "options": "keyValues",
+                        "limit": _HISTORY_PAGE,
+                        "offset": offset,
+                    },
+                    headers=headers,
+                )
+                if resp.status_code == 404:
+                    break  # genuine absence: no (more) records for this parcel
+                resp.raise_for_status()
+                page = resp.json()
+                if not isinstance(page, list):
+                    raise HistoryReadFailed(
+                        f"history read for {attr_name} on {parcel_id} returned "
+                        f"{type(page).__name__}, expected a list"
+                    )
+                data.extend(page)
+                if len(page) < _HISTORY_PAGE:
+                    break
+                offset += _HISTORY_PAGE
+    except HistoryReadFailed:
+        raise
     except Exception as exc:
         logger.exception(
             "fetch_metric_history(tenant=%s, parcel=%s, attr=%s) failed",
@@ -257,12 +327,6 @@ async def fetch_metric_history(
         raise HistoryReadFailed(
             f"history read failed for {attr_name} on {parcel_id}: {exc!r}"
         ) from exc
-
-    if not isinstance(data, list):
-        raise HistoryReadFailed(
-            f"history read for {attr_name} on {parcel_id} returned "
-            f"{type(data).__name__}, expected a list"
-        )
 
     samples: list[tuple[str, float]] = []
     for entity in data:
@@ -280,15 +344,8 @@ async def fetch_metric_history(
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             samples.append((stamp, value))
 
-    as_received = [stamp for stamp, _ in samples]
     samples.sort(key=lambda sample: sample[0])  # oldest first — the guard's contract
-    if len(samples) > 1 and as_received != [stamp for stamp, _ in reversed(samples)]:
-        logger.warning(
-            "Orion did not honour orderBy=dateObserved:desc for %s on %s — the "
-            "client-side sort fixed the order, but `limit` then selects an "
-            "arbitrary window and the variance guard sees less than the most "
-            "recent samples", attr_name, parcel_id,
-        )
+    samples = samples[-limit:]
     return [float(value) for _, value in samples]
 
 
@@ -383,32 +440,119 @@ async def fetch_dem_tile(z: int, x: int, y: int) -> dict[str, Any] | None:
         return None
 
 
-async def fetch_agri_soil(
-    tenant_id: str, parcel_id: str
-) -> dict[str, float | None] | None:
-    """Fetch the ``AgriSoil`` NGSI-LD entity from Orion-LD via the SDK.
+def _attr_value(entity: dict, name: str) -> Any:
+    """Value of an NGSI-LD attribute, normalized or keyValues form."""
+    attr = entity.get(name)
+    if isinstance(attr, dict):
+        return attr.get("value", attr.get("object"))
+    return attr
 
-    Returns a dict with ``sand_pct``, ``silt_pct``, ``clay_pct`` keys,
-    or ``None`` if the entity does not exist or the request fails.
+
+# Organic matter (% weight) from organic carbon (% weight): the Van Bemmelen
+# factor 1.724 (OM = OC x 1.724). GENERAL KNOWLEDGE, not verified against a
+# primary source here: verify before relying on it.
+_OC_TO_OM = 1.724
+_OM_MAX_PCT = 20.0  # plausible upper bound for mineral topsoil organic matter
+
+
+def _fraction(h: dict, attr: str) -> float | None:
+    """A water-content attribute as a fraction in (0, 1), or None.
+
+    Orion stores m3/m3. A value outside (0, 1) (e.g. a percentage written
+    by mistake) is rejected with a WARNING instead of being scaled.
     """
-    entity_id = f"urn:ngsi-ld:AgriSoil:{parcel_id}"
+    v = _as_float(h.get(attr))
+    if v is None:
+        return None
+    if not 0.0 < v < 1.0:
+        logger.warning("Soil attribute %s=%r is not a fraction in (0, 1); ignored", attr, v)
+        return None
+    return v
+
+
+async def fetch_parcel_hydraulics(
+    tenant_id: str, parcel_id: str
+) -> dict[str, float] | None:
+    """Soil hydraulics of a parcel from its ``AgriSoilExtended`` entity.
+
+    Reads the top horizon (``horizons[0]``, as the risk module does). Orion
+    stores water contents as fractions (m3/m3); the result is in % vol:
+    ``{"field_capacity", "wilting_point", "awc"}``. If the horizon has no
+    valid water contents but has sand, clay and organic carbon, they come
+    from the Saxton & Rawls pedotransfer function. Returns ``None`` when
+    there is no entity or no usable data: never a default.
+    """
     orion = OrionClient(tenant_id)
     try:
-        data = await orion.get_entity(entity_id)
-        return {
-            "sand_pct": data.get("sandPct") or data.get("sand_pct"),
-            "silt_pct": data.get("siltPct") or data.get("silt_pct"),
-            "clay_pct": data.get("clayPct") or data.get("clay_pct"),
-        }
+        rows = await orion.query_entities(
+            type="AgriSoilExtended",
+            q=f'refAgriParcel=="{parcel_id}"|hasAgriParcel=="{parcel_id}"',
+            limit=5,
+            options="sysAttrs",
+        )
     except Exception:
         logger.exception(
-            "fetch_agri_soil(tenant=%s, parcel=%s) failed",
-            tenant_id,
-            parcel_id,
+            "fetch_parcel_hydraulics(tenant=%s, parcel=%s) failed",
+            tenant_id, parcel_id,
         )
         return None
     finally:
         await orion.close()
+
+    if not rows:
+        return None
+    entity = rows[0]
+    if len(rows) > 1:
+        dated = [r for r in rows if _attr_value(r, "modifiedAt") or r.get("modifiedAt")]
+        if dated:
+            entity = max(
+                dated, key=lambda r: str(_attr_value(r, "modifiedAt") or r.get("modifiedAt")),
+            )
+        logger.warning(
+            "%d AgriSoilExtended match parcel %s; using %s",
+            len(rows), parcel_id,
+            "the most recently modified" if dated else "the first",
+        )
+    horizons = _attr_value(entity, "horizons")
+    if not (isinstance(horizons, list) and horizons and isinstance(horizons[0], dict)):
+        return None
+    h = horizons[0]
+
+    fc = _fraction(h, "fieldCapacity")
+    wp = _fraction(h, "wiltingPoint")
+    awc = _fraction(h, "availableWaterCapacity")
+    out = None
+    if fc is not None and wp is not None:
+        if awc is None:
+            awc = fc - wp
+        out = {
+            "field_capacity": fc * 100.0,
+            "wilting_point": wp * 100.0,
+            "awc": awc * 100.0,
+        }
+    else:
+        sand = _as_float(h.get("sand"))
+        clay = _as_float(h.get("clay"))
+        oc = _as_float(h.get("organicCarbon"))
+        if sand is None or clay is None or oc is None:
+            return None
+        # organicCarbon is % weight (live AgriSoilExtended horizons and the soil
+        # module's writer agree). Anything giving OM outside (0, 20] % is a unit
+        # slip (e.g. g/kg) or noise: unavailable, never fed to the PTF.
+        om = oc * _OC_TO_OM
+        if not 0.0 < om <= _OM_MAX_PCT:
+            logger.warning(
+                "Soil organicCarbon=%r gives organic matter %.1f %%, outside "
+                "(0, %.0f] %%; hydraulics unavailable for parcel %s",
+                oc, om, _OM_MAX_PCT, parcel_id,
+            )
+            return None
+        out = saxton_rawls_ptf(sand, clay, om)
+
+    if not (out["awc"] > 0 and out["field_capacity"] > out["wilting_point"] >= 0):
+        logger.warning("Unusable hydraulics for parcel %s: %s", parcel_id, out)
+        return None
+    return out
 
 
 async def upsert_record(tenant_id: str, entity: dict) -> None:

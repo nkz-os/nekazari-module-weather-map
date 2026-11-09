@@ -99,3 +99,15 @@ def test_compute_zonal_stats_no_cogs():
     t = result["metrics"].get("temperature_avg", {})
     if isinstance(t, dict) and "error" in t:
         assert "No data" in t["error"] or "No COG" in t["error"]
+
+
+def test_date_resolves_from_first_metric_that_has_a_pointer(monkeypatch):
+    from app import stats
+
+    pointers = {"soil_moisture": None, "eto": "2026-09-02"}
+    monkeypatch.setattr(stats, "get_latest_date", lambda t, m: pointers[m])
+    monkeypatch.setattr(stats, "_collect_pixels", lambda *a, **kw: None)
+    out = stats.compute_zonal_stats("tenant-a", {"type": "Polygon", "coordinates": []},
+                                    ["soil_moisture", "eto"])
+    assert out["date"] == "2026-09-02"
+    assert set(out["metrics"]) == {"soil_moisture", "eto"}
