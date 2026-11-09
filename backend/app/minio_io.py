@@ -207,6 +207,23 @@ def set_latest_date(tenant_id: str, metric: str, date: str) -> bool:
         return False
 
 
+def clear_latest_pointer(tenant_id: str, metric: str) -> None:
+    """Remove the latest-date pointer so a metric with no fresh tiles is not
+    served from an old raster. Errors are logged, never raised."""
+    try:
+        client = _get_client()
+        client.remove_object(
+            bucket_name=settings.minio_bucket,
+            object_name=latest_pointer_path(tenant_id, metric),
+        )
+    except Exception:
+        logger.exception(
+            "clear_latest_pointer(tenant=%s, metric=%s) failed",
+            tenant_id,
+            metric,
+        )
+
+
 # ---------------------------------------------------------------------------
 # COG cleanup
 # ---------------------------------------------------------------------------

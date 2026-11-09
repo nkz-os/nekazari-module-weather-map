@@ -149,3 +149,23 @@ async def test_one_stale_parcel_does_not_block_a_fresh_one():
     assert upsert.await_count == 1
     published = upsert.await_args.args[1]
     assert "fresh" in published["hasAgriParcel"]["object"]
+
+
+@pytest.mark.asyncio
+async def test_record_omits_soil_moisture_when_unavailable():
+    parcels = [{"id": "urn:ngsi-ld:AgriParcel:p1", "lon": -1.5, "lat": 42.0}]
+    upsert = AsyncMock()
+    stats = {
+        "date": _today(),
+        "metrics": {
+            "eto": {"mean": 4.2},
+            "soil_moisture": {"error": "no data"},
+        },
+    }
+    with _run(parcels, stats, upsert):
+        await cog_generator.run_for_tenant(
+            "demo-coop", parcels, "2026-06-01", "2026-06-10",
+        )
+    record = upsert.await_args.args[1]
+    assert "eto" in record
+    assert "soilMoistureVwc" not in record

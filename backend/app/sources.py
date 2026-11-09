@@ -1,7 +1,7 @@
 """HTTP clients for external services: eu-elevation, weather-api, Orion-LD.
 
-Provides async functions that fetch DEM tiles, station weather, AgriSoil
-entities from Orion-LD, and a stub for tenant parcels.  Every function
+Provides async functions that fetch DEM tiles, station weather, soil
+hydraulics (AgriSoilExtended) from Orion-LD, and a stub for tenant parcels.  Every function
 returns ``None`` on error — callers check for ``None`` rather than catching.
 """
 
@@ -15,6 +15,7 @@ import httpx
 from nkz_platform_sdk import OrionClient
 
 from app.config import settings
+from app.downscaler import saxton_rawls_ptf
 
 logger = logging.getLogger(__name__)
 
@@ -436,32 +437,71 @@ async def fetch_dem_tile(z: int, x: int, y: int) -> dict[str, Any] | None:
         return None
 
 
-async def fetch_agri_soil(
-    tenant_id: str, parcel_id: str
-) -> dict[str, float | None] | None:
-    """Fetch the ``AgriSoil`` NGSI-LD entity from Orion-LD via the SDK.
+def _attr_value(entity: dict, name: str) -> Any:
+    """Value of an NGSI-LD attribute, normalized or keyValues form."""
+    attr = entity.get(name)
+    if isinstance(attr, dict):
+        return attr.get("value", attr.get("object"))
+    return attr
 
-    Returns a dict with ``sand_pct``, ``silt_pct``, ``clay_pct`` keys,
-    or ``None`` if the entity does not exist or the request fails.
+
+async def fetch_parcel_hydraulics(
+    tenant_id: str, parcel_id: str
+) -> dict[str, float] | None:
+    """Soil hydraulics of a parcel from its ``AgriSoilExtended`` entity.
+
+    Reads the top horizon (``horizons[0]``, as the risk module does). Orion
+    stores water contents as fractions (m3/m3); the result is in % vol:
+    ``{"field_capacity", "wilting_point", "awc"}``. If the horizon carries
+    no water contents but has sand and clay (% weight), they come from the
+    Saxton & Rawls pedotransfer function. Returns ``None`` when there is no
+    entity or no usable data — never a default.
     """
-    entity_id = f"urn:ngsi-ld:AgriSoil:{parcel_id}"
     orion = OrionClient(tenant_id)
     try:
-        data = await orion.get_entity(entity_id)
-        return {
-            "sand_pct": data.get("sandPct") or data.get("sand_pct"),
-            "silt_pct": data.get("siltPct") or data.get("silt_pct"),
-            "clay_pct": data.get("clayPct") or data.get("clay_pct"),
-        }
+        rows = await orion.query_entities(
+            type="AgriSoilExtended",
+            q=f'refAgriParcel=="{parcel_id}"|hasAgriParcel=="{parcel_id}"',
+            limit=1,
+        )
     except Exception:
         logger.exception(
-            "fetch_agri_soil(tenant=%s, parcel=%s) failed",
-            tenant_id,
-            parcel_id,
+            "fetch_parcel_hydraulics(tenant=%s, parcel=%s) failed",
+            tenant_id, parcel_id,
         )
         return None
     finally:
         await orion.close()
+
+    if not rows:
+        return None
+    horizons = _attr_value(rows[0], "horizons")
+    if not (isinstance(horizons, list) and horizons and isinstance(horizons[0], dict)):
+        return None
+    h = horizons[0]
+
+    fc = _as_float(h.get("fieldCapacity"))
+    wp = _as_float(h.get("wiltingPoint"))
+    awc = _as_float(h.get("availableWaterCapacity"))
+    if fc is not None and wp is not None:
+        if awc is None:
+            awc = fc - wp
+        out = {
+            "field_capacity": fc * 100.0,
+            "wilting_point": wp * 100.0,
+            "awc": awc * 100.0,
+        }
+    else:
+        sand = _as_float(h.get("sand"))
+        clay = _as_float(h.get("clay"))
+        if sand is None or clay is None:
+            return None
+        out = saxton_rawls_ptf(sand, clay)
+
+    if not (out["awc"] > 0 and out["field_capacity"] > out["wilting_point"] >= 0):
+        logger.warning("Unusable hydraulics for parcel %s: %s", parcel_id, out)
+        return None
+    return out
 
 
 async def upsert_record(tenant_id: str, entity: dict) -> None:

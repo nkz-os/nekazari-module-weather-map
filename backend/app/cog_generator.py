@@ -29,14 +29,12 @@ from app.downscaler import (
     compute_water_balance,
     compute_frost_risk,
     compute_soil_moisture,
-    saxton_rawls_ptf,
-    get_texture_defaults,
 )
-from app.minio_io import set_latest_date, upload_cog
+from app.minio_io import clear_latest_pointer, set_latest_date, upload_cog
 from app.records import build_agri_parcel_record, guard_frozen_metrics
 from app.sources import (
     MissingWeatherInput,
-    fetch_agri_soil,
+    fetch_parcel_hydraulics,
     fetch_dem_tile,
     fetch_parcel_weather,
     require,
@@ -262,7 +260,7 @@ async def generate_cog_for_tile(
         Date range (``"YYYY-MM-DD"``).
     tile_center_lat, tile_center_lon : float
         Centre of the tile — used to pick the nearest parcel (weather base)
-        and, for ``soil_moisture``, the matching AgriSoil entity.
+        and, for ``soil_moisture``, the matching soil hydraulics.
     parcels : list[dict]
         Tenant's parcels. The tile's weather (and soil) comes from the
         parcel NEAREST to the tile centre, never ``parcels[0]``.
@@ -447,17 +445,14 @@ async def generate_cog_for_tile(
         result = compute_frost_risk(t_min_corrected, elevations)
 
     elif metric == "soil_moisture":
-        soil = await fetch_agri_soil(tenant_id, parcel_id)
-        if soil is not None and soil.get("sand_pct") is not None:
-            ptf = saxton_rawls_ptf(soil["sand_pct"], soil["clay_pct"])
-        else:
+        ptf = await fetch_parcel_hydraulics(tenant_id, parcel_id)
+        if ptf is None:
             logger.warning(
-                "No AgriSoil for %s; using texture defaults", parcel_id
+                "No soil hydraulics for parcel %s (tile %d/%d/%d, tenant=%s): "
+                "soil_moisture unavailable",
+                parcel_id, z, x, y, tenant_id,
             )
-            defaults = get_texture_defaults()
-            ptf = saxton_rawls_ptf(
-                defaults["sand_pct"], defaults["clay_pct"],
-            )
+            return None
 
         t_avg_corrected = correct_temperature(
             t_avg, station_elevation, elevations,
@@ -642,6 +637,9 @@ async def _generate_and_upload_cogs(
 
         if success_count > 0:
             set_latest_date(tenant_id, metric, today)
+        else:
+            # No tiles today: do not keep serving an older raster as current.
+            clear_latest_pointer(tenant_id, metric)
 
 
 # ---------------------------------------------------------------------------
