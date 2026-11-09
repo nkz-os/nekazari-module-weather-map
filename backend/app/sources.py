@@ -170,6 +170,59 @@ async def fetch_parcel_weather(tenant_id: str, parcel_id: str) -> dict | None:
     return out
 
 
+async def fetch_parcel_scalars(
+    tenant_id: str, parcel_id: str, *, observed: bool, forecast: bool,
+) -> dict:
+    """Parcel scalars for the `/stats` fallback, reading only what is asked for.
+
+    Same inputs the raster job uses in `fetch_parcel_weather`: the running
+    WeatherObserved (`parcel-<id>`) for `t_avg` and `solar_rad_w_m2`, and the
+    WeatherForecast `dayMinimum` for `t_min`. The closed-day `-daily` entity is
+    never read. Each read happens only when its flag is set. A key whose data is
+    absent is omitted. `observed_at` / `valid_from` carry the source's own time.
+    """
+    suffix = parcel_id.split(":")[-1]
+    out: dict = {}
+
+    def _num(raw):
+        return _as_float(raw) if raw is not None else None
+
+    def _stamp(raw):
+        if isinstance(raw, dict):
+            raw = raw.get("@value")
+        return raw if isinstance(raw, str) and raw else None
+
+    if observed:
+        obs = await _get_entity_keyvalues(
+            tenant_id, f"urn:ngsi-ld:WeatherObserved:{tenant_id}:parcel-{suffix}"
+        ) or {}
+        for key, names in (
+            ("t_avg", ("airTemperature", "temperature")),
+            ("solar_rad_w_m2", ("solarRadiation",)),
+        ):
+            for name in names:
+                value = _num(obs.get(name))
+                if value is not None:
+                    out[key] = value
+                    break
+        stamp = _stamp(obs.get("dateObserved"))
+        if stamp:
+            out["observed_at"] = stamp
+    if forecast:
+        fc = await _get_entity_keyvalues(
+            tenant_id, f"urn:ngsi-ld:WeatherForecast:{tenant_id}:parcel-{suffix}"
+        ) or {}
+        block = fc.get("dayMinimum")
+        if isinstance(block, dict):
+            value = _num(block.get("temperature"))
+            if value is not None:
+                out["t_min"] = value
+        stamp = _stamp(fc.get("validFrom"))
+        if stamp:
+            out["valid_from"] = stamp
+    return out
+
+
 class HistoryReadFailed(Exception):
     """The history read did not complete — this is NOT "no history yet".
 

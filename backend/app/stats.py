@@ -25,26 +25,40 @@ logger = logging.getLogger(__name__)
 NO_DATA_ERROR = "No data for parcel at this metric/date"
 
 # Metrics a parcel-level scalar can stand in for when no raster covers the
-# parcel yet, and the key of the flat broker weather dict each one reads.
-_SCALAR_FALLBACK_KEYS = {
-    "temperature_avg": "t_avg",
-    "temperature_min": "t_min",
-    "solar_radiation": "solar_rad_w_m2",
-    "frost_risk": "t_min",
+# parcel yet: (key in the scalars dict, source). "observed" = running
+# WeatherObserved, "forecast" = WeatherForecast dayMinimum, the same inputs the
+# raster job reads.
+_SCALAR_FALLBACK = {
+    "temperature_avg": ("t_avg", "observed"),
+    "solar_radiation": ("solar_rad_w_m2", "observed"),
+    "temperature_min": ("t_min", "forecast"),
+    "frost_risk": ("t_min", "forecast"),
 }
+FALLBACK_METRICS = tuple(_SCALAR_FALLBACK)
 
 
-def scalar_fallback(metric: str, weather: dict[str, Any] | None) -> dict[str, Any] | None:
+def fallback_sources(metrics: list[str]) -> tuple[bool, bool]:
+    """(needs WeatherObserved, needs WeatherForecast) for *metrics*."""
+    srcs = {_SCALAR_FALLBACK[m][1] for m in metrics if m in _SCALAR_FALLBACK}
+    return "observed" in srcs, "forecast" in srcs
+
+
+def scalar_fallback(metric: str, scalars: dict[str, Any] | None) -> dict[str, Any] | None:
     """Parcel-level scalar for *metric*, or None when the broker lacks the input.
 
-    Never a default: a missing key yields None and the caller keeps its error.
-    The frost risk goes through the same function the raster uses, on one
-    pixel (no relative-elevation pooling, so the scalar is the no-pooling case).
+    Reads the same inputs as the raster job (running WeatherObserved for
+    temperature_avg and solar_radiation; WeatherForecast dayMinimum for
+    temperature_min and frost_risk). Never a default: a missing key yields None
+    and the caller keeps its error. Frost risk goes through the raster's own
+    function on a single pixel; relative elevation is then 0, i.e. the maximum
+    cold-air pooling term (2 C). The metric carries its own time: `observed_at`
+    is the source's timestamp, `valid_date` its date part.
     """
-    key = _SCALAR_FALLBACK_KEYS.get(metric)
-    if key is None or not weather:
+    spec = _SCALAR_FALLBACK.get(metric)
+    if spec is None or not scalars:
         return None
-    raw = weather.get(key)
+    key, source = spec
+    raw = scalars.get(key)
     if raw is None:
         return None
     value = float(raw)
@@ -52,9 +66,12 @@ def scalar_fallback(metric: str, weather: dict[str, Any] | None) -> dict[str, An
         from app.downscaler import compute_frost_risk
 
         value = float(compute_frost_risk(np.array([value]), np.array([0.0]))[0])
+    stamp = scalars.get("observed_at" if source == "observed" else "valid_from")
     return {
         "mean": value, "min": value, "max": value,
         "std": None, "fallback": "parcel_scalar",
+        "valid_date": stamp[:10] if stamp else None,
+        "observed_at": stamp,
     }
 
 
@@ -62,7 +79,7 @@ def needs_scalar_fallback(stats: dict[str, Any]) -> list[str]:
     """Metrics of *stats* that carry the no-data error and have a scalar fallback."""
     return [
         m for m, v in stats.get("metrics", {}).items()
-        if m in _SCALAR_FALLBACK_KEYS
+        if m in _SCALAR_FALLBACK
         and isinstance(v, dict) and v.get("error") == NO_DATA_ERROR
     ]
 

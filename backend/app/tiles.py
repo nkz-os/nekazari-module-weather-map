@@ -25,11 +25,18 @@ from app.tile_auth import make_tile_token, verify_tile_token
 from app.minio_io import download_cog, get_latest_date
 from app.color_scales import apply_color_scale
 from app.records import build_agri_parcel_record, guard_frozen_metrics
-from app.stats import compute_zonal_stats, needs_scalar_fallback, scalar_fallback
+from app.stats import (
+    FALLBACK_METRICS,
+    NO_DATA_ERROR,
+    compute_zonal_stats,
+    fallback_sources,
+    needs_scalar_fallback,
+    scalar_fallback,
+)
 from app.sources import (
     fetch_agri_parcel,
     fetch_entity_attr,
-    fetch_parcel_weather,
+    fetch_parcel_scalars,
     upsert_record,
 )
 
@@ -302,17 +309,34 @@ async def parcel_zonal_stats(
         stats["valid_date"] = stats["date"]
         stats["kind"] = "forecast_snapshot"
 
-    # 3c. Parcel not yet covered by a raster: a marked parcel scalar from the
-    # broker. Only for the latest raster (an explicit date asks for that raster)
-    # and never invented: no broker value, the error stays.
+    # 3c. Parcel not covered by a raster: a marked parcel scalar from the
+    # broker, each with its own time. Only for the latest raster (an explicit
+    # date asks for that raster) and never invented: no broker value, the error
+    # stays.
     if date is None:
-        pending = needs_scalar_fallback(stats)
+        no_raster = "error" in stats and not stats.get("metrics")
+        if no_raster:
+            pending = [m for m in metric_list if m in FALLBACK_METRICS]
+        else:
+            pending = needs_scalar_fallback(stats)
         if pending:
-            weather = await fetch_parcel_weather(tenant_id, parcel_id)
-            for metric in pending:
-                fallback = scalar_fallback(metric, weather)
-                if fallback is not None:
-                    stats["metrics"][metric] = fallback
+            obs, fc = fallback_sources(pending)
+            scalars = await fetch_parcel_scalars(
+                tenant_id, parcel_id, observed=obs, forecast=fc
+            )
+            resolved = {m: scalar_fallback(m, scalars) for m in pending}
+            resolved = {m: v for m, v in resolved.items() if v is not None}
+            if no_raster and resolved:
+                stats.pop("error", None)
+                stats["date"] = None
+                stats["valid_date"] = None
+                stats["kind"] = "parcel_scalar"
+                stats["metrics"] = {
+                    m: dict(resolved.get(m) or {"error": NO_DATA_ERROR})
+                    for m in metric_list
+                }
+            elif not no_raster:
+                stats["metrics"].update(resolved)
 
     # 4. Read phenology params from Orion-LD (if crop+stage provided)
     phenology = None

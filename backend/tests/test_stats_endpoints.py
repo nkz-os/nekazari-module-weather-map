@@ -218,7 +218,10 @@ def _uncovered_stats(metrics):
     }
 
 
-WEATHER = {"t_avg": 11.5, "t_min": 2.0, "solar_rad_w_m2": 180.0, "t_max": 20.0}
+WEATHER = {
+    "t_avg": 11.5, "t_min": 2.0, "solar_rad_w_m2": 180.0,
+    "observed_at": "2026-07-01T09:00:00Z", "valid_from": "2026-07-02T00:00:00Z",
+}
 
 
 def _get(client, metrics, **extra):
@@ -230,7 +233,7 @@ def _get(client, metrics, **extra):
 
 
 class TestStatsLabelsAndScalarFallback:
-    @patch("app.tiles.fetch_parcel_weather", new_callable=AsyncMock)
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats", return_value=SAMPLE_STATS)
     @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
     def test_stats_adds_kind_and_valid_date_keeping_date(
@@ -243,7 +246,7 @@ class TestStatsLabelsAndScalarFallback:
         assert data["kind"] == "forecast_snapshot"
         assert data["metrics"]["eto"]["mean"] == 4.2
 
-    @patch("app.tiles.fetch_parcel_weather", new_callable=AsyncMock)
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats")
     @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
     def test_uncovered_parcel_gets_scalar_fallback_marked(
@@ -256,12 +259,15 @@ class TestStatsLabelsAndScalarFallback:
         m = _get(client, ",".join(names)).json()["metrics"]
         expect = {"temperature_avg": 11.5, "temperature_min": 2.0, "solar_radiation": 180.0}
         for name, value in expect.items():
-            assert m[name] == {
-                "mean": value, "min": value, "max": value,
-                "std": None, "fallback": "parcel_scalar",
-            }
+            stamp = "2026-07-02" if name == "temperature_min" else "2026-07-01"
+            assert m[name]["fallback"] == "parcel_scalar"
+            assert m[name]["std"] is None
+            assert (m[name]["mean"], m[name]["min"], m[name]["max"]) == (value,) * 3
+            assert m[name]["valid_date"] == stamp
+        assert m["temperature_min"]["valid_date"] == "2026-07-02"
+        assert m["temperature_min"]["observed_at"] == "2026-07-02T00:00:00Z"
 
-    @patch("app.tiles.fetch_parcel_weather", new_callable=AsyncMock)
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats")
     @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
     def test_fallback_frost_risk_uses_same_function_as_raster(
@@ -279,7 +285,7 @@ class TestStatsLabelsAndScalarFallback:
         assert m["fallback"] == "parcel_scalar"
         assert m["std"] is None
 
-    @patch("app.tiles.fetch_parcel_weather", new_callable=AsyncMock)
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats")
     @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
     def test_fallback_without_broker_data_keeps_error(
@@ -298,7 +304,7 @@ class TestStatsLabelsAndScalarFallback:
         for name in names:
             assert m[name] == NO_DATA
 
-    @patch("app.tiles.fetch_parcel_weather", new_callable=AsyncMock)
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats", return_value=SAMPLE_STATS)
     @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
     def test_covered_parcel_never_uses_fallback(
@@ -309,7 +315,7 @@ class TestStatsLabelsAndScalarFallback:
         assert "fallback" not in data["metrics"]["eto"]
         mock_weather.assert_not_awaited()
 
-    @patch("app.tiles.fetch_parcel_weather", new_callable=AsyncMock)
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats")
     @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
     def test_explicit_date_never_uses_fallback(
@@ -322,7 +328,7 @@ class TestStatsLabelsAndScalarFallback:
         assert m["temperature_min"] == NO_DATA
         mock_weather.assert_not_awaited()
 
-    @patch("app.tiles.fetch_parcel_weather", new_callable=AsyncMock)
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats")
     @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
     def test_other_metrics_keep_their_error(
@@ -332,3 +338,91 @@ class TestStatsLabelsAndScalarFallback:
         mock_stats.return_value = _uncovered_stats(["eto"])
         mock_weather.return_value = dict(WEATHER)
         assert _get(client, "eto").json()["metrics"]["eto"] == NO_DATA
+
+
+NO_RASTER = {"error": "No COG data available", "metrics": {}}
+
+
+class TestNoRasterAndSources:
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
+    @patch("app.tiles.compute_zonal_stats", return_value=dict(NO_RASTER))
+    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
+    def test_tenant_without_raster_gets_scalar_fallback(
+        self, mock_fetch, mock_stats, mock_weather, client
+    ):
+        mock_fetch.return_value = SAMPLE_PARCEL
+        mock_weather.return_value = dict(WEATHER)
+        data = _get(client, "temperature_min,eto").json()
+        assert "error" not in data
+        assert data["valid_date"] is None
+        assert data["kind"] == "parcel_scalar"
+        assert data["metrics"]["temperature_min"]["fallback"] == "parcel_scalar"
+        assert data["metrics"]["eto"] == NO_DATA
+
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
+    @patch("app.tiles.compute_zonal_stats", return_value=dict(NO_RASTER))
+    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
+    def test_no_raster_and_no_broker_data_keeps_original_payload(
+        self, mock_fetch, mock_stats, mock_weather, client
+    ):
+        mock_fetch.return_value = SAMPLE_PARCEL
+        mock_weather.return_value = {}
+        data = _get(client, "temperature_min").json()
+        assert data["error"] == "No COG data available"
+        assert data["metrics"] == {}
+        assert "kind" not in data and "valid_date" not in data
+
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
+    @patch("app.tiles.compute_zonal_stats", return_value=dict(NO_RASTER))
+    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
+    def test_no_raster_explicit_date_never_uses_fallback(
+        self, mock_fetch, mock_stats, mock_weather, client
+    ):
+        mock_fetch.return_value = SAMPLE_PARCEL
+        data = _get(client, "temperature_min", date="2026-06-13").json()
+        assert data["error"] == "No COG data available"
+        mock_weather.assert_not_awaited()
+
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
+    @patch("app.tiles.compute_zonal_stats")
+    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
+    def test_stale_raster_and_fallback_metric_have_different_dates(
+        self, mock_fetch, mock_stats, mock_weather, client
+    ):
+        mock_fetch.return_value = SAMPLE_PARCEL
+        stats = _uncovered_stats(["temperature_min"])
+        stats["metrics"]["eto"] = SAMPLE_STATS["metrics"]["eto"]
+        mock_stats.return_value = stats
+        mock_weather.return_value = dict(WEATHER)
+        data = _get(client, "temperature_min,eto").json()
+        assert data["valid_date"] == "2026-06-13"
+        assert data["kind"] == "forecast_snapshot"
+        assert data["metrics"]["temperature_min"]["valid_date"] == "2026-07-02"
+        assert "valid_date" not in data["metrics"]["eto"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "metrics,expected",
+        [
+            (["temperature_avg"], ["WeatherObserved"]),
+            (["solar_radiation"], ["WeatherObserved"]),
+            (["temperature_min"], ["WeatherForecast"]),
+            (["frost_risk"], ["WeatherForecast"]),
+            (["temperature_avg", "frost_risk"], ["WeatherObserved", "WeatherForecast"]),
+        ],
+    )
+    async def test_reads_only_what_the_metrics_need(self, metrics, expected):
+        from app import sources
+        from app.stats import fallback_sources
+
+        obs, fc = fallback_sources(metrics)
+        with patch.object(
+            sources, "_get_entity_keyvalues", new_callable=AsyncMock
+        ) as get:
+            get.return_value = {"airTemperature": 10.0}
+            await sources.fetch_parcel_scalars(
+                "tenant-a", "urn:ngsi-ld:AgriParcel:p1", observed=obs, forecast=fc
+            )
+        ids = [c.args[1] for c in get.await_args_list]
+        assert [i.split(":")[2] for i in ids] == expected
+        assert not any(i.endswith("-daily") or "daily" in i for i in ids)
