@@ -8,13 +8,11 @@ puntero ANTERIOR. El registro publicaba los píxeles de ayer bajo un
 `observedAt` fresco: dato viejo presentado como actual, que es peor que un
 hueco porque el hueco sí se ve aguas abajo.
 
-Estos tests tampoco tocan la red: `fetch_metric_history` y la generación de
-PMTiles van mockeados. Sin eso ambos ejercían la rama `except` contra un DNS
+Estos tests tampoco tocan la red: `fetch_metric_history` va mockeado. Sin eso
+ejercía la rama `except` contra un DNS
 real y el CI seguía verde con el guard permanentemente roto.
 """
 
-import sys
-import types
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -38,12 +36,6 @@ def _no_network(monkeypatch):
         return []
 
     monkeypatch.setattr(records, "fetch_metric_history", _no_history)
-
-    # run_for_tenant importa pmtiles_generator dentro de la función y traga
-    # cualquier excepción; sin este stub el paso final hablaría con MinIO.
-    stub = types.ModuleType("app.pmtiles_generator")
-    stub.generate_all_pmtiles = lambda *a, **kw: {}
-    monkeypatch.setitem(sys.modules, "app.pmtiles_generator", stub)
 
 
 def _run(parcels, stats, upsert):
@@ -82,6 +74,25 @@ async def test_run_for_tenant_persists_record_for_each_parcel():
             "demo-coop", parcels, "2026-06-01", "2026-06-10",
         )
     assert upsert.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_invoke_pmtiles(monkeypatch):
+    """The run has no PMTiles step: no generator module, nothing imports it."""
+    import importlib.util
+    import sys
+
+    assert importlib.util.find_spec("app.pmtiles_generator") is None
+    monkeypatch.setitem(sys.modules, "app.pmtiles_generator", None)  # import would raise
+    parcels = [{"id": "urn:ngsi-ld:AgriParcel:p1", "lon": -1.5, "lat": 42.0}]
+    upsert = AsyncMock()
+    stats = {"date": _today(), "metrics": {"eto": {"mean": 3.5}}}
+    with _run(parcels, stats, upsert), patch.object(cog_generator.logger, "error") as err:
+        await cog_generator.run_for_tenant(
+            "demo-coop", parcels, "2026-06-01", "2026-06-10",
+        )
+    upsert.assert_awaited()
+    assert not any("PMTiles" in str(c) for c in err.call_args_list)
 
 
 @pytest.mark.asyncio
