@@ -1,6 +1,6 @@
 """COG generator — weather raster computation and MinIO upload.
 
-Runs periodically (every 5 days) to produce per-pixel weather rasters
+Runs daily to produce per-pixel weather rasters
 for each tenant's parcels.  Each raster is written as a Cloud-Optimized
 GeoTIFF (COG) and uploaded to MinIO under
 ``cogs/{tenant}/{metric}/{date}/{z}/{x}/{y}.tif``.
@@ -26,7 +26,7 @@ from app.downscaler import (
     correct_temperature,
     correct_solar_radiation,
     compute_eto,
-    clamp_ea_to_tmin,
+    clamp_ea_to_es,
     compute_water_balance,
     compute_frost_risk,
     compute_soil_moisture,
@@ -236,9 +236,6 @@ def _nearest_parcel(
 # parcel that contains it. Pixels in no parcel are nodata.
 _DAILY_METRICS = frozenset({"eto", "water_balance"})
 
-# Daily-mean W m-2 <-> MJ m-2 d-1 as correct_solar_radiation applies it.
-_W_PER_MJ = 11.6
-
 
 def _parcel_pixel_labels(
     parcels: list[dict[str, Any]], transform: Any, rows: int, cols: int,
@@ -341,12 +338,12 @@ async def _daily_metric_raster(
 
         t_min_px = correct_temperature(t_min, ref_elevation, elevations)
         t_max_px = correct_temperature(t_max, ref_elevation, elevations)
-        rs_surface_w = correct_solar_radiation(
-            rs_mj * _W_PER_MJ, pixel_lats, aspect, slope, doy,
-        )
+        # Horizontal Rs for net shortwave and cloudiness, as zone_accumulator
+        # does: the slope/aspect correction is not validated for daily ET0
+        # (P5 brings a validated model), so it is not applied.
         eto = compute_eto(
-            t_min_px, t_max_px, clamp_ea_to_tmin(ea_kpa, t_min_px), u2_ms,
-            rs_mj, rs_surface_w / _W_PER_MJ,
+            t_min_px, t_max_px, clamp_ea_to_es(ea_kpa, t_min_px, t_max_px), u2_ms,
+            rs_mj, np.full(elevations.shape, rs_mj, dtype=float),
             elevations, pixel_lats, doy,
         )
         result[mask] = eto[mask]
@@ -388,10 +385,13 @@ async def generate_cog_for_tile(
         Date range (``"YYYY-MM-DD"``).
     tile_center_lat, tile_center_lon : float
         Centre of the tile — used to pick the nearest parcel (weather base)
-        and, for ``soil_moisture``, the matching soil hydraulics.
+        and, for ``soil_moisture``, the matching soil hydraulics. Not used
+        for ``eto`` / ``water_balance``, which read the containing parcel.
     parcels : list[dict]
-        Tenant's parcels. The tile's weather (and soil) comes from the
-        parcel NEAREST to the tile centre, never ``parcels[0]``.
+        Tenant's parcels. For the metrics other than ``eto`` / ``water_balance``
+        the tile's weather (and soil) comes from the parcel NEAREST to the tile
+        centre, never ``parcels[0]``; ``eto`` / ``water_balance`` use, per
+        pixel, the parcel that contains it.
     weather_cache : dict or None
         Per-run cache, keyed by parcel id. The weather is identical for all
         seven metrics and for every tile sharing the same nearest parcel, so

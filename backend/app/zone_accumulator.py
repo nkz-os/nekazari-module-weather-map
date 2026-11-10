@@ -16,7 +16,7 @@ import geohash2
 import numpy as np
 
 from app.config import settings
-from app.downscaler import compute_zones, correct_temperature, compute_eto, clamp_ea_to_tmin
+from app.downscaler import compute_zones, correct_temperature, compute_eto, clamp_ea_to_es
 from app.records import build_agri_parcel_zone
 from app.stats import compute_zonal_stats
 from nkz_platform_sdk import OrionClient
@@ -294,7 +294,7 @@ async def process_parcel(
         t_max_z = float(correct_temperature(t_max, station_elev, np.array([elev_mean]))[0])
         eto = compute_eto(
             np.array([t_min_z]), np.array([t_max_z]),
-            clamp_ea_to_tmin(ea_kpa, np.array([t_min_z])), u2_ms,
+            clamp_ea_to_es(ea_kpa, np.array([t_min_z]), np.array([t_max_z])), u2_ms,
             rs_mj, np.array([rs_mj]),
             np.array([elev_mean]), np.array([zd["centroid"][1]]),
             doy,

@@ -568,26 +568,80 @@ async def test_water_balance_absent_when_window_incomplete(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_raster_ea_is_clamped_to_pixel_tmin_saturation(monkeypatch):
-    """Parcel reference far below the pixels (they are colder): a humid-day ea equal
-    to e0(Tmin_ref) would exceed e0(Tmin_px); the clamp must bring it under."""
+async def test_raster_ea_is_clamped_to_pixel_es(monkeypatch):
+    """A humid-day ea saturated at the reference Tmax exceeds es_px on pixels that
+    are colder; the clamp must bring it to es_px (VPD >= 0)."""
     from app import cog_generator as cg
-    from app.downscaler import _saturation_vapour_pressure
+    from app.downscaler import _saturation_vapour_pressure as e0
 
     seen: dict = {}
     real = cg.compute_eto
 
     def _spy(t_min, t_max, ea, *rest):
-        seen["t_min"], seen["ea"] = np.asarray(t_min), np.asarray(ea)
+        seen["t_min"], seen["t_max"], seen["ea"] = (
+            np.asarray(t_min), np.asarray(t_max), np.asarray(ea))
         return real(t_min, t_max, ea, *rest)
 
     monkeypatch.setattr(cg, "compute_eto", _spy)
-    humid = _daily(elevation_ref_m=100.0, ea_kpa=float(_saturation_vapour_pressure(15.0)))
+    humid = _daily(elevation_ref_m=100.0, ea_kpa=float(e0(30.0)))
     cog = await _daily_tile(cg, monkeypatch, "eto", {PARCEL_A["id"]: humid}, parcels=[PARCEL_A])
     assert cog is not None
-    bound = _saturation_vapour_pressure(seen["t_min"])
-    assert np.any(humid["ea_kpa"] > bound), "the clamp must be exercised"
-    assert np.all(seen["ea"] <= bound + 1e-12)
+    es_px = (e0(seen["t_min"]) + e0(seen["t_max"])) / 2.0
+    assert np.any(humid["ea_kpa"] > es_px), "the clamp must be exercised"
+    assert np.all(seen["ea"] <= es_px + 1e-12)
+
+
+@pytest.mark.asyncio
+async def test_flat_pixel_at_reference_equals_compute_eto_horizontal(monkeypatch):
+    """Horizontal Rs for both Rns and Rnl: at the reference elevation the raster
+    value is exactly compute_eto with rs_surface = rs_horizontal."""
+    from app import cog_generator as cg
+    from app.downscaler import compute_eto, clamp_ea_to_es
+
+    seen: dict = {}
+    real = cg.compute_eto
+
+    def _spy(t_min, t_max, ea, u2, rs_h, rs_s, z, lat, doy):
+        seen.update(rs_h=rs_h, rs_s=np.asarray(rs_s))
+        return real(t_min, t_max, ea, u2, rs_h, rs_s, z, lat, doy)
+
+    monkeypatch.setattr(cg, "compute_eto", _spy)
+    d = _daily(elevation_ref_m=500.0)
+    cog = await _daily_tile(cg, monkeypatch, "eto", {PARCEL_A["id"]: d}, parcels=[PARCEL_A])
+    assert np.all(seen["rs_s"] == d["rs_mj"]) and seen["rs_h"] == d["rs_mj"]
+    arr = _read(cog)
+    # pixel (row 0, col 0): elevation 500.0 == reference
+    t_min = np.array([d["t_min"]]); t_max = np.array([d["t_max"]])
+    expected = compute_eto(
+        t_min, t_max, clamp_ea_to_es(d["ea_kpa"], t_min, t_max), d["u2_ms"],
+        d["rs_mj"], np.array([d["rs_mj"]]), np.array([500.0]),
+        np.array([ORIGIN_LAT + PX / 2]), d["doy"],
+    )[0]
+    assert arr[-1, 0] == pytest.approx(expected, abs=0.05)
+
+
+@pytest.mark.asyncio
+async def test_eto_raster_independent_of_aspect(monkeypatch):
+    """Two pixels at the same elevation with different slope/aspect: same ET0."""
+    from app import cog_generator as cg
+
+    rows, cols = 10, 24
+    flat = np.full((rows, cols), 500.0)
+    monkeypatch.setattr(cg, "slope_degrees", lambda e, px: np.where(np.arange(cols) < 3, 0.0, 5.0)[None, :].repeat(rows, 0))
+    monkeypatch.setattr(cg, "aspect_degrees", lambda e, px: np.where(np.arange(cols) < 3, 0.0, 180.0)[None, :].repeat(rows, 0))
+    dem = _wide_dem()
+    dem["elevations"] = flat.tolist()
+    async def _fetch(t, pid):
+        return _daily(elevation_ref_m=500.0)
+    monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=dem))
+    monkeypatch.setattr(cg, "fetch_parcel_daily", _fetch)
+    cog = await cg.generate_cog_for_tile(
+        "demo-coop", "eto", 14, 8117, 6038, "2026-07-06", "2026-07-06",
+        42.8, -1.65, parcels=[PARCEL_A],
+    )
+    arr = _read(cog)
+    assert np.isfinite(arr[5, 1]) and np.isfinite(arr[5, 4])
+    assert arr[5, 1] == pytest.approx(arr[5, 4], abs=1e-4)
 
 
 def test_margin_pixels_take_the_parcel_and_exact_polygon_beats_neighbour_margin():

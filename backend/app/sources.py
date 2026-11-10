@@ -148,6 +148,8 @@ async def fetch_parcel_weather(tenant_id: str, parcel_id: str) -> dict | None:
 
     # Alias del @context: Orion devuelve el término que el productor NO usó.
     _put("t_avg", observed, "airTemperature", "temperature")
+    # rh_avg, wind_speed_ms and precip_mm are extracted but unused by callers
+    # (ET0 reads /daily); kept because tests and the alias handling cover them.
     _put("rh_avg", observed, "humidity", "relativeHumidity")
     _put("wind_speed_ms", observed, "windSpeed")
     _put("solar_rad_w_m2", observed, "solarRadiation")

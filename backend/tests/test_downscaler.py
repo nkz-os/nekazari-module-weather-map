@@ -57,6 +57,10 @@ class TestCorrectTemperature:
 class TestCorrectSolarRadiation:
     """Solar radiation correction for slope and aspect."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="slope radiation model broken, see PENDING; fixed in P5",
+    )
     def test_flat_surface_returns_base(self):
         """Flat surface (slope=0) with no clouds should give approx base value."""
         lat = np.full((2, 2), 40.0)
@@ -68,8 +72,8 @@ class TestCorrectSolarRadiation:
         result = correct_solar_radiation(rad_base, lat, aspect, slope, doy)
         assert result.shape == (2, 2)
         assert np.all(result >= 0)
-        # Flat surface should be close to base (within reasonable range)
-        assert np.all(result < 1200)
+        # Flat surface must return the base value.
+        np.testing.assert_allclose(result, rad_base, rtol=0.05)
 
     def test_south_vs_north(self):
         """South-facing slope gets more radiation than north-facing (northern hemisphere)."""
@@ -197,11 +201,11 @@ class TestComputeETo:
         np.testing.assert_allclose(above, at_rso)
 
     def test_overcast_floor(self):
-        """Rs/Rso is floored at 0.25: Rs = 0 and Rs = 0.25 Rso agree in Rnl."""
+        """Rs/Rso is floored at 0.3 (ASCE-EWRI 2005): Rs = 0 and Rs = 0.3 Rso agree in Rnl."""
         ra = extraterrestrial_radiation(np.array([40.0]), 180)
         rso = float(clear_sky_radiation(ra, np.array([100.0]))[0])
         zero = self._eto(rs=0.0, rs_surf=0.0)
-        floor = self._eto(rs=0.25 * rso, rs_surf=0.0)
+        floor = self._eto(rs=0.3 * rso, rs_surf=0.0)
         np.testing.assert_allclose(zero, floor)
 
     def test_higher_wind_raises_et0_in_dry_air(self):
@@ -556,34 +560,40 @@ class TestComputeZones:
         assert labels.shape == (0,)
 
 
-class TestClampEaToTmin:
-    """FAO-56: Tdew is close to Tmin, so ea <= e0(Tmin) bounds ea."""
+class TestClampEaToEs:
+    """VPD >= 0 per pixel: ea is bounded by es_px = (e0(Tmax)+e0(Tmin))/2."""
 
-    def test_clamps_where_pixel_is_colder_than_reference(self):
-        from app.downscaler import clamp_ea_to_tmin, _saturation_vapour_pressure
-        t_min = np.array([15.0, 15.0 - 6.5 * 5])  # pixel 500 m above reference
-        ea = _saturation_vapour_pressure(15.0)  # humid day: ea = e0(Tmin_ref)
-        out = clamp_ea_to_tmin(ea, t_min)
+    def test_ea_between_e0_tmin_and_es_is_unchanged_at_reference(self):
+        from app.downscaler import clamp_ea_to_es, _saturation_vapour_pressure as e0
+        t_min, t_max = np.array([10.0]), np.array([28.0])
+        es = float((e0(t_max) + e0(t_min))[0] / 2.0)
+        ea = float(e0(t_min)[0]) + 0.3  # dew point above Tmin, still below es
+        assert float(e0(t_min)[0]) < ea < es
+        out = clamp_ea_to_es(ea, t_min, t_max)
         assert out[0] == pytest.approx(ea)
-        assert out[1] < ea
-        assert out[1] == pytest.approx(float(_saturation_vapour_pressure(t_min[1])))
 
-    def test_vpd_non_negative_after_clamp_in_compute_eto(self):
-        from app.downscaler import clamp_ea_to_tmin, _saturation_vapour_pressure
+    def test_cold_pixel_is_clamped_to_es_and_vpd_is_zero(self):
+        from app.downscaler import clamp_ea_to_es, _saturation_vapour_pressure as e0
         t_min = np.array([15.0, 15.0 - 9.75])
         t_max = np.array([25.0, 25.0 - 9.75])
-        ea = float(_saturation_vapour_pressure(15.0))
-        es = (_saturation_vapour_pressure(t_max) + _saturation_vapour_pressure(t_min)) / 2.0
-        assert np.any(es - ea < 0), "unclamped ea must exceed es somewhere"
-        ea_px = clamp_ea_to_tmin(ea, t_min)
-        assert np.all(es - ea_px >= 0)
+        ea = float(e0(25.0))  # saturated at Tmax_ref: above es everywhere
+        es = (e0(t_max) + e0(t_min)) / 2.0
+        out = clamp_ea_to_es(ea, t_min, t_max)
+        np.testing.assert_allclose(out, es)
+        np.testing.assert_allclose(es - out, 0.0, atol=1e-12)
+
+    def test_compute_eto_non_negative_after_clamp(self):
+        from app.downscaler import clamp_ea_to_es
+        t_min = np.array([15.0, 15.0 - 9.75])
+        t_max = np.array([25.0, 25.0 - 9.75])
+        ea_px = clamp_ea_to_es(3.0, t_min, t_max)
         r = compute_eto(t_min, t_max, ea_px, 2.0, 20.0, np.full(2, 20.0),
                         np.array([600.0, 1100.0]), np.full(2, 40.0), 180)
         assert np.all(r >= 0)
 
     def test_logs_at_debug_when_it_clamps(self, caplog):
         import logging
-        from app.downscaler import clamp_ea_to_tmin
+        from app.downscaler import clamp_ea_to_es
         with caplog.at_level(logging.DEBUG, logger="app.downscaler"):
-            clamp_ea_to_tmin(5.0, np.array([0.0]))
+            clamp_ea_to_es(5.0, np.array([0.0]), np.array([5.0]))
         assert "clamp" in caplog.text.lower()

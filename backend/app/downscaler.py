@@ -179,21 +179,24 @@ def clear_sky_radiation(ra: np.ndarray, elevation_m: np.ndarray) -> np.ndarray:
     return (0.75 + 2e-5 * np.asarray(elevation_m, dtype=float)) * ra
 
 
-def clamp_ea_to_tmin(ea_kpa, t_min):
-    """Bound actual vapour pressure by e0(Tmin), per pixel.
+def clamp_ea_to_es(ea_kpa, t_min, t_max):
+    """Bound actual vapour pressure by the mean saturation pressure, per pixel.
 
-    FAO-56 (Allen et al. 1998, ch. 3, "Tdew ~ Tmin" assumption): dew point is
-    close to the daily minimum temperature, so ea cannot exceed e0(Tmin). A
-    scalar ea from the parcel reference can exceed it on pixels corrected to a
-    colder Tmin (supersaturation). Returns an array; logs at DEBUG when it clamps.
+    Physical bound VPD >= 0: ea <= es_px, with es_px = (e0(Tmax_px) + e0(Tmin_px)) / 2
+    (FAO-56 eq. 12). A scalar ea from the parcel reference can exceed es_px on
+    pixels corrected to a colder temperature (supersaturation). The stricter
+    ea <= e0(Tmin) bound was rejected: dew point is often above Tmin, so it
+    biased ET0 upward-of-truth on a fifth of the validation days.
+    Returns an array; logs at DEBUG when it clamps.
     """
     t_min = np.asarray(t_min, dtype=float)
-    bound = _saturation_vapour_pressure(t_min)
+    t_max = np.asarray(t_max, dtype=float)
+    bound = (_saturation_vapour_pressure(t_max) + _saturation_vapour_pressure(t_min)) / 2.0
     ea = np.broadcast_to(np.asarray(ea_kpa, dtype=float), bound.shape)
     clamped = ea > bound
     if np.any(clamped):
         logger.debug(
-            "ea clamped to e0(Tmin) on %d of %d pixels",
+            "ea clamped to es on %d of %d pixels",
             int(np.sum(clamped)), int(clamped.size),
         )
     return np.minimum(ea, bound)
@@ -222,10 +225,11 @@ def compute_eto(
         Wind speed at 2 m height (m s-1).
     rs_mj_horizontal : float
         Incoming solar radiation on a horizontal surface (MJ m-2 d-1); used
-        only for the cloudiness ratio Rs/Rso in net longwave.
+        for the cloudiness ratio Rs/Rso in net longwave.
     rs_mj_surface : np.ndarray
-        Solar radiation on the (slope/aspect-corrected) surface (MJ m-2 d-1);
-        used for net shortwave.
+        Solar radiation used for net shortwave (MJ m-2 d-1). Callers pass the
+        horizontal value: no validated daily slope model exists yet (planned
+        in the downscaling plan, P5), so no slope/aspect correction is applied.
     elevation_m, lat_deg : np.ndarray
         Pixel elevation (m) and latitude (degrees).
     doy : int
@@ -238,9 +242,10 @@ def compute_eto(
 
     Notes
     -----
-    Rs/Rso is clipped to [0.25, 1.0] (FAO-56 eq. 39 range; 0.25 is the ratio
-    of a fully overcast day, and 1.0 is clear sky). This also avoids a
+    Rs/Rso is clipped to [0.3, 1.0], the bounds of the ASCE-EWRI (2005)
+    standardized reference ET equation (1.0 is clear sky). This also avoids a
     division by zero where Rso -> 0 (polar winter). G = 0 for daily steps.
+    (0.25 is Rs/Ra under a fully overcast sky, not Rs/Rso.)
     """
     t_min = np.asarray(t_min, dtype=float)
     t_max = np.asarray(t_max, dtype=float)
@@ -255,9 +260,9 @@ def compute_eto(
     ra = extraterrestrial_radiation(lat_deg, doy)
     rso = clear_sky_radiation(ra, z)
     ratio = np.where(
-        rso > 1e-6, rs_mj_horizontal / np.maximum(rso, 1e-6), 0.25,
+        rso > 1e-6, rs_mj_horizontal / np.maximum(rso, 1e-6), 0.3,
     )
-    ratio = np.clip(ratio, 0.25, 1.0)
+    ratio = np.clip(ratio, 0.3, 1.0)
 
     rns = 0.77 * np.asarray(rs_mj_surface, dtype=float)  # eq. 38, albedo 0.23
     sigma = 4.903e-9  # MJ K-4 m-2 d-1
@@ -290,16 +295,17 @@ def compute_eto(
 
 def compute_water_balance(
     precip_5d_mm: float,
-    eto_5d_mm: np.ndarray,
-) -> np.ndarray:
+    eto_5d_mm: np.ndarray | float,
+) -> np.ndarray | float:
     """Compute a simple water balance (precip − ET₀).
 
     Parameters
     ----------
     precip_5d_mm : float
-        5‑day cumulative precipitation (mm).
-    eto_5d_mm : np.ndarray
-        5‑day cumulative reference evapotranspiration (mm).
+        5-day cumulative precipitation (mm).
+    eto_5d_mm : float or np.ndarray
+        5-day cumulative reference evapotranspiration (mm); a scalar in the
+        COG path (parcel value broadcast to its pixels).
 
     Returns
     -------
