@@ -407,7 +407,6 @@ class TestSoilMoistureWithoutSoil:
 # eto / water_balance: inputs from /daily, each pixel from its own parcel
 # ======================================================================
 
-import rasterio  # noqa: E402
 from rasterio import MemoryFile  # noqa: E402
 
 PX = 0.0001
@@ -611,7 +610,8 @@ async def test_flat_pixel_at_reference_equals_compute_eto_horizontal(monkeypatch
     assert np.all(seen["rs_s"] == d["rs_mj"]) and seen["rs_h"] == d["rs_mj"]
     arr = _read(cog)
     # pixel (row 0, col 0): elevation 500.0 == reference
-    t_min = np.array([d["t_min"]]); t_max = np.array([d["t_max"]])
+    t_min = np.array([d["t_min"]])
+    t_max = np.array([d["t_max"]])
     expected = compute_eto(
         t_min, t_max, clamp_ea_to_es(d["ea_kpa"], t_min, t_max), d["u2_ms"],
         d["rs_mj"], np.array([d["rs_mj"]]), np.array([500.0]),
