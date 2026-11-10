@@ -179,19 +179,6 @@ def clear_sky_radiation(ra: np.ndarray, elevation_m: np.ndarray) -> np.ndarray:
     return (0.75 + 2e-5 * np.asarray(elevation_m, dtype=float)) * ra
 
 
-def ea_from_rh(t_min, t_max, rh_pct):
-    """Actual vapour pressure (kPa) from mean RH and the Tmin/Tmax it applies to.
-
-    ea = RH/100 x es, es = mean of e°(Tmin), e°(Tmax) (FAO-56 eq. 12). Pass the
-    same (elevation-corrected) temperatures given to compute_eto so es - ea
-    stays >= 0 per pixel. TEMPORARY: Task 3 sources ea from /daily instead.
-    """
-    t_min = np.asarray(t_min, dtype=float)
-    t_max = np.asarray(t_max, dtype=float)
-    es = (_saturation_vapour_pressure(t_max) + _saturation_vapour_pressure(t_min)) / 2.0
-    return es * rh_pct / 100.0
-
-
 def compute_eto(
     t_min: np.ndarray,
     t_max: np.ndarray,

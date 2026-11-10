@@ -9,7 +9,6 @@ from app.downscaler import (
     compute_eto,
     extraterrestrial_radiation,
     clear_sky_radiation,
-    ea_from_rh,
     compute_water_balance,
     compute_frost_risk,
     compute_soil_moisture,
@@ -174,13 +173,13 @@ class TestComputeETo:
         rso = clear_sky_radiation(np.array([25.1]), np.array([0.0]))
         assert float(rso[0]) == pytest.approx(18.8, abs=0.05)
 
-    def test_ea_array_high_pixel_keeps_vpd_non_negative(self):
-        """ea derived per pixel from RH and the pixel's own Tmin/Tmax: es - ea >= 0 at +1000 m."""
+    def test_ea_array_is_accepted_per_pixel(self):
+        """compute_eto takes ea per pixel (array) as well as scalar."""
         t_min = np.array([15.0, 15.0 - 6.5])
         t_max = np.array([25.0, 25.0 - 6.5])
-        ea = ea_from_rh(t_min, t_max, 60.0)
         es = (0.6108 * np.exp(17.27 * t_max / (t_max + 237.3))
               + 0.6108 * np.exp(17.27 * t_min / (t_min + 237.3))) / 2.0
+        ea = es * 0.6
         assert np.all(ea <= es)
         assert np.all(es - ea >= 0)
         result = compute_eto(

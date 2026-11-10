@@ -6,8 +6,8 @@ Usage::
     COG_TENANTS="tenant1,tenant2" python3 scripts/run_cog_generator.py
 
 Runs ``run_for_tenant`` for each tenant ID listed in the ``COG_TENANTS``
-environment variable (comma-separated).  Over the last 5 days and uploads
-COGs to MinIO.
+environment variable (comma-separated), reads each parcel's weather from weather-api /daily
+(needs ``HMAC_SECRET``) and uploads COGs to MinIO.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 # Ensure /app is on the path (scripts/ runs from /app root in Docker)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,10 +44,11 @@ async def main() -> None:
         logger.warning("cog-generator: no tenants to process")
         return
 
+    # The run's own day. The 5-day look-back is no longer a window of this
+    # script: weather-api /daily supplies the running day and the last closed
+    # days, dated.
     date_to = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    date_from = (
-        datetime.now(timezone.utc) - timedelta(days=5)
-    ).strftime("%Y-%m-%d")
+    date_from = date_to
 
     for tenant_id in tenant_ids:
         logger.info(

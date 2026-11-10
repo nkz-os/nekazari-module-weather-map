@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 from nkz_platform_sdk import OrionClient
+from nkz_platform_sdk.crypto import generate_hmac_signature
 
 from app.config import settings
 from app.downscaler import saxton_rawls_ptf
@@ -168,6 +170,140 @@ async def fetch_parcel_weather(tenant_id: str, parcel_id: str) -> dict | None:
     if observed_at:
         out["observed_at"] = observed_at
 
+    return out
+
+
+# Days of closed weather the water balance sums, and the user id presented to
+# weather-api (it only needs to be non-empty and identify this caller).
+_BALANCE_DAYS = 5
+_DAILY_CALLER = "weather-map-worker"
+
+
+def _closed5(days: list[dict]) -> dict | None:
+    """Sum of the last 5 CLOSED days, or None unless all 5 are whole.
+
+    "Whole" means five consecutive dates, each with a numeric precipitation
+    and ET0. A shorter or gappy window is not presented as 5 days.
+    """
+    closed = sorted(
+        (d for d in days if d.get("kind") == "closed" and d.get("date")),
+        key=lambda d: d["date"],
+    )[-_BALANCE_DAYS:]
+    if len(closed) < _BALANCE_DAYS:
+        return None
+    try:
+        dates = [date.fromisoformat(d["date"]) for d in closed]
+    except ValueError:
+        return None
+    for prev, nxt in zip(dates, dates[1:]):
+        if nxt - prev != timedelta(days=1):
+            return None
+    precip = [_as_float(d.get("precip_mm")) for d in closed]
+    et0 = [_as_float(d.get("et0_mm")) for d in closed]
+    if any(v is None for v in precip) or any(v is None for v in et0):
+        return None
+    return {
+        "precip_mm": float(sum(precip)),
+        "et0_mm": float(sum(et0)),
+        "days": _BALANCE_DAYS,
+        "start": closed[0]["date"],
+        "end": closed[-1]["date"],
+    }
+
+
+async def fetch_parcel_daily(tenant_id: str, parcel_id: str) -> dict | None:
+    """One parcel's weather from weather-api ``/daily``: the running day's ET0
+    inputs and the last five closed days.
+
+    Returns ``None`` when the call cannot be made or fails (no secret, network
+    error, 401, 5xx): the caller skips the parcel and nothing is invented.
+    Otherwise a flat dict in which every key whose value is missing is
+    OMITTED, so ``require`` raises ``MissingWeatherInput``:
+
+    ``date`` / ``doy`` (the running day), ``t_min``, ``t_max``, ``ea_kpa``,
+    ``u2_ms`` (already at 2 m), ``rs_mj`` (MJ m-2 d-1, horizontal),
+    ``elevation_ref_m`` (the parcel altitude those temperatures refer to) and
+    ``closed5`` (sums over 5 whole closed days, else omitted).
+    """
+    secret = settings.hmac_secret
+    if not secret:
+        logger.error(
+            "fetch_parcel_daily(tenant=%s, parcel=%s): HMAC_SECRET is not set; "
+            "weather-api rejects unsigned calls, so none is made",
+            tenant_id, parcel_id,
+        )
+        return None
+
+    suffix = parcel_id.split(":")[-1]
+    today = datetime.now(timezone.utc).date()
+    params = {
+        "start": (today - timedelta(days=_BALANCE_DAYS)).isoformat(),
+        "end": today.isoformat(),
+        "forecast_days": 1,
+        "fill": "open_meteo",
+    }
+    headers = {
+        "X-Tenant-ID": tenant_id,
+        "X-User-ID": _DAILY_CALLER,
+        "X-Auth-Signature": generate_hmac_signature(secret, "", tenant_id),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{settings.weather_api_url}/api/weather/parcel/{suffix}/daily",
+                params=params,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+    except Exception:
+        logger.exception(
+            "fetch_parcel_daily(tenant=%s, parcel=%s) failed", tenant_id, parcel_id,
+        )
+        return None
+
+    days = body.get("days") if isinstance(body, dict) else None
+    if not isinstance(days, list):
+        logger.error(
+            "fetch_parcel_daily(tenant=%s, parcel=%s): no days in the response",
+            tenant_id, parcel_id,
+        )
+        return None
+
+    out: dict = {}
+    running = next((d for d in days if d.get("kind") == "running"), None)
+    if running is not None:
+        try:
+            run_date = date.fromisoformat(running["date"])
+        except (KeyError, ValueError):
+            run_date = None
+        if run_date is not None:
+            out["date"] = run_date.isoformat()
+            out["doy"] = run_date.timetuple().tm_yday
+        for key, field in (
+            ("t_min", "tmin_c"),
+            ("t_max", "tmax_c"),
+            ("ea_kpa", "vapour_pressure_kpa"),
+            ("u2_ms", "wind2m_ms"),
+            ("rs_mj", "radiation_mj_m2"),
+        ):
+            value = _as_float(running.get(field))
+            if value is not None:
+                out[key] = value
+
+    parcel = await _get_entity_keyvalues(
+        tenant_id, parcel_id if parcel_id.startswith("urn:") else f"urn:ngsi-ld:AgriParcel:{parcel_id}",
+    ) or {}
+    elevation = parcel.get("elevation")
+    if isinstance(elevation, dict):
+        elevation = elevation.get("value")
+    elevation = _as_float(elevation)
+    if elevation is not None:
+        out["elevation_ref_m"] = elevation
+
+    closed5 = _closed5(days)
+    if closed5 is not None:
+        out["closed5"] = closed5
     return out
 
 
@@ -597,6 +733,10 @@ async def fetch_entity_attr(
         await orion.close()
 
 
+_PARCEL_PAGE_SIZE = 100
+_PARCEL_MAX_PAGES = 100
+
+
 async def fetch_tenant_parcels(tenant_id: str) -> list[dict[str, Any]]:
     """Fetch all AgriParcel entities for a tenant from Orion-LD.
 
@@ -606,8 +746,18 @@ async def fetch_tenant_parcels(tenant_id: str) -> list[dict[str, Any]]:
     Returns a list of dicts with ``id``, ``location`` (GeoJSON geometry),
     and optionally ``name`` / ``description``.
 
+    Pages through every parcel (limit + offset until a short page).
     Returns an empty list on error or if no parcels exist.
     """
+    if not settings.context_url:
+        # An empty CONTEXT_URL turns the Link header into `<>`, which Orion
+        # answers with 400: say what is wrong instead of failing downstream.
+        logger.error(
+            "fetch_tenant_parcels(tenant=%s): CONTEXT_URL is not set; "
+            "cannot list parcels",
+            tenant_id,
+        )
+        return []
     headers = {
         "NGSILD-Tenant": tenant_id,
         "Fiware-Service": tenant_id,
@@ -622,41 +772,55 @@ async def fetch_tenant_parcels(tenant_id: str) -> list[dict[str, Any]]:
         "entities": [{"type": "AgriParcel"}],
         "attrs": ["location", "name", "description"],
     }
-    params = {"options": "keyValues"}
+    parcels: list[dict[str, Any]] = []
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{settings.orion_url}/ngsi-ld/v1/entityOperations/query",
-                params=params,
-                headers=headers,
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if not isinstance(data, list):
-                logger.warning(
-                    "fetch_tenant_parcels(tenant=%s): unexpected response type %s",
-                    tenant_id, type(data).__name__,
+            # Orion pages at 20 by default: ask for explicit pages and keep
+            # going until one comes back short.
+            for page_no in range(_PARCEL_MAX_PAGES):
+                resp = await client.post(
+                    f"{settings.orion_url}/ngsi-ld/v1/entityOperations/query",
+                    params={
+                        "options": "keyValues",
+                        "limit": _PARCEL_PAGE_SIZE,
+                        "offset": page_no * _PARCEL_PAGE_SIZE,
+                    },
+                    headers=headers,
+                    json=payload,
                 )
-                return []
+                resp.raise_for_status()
+                data = resp.json()
+                if not isinstance(data, list):
+                    logger.warning(
+                        "fetch_tenant_parcels(tenant=%s): unexpected response type %s",
+                        tenant_id, type(data).__name__,
+                    )
+                    return []
 
-            parcels = []
-            for entity in data[:100]:  # limit to first 100
-                location = entity.get("location")
-                if location is None:
-                    continue
-                parcel: dict[str, Any] = {
-                    "id": entity.get("id"),
-                    "location": location,
-                }
-                if entity.get("name") is not None:
-                    parcel["name"] = entity["name"]
-                if entity.get("description") is not None:
-                    parcel["description"] = entity["description"]
-                parcels.append(parcel)
+                for entity in data:
+                    location = entity.get("location")
+                    if location is None:
+                        continue
+                    parcel: dict[str, Any] = {
+                        "id": entity.get("id"),
+                        "location": location,
+                    }
+                    if entity.get("name") is not None:
+                        parcel["name"] = entity["name"]
+                    if entity.get("description") is not None:
+                        parcel["description"] = entity["description"]
+                    parcels.append(parcel)
 
-            return parcels
+                if len(data) < _PARCEL_PAGE_SIZE:
+                    return parcels
+            logger.error(
+                "fetch_tenant_parcels(tenant=%s): more than %d parcels, "
+                "refusing a truncated listing",
+                tenant_id, _PARCEL_MAX_PAGES * _PARCEL_PAGE_SIZE,
+            )
+            return []
     except Exception:
+        # Never hand back a partial listing as if it were the whole tenant.
         logger.exception(
             "fetch_tenant_parcels(tenant=%s) failed", tenant_id,
         )

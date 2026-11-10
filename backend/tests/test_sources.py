@@ -83,6 +83,11 @@ class TestDemTileBbox:
 class TestFetchTenantParcels:
     """Tests for fetch_tenant_parcels — mocked HTTP calls."""
 
+    @pytest.fixture(autouse=True)
+    def _context_url(self, monkeypatch):
+        from app import sources
+        monkeypatch.setattr(sources.settings, "context_url", "http://context.test/ctx.json")
+
     @staticmethod
     def _mock_client(response_data, raise_for_status=None):
         """Create a patched httpx.AsyncClient that returns *response_data*."""
@@ -232,20 +237,97 @@ class TestFetchTenantParcels:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_limits_to_100_parcels(self):
-        """Only the first 100 parcels are returned when more exist."""
-        many_parcels = [
+    async def test_parcel_listing_pages_past_20(self, monkeypatch):
+        """45 parcels come back whole: limit+offset until a short page."""
+        from app import sources
+        monkeypatch.setattr(sources, "_PARCEL_PAGE_SIZE", 20)
+        all_parcels = [
             {
                 "id": f"urn:ngsi-ld:AgriParcel:p{i}",
                 "type": "AgriParcel",
                 "location": {"type": "Point", "coordinates": [i, 0.0]},
             }
-            for i in range(150)
+            for i in range(45)
         ]
-        with self._mock_client(many_parcels) as _:
+        seen: list = []
+
+        async def _post(url, params=None, headers=None, json=None):
+            seen.append(dict(params))
+            lim = int(params["limit"])
+            off = int(params["offset"])
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = all_parcels[off:off + lim]
+            return resp
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.side_effect = _post
+        with patch("httpx.AsyncClient", return_value=mock_client):
             result = await fetch_tenant_parcels("test-tenant")
 
-        assert len(result) == 100
+        assert [p["id"] for p in result] == [p["id"] for p in all_parcels]
+        assert [int(s["offset"]) for s in seen] == [0, 20, 40]
+
+    @pytest.mark.asyncio
+    async def test_listing_stops_on_short_page(self):
+        pages = [
+            [{"id": f"urn:ngsi-ld:AgriParcel:p{i}", "location": {"type": "Point", "coordinates": [0, 0]}}
+             for i in range(100)],
+            [{"id": "urn:ngsi-ld:AgriParcel:last", "location": {"type": "Point", "coordinates": [0, 0]}}],
+        ]
+        calls = {"n": 0}
+
+        async def _post(url, params=None, headers=None, json=None):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = pages[calls["n"]]
+            calls["n"] += 1
+            return resp
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.side_effect = _post
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await fetch_tenant_parcels("test-tenant")
+        assert len(result) == 101 and calls["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_failure_on_a_later_page_returns_nothing(self):
+        """A partial listing is never returned as if it were the whole tenant."""
+        first = [{"id": f"urn:ngsi-ld:AgriParcel:p{i}", "location": {"type": "Point", "coordinates": [0, 0]}}
+                 for i in range(100)]
+        calls = {"n": 0}
+
+        async def _post(url, params=None, headers=None, json=None):
+            calls["n"] += 1
+            resp = MagicMock()
+            if calls["n"] == 1:
+                resp.raise_for_status = MagicMock()
+                resp.json.return_value = first
+            else:
+                resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+                    "400", request=MagicMock(), response=MagicMock(status_code=400))
+            return resp
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.side_effect = _post
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            assert await fetch_tenant_parcels("test-tenant") == []
+
+    @pytest.mark.asyncio
+    async def test_empty_context_url_is_refused_loudly(self, monkeypatch, caplog):
+        """An empty CONTEXT_URL sends `Link: <>`, which Orion answers with 400."""
+        from app import sources
+        monkeypatch.setattr(sources.settings, "context_url", "")
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            with caplog.at_level("ERROR"):
+                assert await fetch_tenant_parcels("test-tenant") == []
+        mock_client.post.assert_not_called()
+        assert "CONTEXT_URL" in caplog.text
 
 
 class TestCogPathFormat:
