@@ -554,3 +554,36 @@ class TestComputeZones:
         zones, labels = compute_zones(elev, aspect, slope)
         assert zones == []
         assert labels.shape == (0,)
+
+
+class TestClampEaToTmin:
+    """FAO-56: Tdew is close to Tmin, so ea <= e0(Tmin) bounds ea."""
+
+    def test_clamps_where_pixel_is_colder_than_reference(self):
+        from app.downscaler import clamp_ea_to_tmin, _saturation_vapour_pressure
+        t_min = np.array([15.0, 15.0 - 6.5 * 5])  # pixel 500 m above reference
+        ea = _saturation_vapour_pressure(15.0)  # humid day: ea = e0(Tmin_ref)
+        out = clamp_ea_to_tmin(ea, t_min)
+        assert out[0] == pytest.approx(ea)
+        assert out[1] < ea
+        assert out[1] == pytest.approx(float(_saturation_vapour_pressure(t_min[1])))
+
+    def test_vpd_non_negative_after_clamp_in_compute_eto(self):
+        from app.downscaler import clamp_ea_to_tmin, _saturation_vapour_pressure
+        t_min = np.array([15.0, 15.0 - 9.75])
+        t_max = np.array([25.0, 25.0 - 9.75])
+        ea = float(_saturation_vapour_pressure(15.0))
+        es = (_saturation_vapour_pressure(t_max) + _saturation_vapour_pressure(t_min)) / 2.0
+        assert np.any(es - ea < 0), "unclamped ea must exceed es somewhere"
+        ea_px = clamp_ea_to_tmin(ea, t_min)
+        assert np.all(es - ea_px >= 0)
+        r = compute_eto(t_min, t_max, ea_px, 2.0, 20.0, np.full(2, 20.0),
+                        np.array([600.0, 1100.0]), np.full(2, 40.0), 180)
+        assert np.all(r >= 0)
+
+    def test_logs_at_debug_when_it_clamps(self, caplog):
+        import logging
+        from app.downscaler import clamp_ea_to_tmin
+        with caplog.at_level(logging.DEBUG, logger="app.downscaler"):
+            clamp_ea_to_tmin(5.0, np.array([0.0]))
+        assert "clamp" in caplog.text.lower()

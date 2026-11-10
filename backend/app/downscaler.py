@@ -179,6 +179,26 @@ def clear_sky_radiation(ra: np.ndarray, elevation_m: np.ndarray) -> np.ndarray:
     return (0.75 + 2e-5 * np.asarray(elevation_m, dtype=float)) * ra
 
 
+def clamp_ea_to_tmin(ea_kpa, t_min):
+    """Bound actual vapour pressure by e0(Tmin), per pixel.
+
+    FAO-56 (Allen et al. 1998, ch. 3, "Tdew ~ Tmin" assumption): dew point is
+    close to the daily minimum temperature, so ea cannot exceed e0(Tmin). A
+    scalar ea from the parcel reference can exceed it on pixels corrected to a
+    colder Tmin (supersaturation). Returns an array; logs at DEBUG when it clamps.
+    """
+    t_min = np.asarray(t_min, dtype=float)
+    bound = _saturation_vapour_pressure(t_min)
+    ea = np.broadcast_to(np.asarray(ea_kpa, dtype=float), bound.shape)
+    clamped = ea > bound
+    if np.any(clamped):
+        logger.debug(
+            "ea clamped to e0(Tmin) on %d of %d pixels",
+            int(np.sum(clamped)), int(clamped.size),
+        )
+    return np.minimum(ea, bound)
+
+
 def compute_eto(
     t_min: np.ndarray,
     t_max: np.ndarray,

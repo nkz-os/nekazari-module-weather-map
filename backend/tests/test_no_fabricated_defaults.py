@@ -180,10 +180,9 @@ def test_ptf_requires_organic_matter_explicitly():
 
 def test_eto_inputs_come_from_daily_not_from_stand_ins():
     """ET0 inputs are the /daily running day's: no RH-derived ea, no look-back doy,
-    no x5 extrapolation of a single day."""
+    no look-back doy (the x5 extrapolation is covered by the water_balance tests)."""
     for name in ("cog_generator.py", "zone_accumulator.py"):
         text = (APP / name).read_text()
         assert "ea_from_rh" not in text, name
         assert "rh_avg" not in text, name
         assert "_date_to_doy(date_from)" not in text, name
-        assert "* 5" not in text, name

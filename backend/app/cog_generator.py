@@ -26,6 +26,7 @@ from app.downscaler import (
     correct_temperature,
     correct_solar_radiation,
     compute_eto,
+    clamp_ea_to_tmin,
     compute_water_balance,
     compute_frost_risk,
     compute_soil_moisture,
@@ -342,7 +343,7 @@ async def _daily_metric_raster(
             rs_mj * _W_PER_MJ, pixel_lats, aspect, slope, doy,
         )
         eto = compute_eto(
-            t_min_px, t_max_px, ea_kpa, u2_ms,
+            t_min_px, t_max_px, clamp_ea_to_tmin(ea_kpa, t_min_px), u2_ms,
             rs_mj, rs_surface_w / _W_PER_MJ,
             elevations, pixel_lats, doy,
         )

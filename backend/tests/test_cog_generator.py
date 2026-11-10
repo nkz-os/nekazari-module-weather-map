@@ -565,3 +565,46 @@ async def test_water_balance_absent_when_window_incomplete(monkeypatch):
     arr = _read(cog)
     assert np.allclose(arr[:, 0:5], -15.0)
     assert np.all(np.isnan(arr[:, 19:24]))
+
+
+@pytest.mark.asyncio
+async def test_raster_ea_is_clamped_to_pixel_tmin_saturation(monkeypatch):
+    """Parcel reference far below the pixels (they are colder): a humid-day ea equal
+    to e0(Tmin_ref) would exceed e0(Tmin_px); the clamp must bring it under."""
+    from app import cog_generator as cg
+    from app.downscaler import _saturation_vapour_pressure
+
+    seen: dict = {}
+    real = cg.compute_eto
+
+    def _spy(t_min, t_max, ea, *rest):
+        seen["t_min"], seen["ea"] = np.asarray(t_min), np.asarray(ea)
+        return real(t_min, t_max, ea, *rest)
+
+    monkeypatch.setattr(cg, "compute_eto", _spy)
+    humid = _daily(elevation_ref_m=100.0, ea_kpa=float(_saturation_vapour_pressure(15.0)))
+    cog = await _daily_tile(cg, monkeypatch, "eto", {PARCEL_A["id"]: humid}, parcels=[PARCEL_A])
+    assert cog is not None
+    bound = _saturation_vapour_pressure(seen["t_min"])
+    assert np.any(humid["ea_kpa"] > bound), "the clamp must be exercised"
+    assert np.all(seen["ea"] <= bound + 1e-12)
+
+
+def test_margin_pixels_take_the_parcel_and_exact_polygon_beats_neighbour_margin():
+    from app.cog_generator import _parcel_pixel_labels
+    from rasterio.transform import from_bounds
+
+    rows, cols = 4, 24
+    tr = from_bounds(ORIGIN_LON, ORIGIN_LAT, ORIGIN_LON + cols * PX, ORIGIN_LAT + rows * PX, cols, rows)
+    a = {"id": "a", "location": _box(0, 5, rows)}
+    b = {"id": "b", "location": _box(6, 12, rows)}  # 1 pixel gap, inside both margins
+    labels = _parcel_pixel_labels([a, b], tr, rows, cols)
+    assert np.all(labels[:, 0:5] == 0) and np.all(labels[:, 6:12] == 1)
+    # column 5 is in neither polygon: it takes a parcel from the margin pass
+    assert np.all(labels[:, 5] >= 0)
+    # b's exact pixels next to a are not stolen by a's margin
+    assert np.all(labels[:, 6] == 1)
+    # far from every parcel: nodata
+    assert np.all(labels[:, 18:24] == -1)
+    # the margin does not stretch beyond ~20 m (2 pixels): column 14+ is free
+    assert np.all(labels[:, 14] == -1)

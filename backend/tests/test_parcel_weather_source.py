@@ -338,3 +338,15 @@ async def test_missing_parcel_elevation_omits_reference(monkeypatch):
     _install_fake_weather_api(monkeypatch, _body(RUN_DAY), elevation=None)
     out = await sources.fetch_parcel_daily("tenant-a", PARCEL_URN)
     assert "elevation_ref_m" not in out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [0, 0.0, -5.0, float("nan"), float("inf")])
+async def test_non_positive_or_non_finite_elevation_is_unknown(monkeypatch, bad):
+    """Elevation <= 0 means unknown upstream: /daily temperatures then refer to the
+    model grid, so a 0 m reference would offset the per-pixel correction."""
+    from app import sources
+
+    _install_fake_weather_api(monkeypatch, _body(RUN_DAY), elevation=bad)
+    out = await sources.fetch_parcel_daily("tenant-a", PARCEL_URN)
+    assert "elevation_ref_m" not in out

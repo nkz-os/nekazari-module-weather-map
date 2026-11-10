@@ -298,8 +298,17 @@ async def fetch_parcel_daily(tenant_id: str, parcel_id: str) -> dict | None:
     if isinstance(elevation, dict):
         elevation = elevation.get("value")
     elevation = _as_float(elevation)
-    if elevation is not None:
+    # weather-api treats an elevation <= 0 as unknown and then returns
+    # temperatures for the model grid, not for the parcel: such a value is not a
+    # usable reference altitude.
+    if elevation is not None and math.isfinite(elevation) and elevation > 0:
         out["elevation_ref_m"] = elevation
+    elif elevation is not None:
+        logger.warning(
+            "fetch_parcel_daily(tenant=%s, parcel=%s): elevation %r is not a "
+            "usable reference altitude (needs a finite value > 0)",
+            tenant_id, parcel_id, elevation,
+        )
 
     closed5 = _closed5(days)
     if closed5 is not None:
