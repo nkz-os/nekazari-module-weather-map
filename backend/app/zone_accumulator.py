@@ -16,7 +16,7 @@ import geohash2
 import numpy as np
 
 from app.config import settings
-from app.downscaler import compute_zones, correct_temperature, compute_eto, _ea_from_mean_rh
+from app.downscaler import compute_zones, correct_temperature, compute_eto, ea_from_rh
 from app.records import build_agri_parcel_zone
 from app.stats import compute_zonal_stats
 from nkz_platform_sdk import OrionClient
@@ -294,7 +294,7 @@ async def process_parcel(
         # TEMPORARY adapter: Task 3 rewires inputs (ea, u2, Rs MJ) from /daily.
         eto = compute_eto(
             np.array([t_min_z]), np.array([t_max_z]),
-            _ea_from_mean_rh(t_min_z, t_max_z, rh), wind,
+            ea_from_rh(t_min_z, t_max_z, rh), wind,
             solar / 11.6, np.array([solar / 11.6]),
             np.array([elev_mean]), np.array([zd["centroid"][1]]),
             datetime.now(timezone.utc).timetuple().tm_yday,

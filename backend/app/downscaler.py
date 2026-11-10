@@ -179,20 +179,23 @@ def clear_sky_radiation(ra: np.ndarray, elevation_m: np.ndarray) -> np.ndarray:
     return (0.75 + 2e-5 * np.asarray(elevation_m, dtype=float)) * ra
 
 
-def _ea_from_mean_rh(t_min, t_max, rh_pct) -> float:
-    """TEMPORARY adapter (Task 3 replaces it with the /daily vapour pressure).
+def ea_from_rh(t_min, t_max, rh_pct):
+    """Actual vapour pressure (kPa) from mean RH and the Tmin/Tmax it applies to.
 
-    ea = mean RH x es, es = mean of e°(Tmin), e°(Tmax) — the derivation the
-    previous compute_eto did internally, from the callers' scalar inputs.
+    ea = RH/100 x es, es = mean of e°(Tmin), e°(Tmax) (FAO-56 eq. 12). Pass the
+    same (elevation-corrected) temperatures given to compute_eto so es - ea
+    stays >= 0 per pixel. TEMPORARY: Task 3 sources ea from /daily instead.
     """
-    es = (_saturation_vapour_pressure(float(t_max)) + _saturation_vapour_pressure(float(t_min))) / 2.0
-    return float(es * rh_pct / 100.0)
+    t_min = np.asarray(t_min, dtype=float)
+    t_max = np.asarray(t_max, dtype=float)
+    es = (_saturation_vapour_pressure(t_max) + _saturation_vapour_pressure(t_min)) / 2.0
+    return es * rh_pct / 100.0
 
 
 def compute_eto(
     t_min: np.ndarray,
     t_max: np.ndarray,
-    ea_kpa: float,
+    ea_kpa: np.ndarray | float,
     u2_ms: float,
     rs_mj_horizontal: float,
     rs_mj_surface: np.ndarray,
@@ -206,8 +209,8 @@ def compute_eto(
     ----------
     t_min, t_max : np.ndarray
         Daily minimum / maximum air temperature (°C). Tmean = (Tmax + Tmin) / 2.
-    ea_kpa : float
-        Actual vapour pressure (kPa).
+    ea_kpa : np.ndarray or float
+        Actual vapour pressure (kPa); scalar or per-pixel (broadcast).
     u2_ms : float
         Wind speed at 2 m height (m s-1).
     rs_mj_horizontal : float

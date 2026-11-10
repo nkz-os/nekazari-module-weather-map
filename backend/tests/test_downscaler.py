@@ -9,6 +9,7 @@ from app.downscaler import (
     compute_eto,
     extraterrestrial_radiation,
     clear_sky_radiation,
+    ea_from_rh,
     compute_water_balance,
     compute_frost_risk,
     compute_soil_moisture,
@@ -158,10 +159,35 @@ class TestComputeETo:
         ra = extraterrestrial_radiation(np.array([-20.0]), 246)
         assert float(ra[0]) == pytest.approx(32.2, abs=0.1)
 
-    def test_rso_example10(self):
-        """FAO-56 Example 10: Rso = (0.75 + 2e-5 z) Ra, z = 1800 m, Ra = 32.2 -> 25.3."""
-        rso = clear_sky_radiation(np.array([32.2]), np.array([1800.0]))
-        assert float(rso[0]) == pytest.approx(25.3, abs=0.1)
+    def test_ra_example18(self):
+        """FAO-56 Example 18: 50 deg 48' N (50.80), J = 187 -> Ra = 41.09 MJ m-2 d-1."""
+        ra = extraterrestrial_radiation(np.array([50.80]), 187)
+        assert float(ra[0]) == pytest.approx(41.09, abs=0.05)
+
+    def test_rso_example18(self):
+        """FAO-56 Example 18: Ra = 41.09, z = 100 m -> Rso = 30.90 MJ m-2 d-1."""
+        rso = clear_sky_radiation(np.array([41.09]), np.array([100.0]))
+        assert float(rso[0]) == pytest.approx(30.90, abs=0.01)
+
+    def test_rso_example11(self):
+        """FAO-56 Example 11: Ra = 25.1, sea level -> Rso = 0.75 Ra = 18.8."""
+        rso = clear_sky_radiation(np.array([25.1]), np.array([0.0]))
+        assert float(rso[0]) == pytest.approx(18.8, abs=0.05)
+
+    def test_ea_array_high_pixel_keeps_vpd_non_negative(self):
+        """ea derived per pixel from RH and the pixel's own Tmin/Tmax: es - ea >= 0 at +1000 m."""
+        t_min = np.array([15.0, 15.0 - 6.5])
+        t_max = np.array([25.0, 25.0 - 6.5])
+        ea = ea_from_rh(t_min, t_max, 60.0)
+        es = (0.6108 * np.exp(17.27 * t_max / (t_max + 237.3))
+              + 0.6108 * np.exp(17.27 * t_min / (t_min + 237.3))) / 2.0
+        assert np.all(ea <= es)
+        assert np.all(es - ea >= 0)
+        result = compute_eto(
+            t_min, t_max, ea, 2.0, 20.0, np.full(2, 20.0),
+            np.array([100.0, 1100.0]), np.full(2, 40.0), 180,
+        )
+        assert result.shape == (2,) and np.all(result >= 0)
 
     def test_rs_ratio_clipped(self):
         """Rs above Rso gives the same ET0 as Rs = Rso."""
@@ -211,7 +237,8 @@ class TestComputeETo:
         with caplog.at_level("WARNING"):
             result = self._eto(t_min=35.0, t_max=50.0, ea=0.1, u2=15.0, rs=35.0, lat=0.0, doy=80)
         assert np.all(result <= 15.0)
-        assert any("15" in r.message for r in caplog.records)
+        warns = [r for r in caplog.records if r.levelname == "WARNING" and "capped" in r.message]
+        assert len(warns) == 1
 
 
 class TestWaterBalance:
