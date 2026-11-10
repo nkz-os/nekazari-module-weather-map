@@ -26,6 +26,7 @@ from app.downscaler import (
     correct_temperature,
     correct_solar_radiation,
     compute_eto,
+    _ea_from_mean_rh,
     compute_water_balance,
     compute_frost_risk,
     compute_soil_moisture,
@@ -411,8 +412,10 @@ async def generate_cog_for_tile(
             solar_rad_w_m2, pixel_lats, aspect, slope, doy,
         )
         result = compute_eto(
-            t_avg_corrected, t_min_corrected, t_max_corrected,
-            rad_corrected, wind_speed_ms, rh_avg, elevations,
+            t_min_corrected, t_max_corrected,
+            _ea_from_mean_rh(t_min, t_max, rh_avg), wind_speed_ms,
+            solar_rad_w_m2 / 11.6, rad_corrected / 11.6,
+            elevations, pixel_lats, doy,
         )
 
     elif metric == "water_balance":
@@ -429,8 +432,10 @@ async def generate_cog_for_tile(
             solar_rad_w_m2, pixel_lats, aspect, slope, doy,
         )
         eto_daily = compute_eto(
-            t_avg_corrected, t_min_corrected, t_max_corrected,
-            rad_corrected, wind_speed_ms, rh_avg, elevations,
+            t_min_corrected, t_max_corrected,
+            _ea_from_mean_rh(t_min, t_max, rh_avg), wind_speed_ms,
+            solar_rad_w_m2 / 11.6, rad_corrected / 11.6,
+            elevations, pixel_lats, doy,
         )
         # Aggregate ET₀ to a single mean scalar × 5 days
         eto_5d = float(np.nanmean(eto_daily)) * 5
@@ -467,8 +472,10 @@ async def generate_cog_for_tile(
             solar_rad_w_m2, pixel_lats, aspect, slope, doy,
         )
         eto_daily = compute_eto(
-            t_avg_corrected, t_min_corrected, t_max_corrected,
-            rad_corrected, wind_speed_ms, rh_avg, elevations,
+            t_min_corrected, t_max_corrected,
+            _ea_from_mean_rh(t_min, t_max, rh_avg), wind_speed_ms,
+            solar_rad_w_m2 / 11.6, rad_corrected / 11.6,
+            elevations, pixel_lats, doy,
         )
         eto_5d = float(np.nanmean(eto_daily)) * 5
 
