@@ -350,3 +350,45 @@ async def test_non_positive_or_non_finite_elevation_is_unknown(monkeypatch, bad)
     _install_fake_weather_api(monkeypatch, _body(RUN_DAY), elevation=bad)
     out = await sources.fetch_parcel_daily("tenant-a", PARCEL_URN)
     assert "elevation_ref_m" not in out
+
+
+@pytest.mark.asyncio
+async def test_closed5_skips_unpublished_yesterday(monkeypatch):
+    # At the nightly run yesterday is often closed but not published yet
+    # (null values): the window is the latest 5 whole closed days before it.
+    from app import sources
+
+    body = _body(RUN_DAY, n_closed=7)
+    body["days"][-2]["precip_mm"] = None  # yesterday, the last closed day
+    body["days"][-2]["et0_mm"] = None
+    _install_fake_weather_api(monkeypatch, body)
+    out = await sources.fetch_parcel_daily("tenant-a", PARCEL_URN)
+    c5 = out["closed5"]
+    assert c5["days"] == 5
+    assert c5["start"] == "2026-06-30" and c5["end"] == "2026-07-04"
+
+
+@pytest.mark.asyncio
+async def test_closed5_absent_when_latest_whole_window_is_stale(monkeypatch):
+    # Whole days only up to 4 days before the running day: too old to stand
+    # for "the last 5 days".
+    from app import sources
+
+    body = _body(RUN_DAY, n_closed=9)
+    for d in body["days"][-4:-1]:
+        d["precip_mm"] = None
+        d["et0_mm"] = None
+    _install_fake_weather_api(monkeypatch, body)
+    out = await sources.fetch_parcel_daily("tenant-a", PARCEL_URN)
+    assert "closed5" not in out
+
+
+@pytest.mark.asyncio
+async def test_request_looks_back_far_enough(monkeypatch):
+    from app import sources
+
+    calls = _install_fake_weather_api(monkeypatch, _body(RUN_DAY))
+    await sources.fetch_parcel_daily("tenant-a", PARCEL_URN)
+    p = calls[0]["params"]
+    start, end = _dt.date.fromisoformat(p["start"]), _dt.date.fromisoformat(p["end"])
+    assert (end - start).days >= 8

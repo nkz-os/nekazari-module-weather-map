@@ -178,38 +178,54 @@ async def fetch_parcel_weather(tenant_id: str, parcel_id: str) -> dict | None:
 # Days of closed weather the water balance sums, and the user id presented to
 # weather-api (it only needs to be non-empty and identify this caller).
 _BALANCE_DAYS = 5
+# Closed days are requested this far back: at the nightly run yesterday is
+# often closed but not yet published, so the window may end earlier.
+_BALANCE_LOOKBACK_DAYS = 10
+# The window must end at most this many days before the running day; an older
+# window does not stand for "the last 5 days".
+_BALANCE_MAX_AGE_DAYS = 3
 _DAILY_CALLER = "weather-map-worker"
 
 
-def _closed5(days: list[dict]) -> dict | None:
-    """Sum of the last 5 CLOSED days, or None unless all 5 are whole.
+def _closed5(days: list[dict], running_day: date | None) -> dict | None:
+    """Sum of the latest 5 consecutive WHOLE closed days, or None.
 
-    "Whole" means five consecutive dates, each with a numeric precipitation
-    and ET0. A shorter or gappy window is not presented as 5 days.
+    "Whole" means a closed day with numeric precipitation and ET0. Closed days
+    without values (typically yesterday, not yet published at the nightly run)
+    are skipped, so the window may end before yesterday; it must still end at
+    most _BALANCE_MAX_AGE_DAYS before the running day. A shorter or gappy run
+    is never presented as 5 days.
     """
-    closed = sorted(
-        (d for d in days if d.get("kind") == "closed" and d.get("date")),
-        key=lambda d: d["date"],
-    )[-_BALANCE_DAYS:]
-    if len(closed) < _BALANCE_DAYS:
+    whole = []
+    for d in days:
+        if d.get("kind") != "closed" or not d.get("date"):
+            continue
+        p, e = _as_float(d.get("precip_mm")), _as_float(d.get("et0_mm"))
+        if p is None or e is None:
+            continue
+        try:
+            whole.append((date.fromisoformat(d["date"]), p, e))
+        except ValueError:
+            continue
+    whole.sort()
+    run: list = []
+    for item in reversed(whole):
+        if run and run[-1][0] - item[0] != timedelta(days=1):
+            break
+        run.append(item)
+        if len(run) == _BALANCE_DAYS:
+            break
+    if len(run) < _BALANCE_DAYS:
         return None
-    try:
-        dates = [date.fromisoformat(d["date"]) for d in closed]
-    except ValueError:
-        return None
-    for prev, nxt in zip(dates, dates[1:]):
-        if nxt - prev != timedelta(days=1):
-            return None
-    precip = [_as_float(d.get("precip_mm")) for d in closed]
-    et0 = [_as_float(d.get("et0_mm")) for d in closed]
-    if any(v is None for v in precip) or any(v is None for v in et0):
+    run.reverse()
+    if running_day is not None and (running_day - run[-1][0]).days > _BALANCE_MAX_AGE_DAYS:
         return None
     return {
-        "precip_mm": float(sum(precip)),
-        "et0_mm": float(sum(et0)),
+        "precip_mm": float(sum(p for _, p, _ in run)),
+        "et0_mm": float(sum(e for _, _, e in run)),
         "days": _BALANCE_DAYS,
-        "start": closed[0]["date"],
-        "end": closed[-1]["date"],
+        "start": run[0][0].isoformat(),
+        "end": run[-1][0].isoformat(),
     }
 
 
@@ -239,7 +255,7 @@ async def fetch_parcel_daily(tenant_id: str, parcel_id: str) -> dict | None:
     suffix = parcel_id.split(":")[-1]
     today = datetime.now(timezone.utc).date()
     params = {
-        "start": (today - timedelta(days=_BALANCE_DAYS)).isoformat(),
+        "start": (today - timedelta(days=_BALANCE_LOOKBACK_DAYS)).isoformat(),
         "end": today.isoformat(),
         "forecast_days": 1,
         "fill": "open_meteo",
@@ -273,6 +289,7 @@ async def fetch_parcel_daily(tenant_id: str, parcel_id: str) -> dict | None:
         return None
 
     out: dict = {}
+    run_date = None
     running = next((d for d in days if d.get("kind") == "running"), None)
     if running is not None:
         try:
@@ -312,7 +329,7 @@ async def fetch_parcel_daily(tenant_id: str, parcel_id: str) -> dict | None:
             tenant_id, parcel_id, elevation,
         )
 
-    closed5 = _closed5(days)
+    closed5 = _closed5(days, run_date)
     if closed5 is not None:
         out["closed5"] = closed5
     return out
