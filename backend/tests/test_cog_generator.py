@@ -676,3 +676,11 @@ def test_record_balance_window_from_daily_cache(monkeypatch):
     written.clear()
     cg._record_balance_window("t1", "2026-06-13", {"daily:a": {}})
     assert written == []
+
+
+def test_record_eto_method_writes_date_and_method(monkeypatch):
+    import app.cog_generator as cg
+    written = []
+    monkeypatch.setattr(cg, "set_window_meta", lambda t, m, meta: written.append((t, m, meta)))
+    cg._record_eto_method("t1", "2026-06-13")
+    assert written == [("t1", "eto", {"date": "2026-06-13", "method": "FAO-56 PM daily"})]

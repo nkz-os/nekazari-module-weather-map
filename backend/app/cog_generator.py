@@ -662,6 +662,18 @@ def _record_balance_window(
     })
 
 
+ETO_METHOD = "FAO-56 PM daily"
+
+
+def _record_eto_method(tenant_id: str, today: str) -> None:
+    """Mark the eto raster of *today* as built by the FAO-56 daily path.
+
+    /stats labels an eto raster only when this sidecar carries the raster's
+    date, so rasters from the previous method are never mislabelled.
+    """
+    set_window_meta(tenant_id, "eto", {"date": today, "method": ETO_METHOD})
+
+
 async def _generate_and_upload_cogs(
     tenant_id: str,
     parcels: list[dict[str, Any]],
@@ -770,6 +782,8 @@ async def _generate_and_upload_cogs(
             set_latest_date(tenant_id, metric, today)
             if metric == "water_balance":
                 _record_balance_window(tenant_id, today, weather_cache)
+            elif metric == "eto":
+                _record_eto_method(tenant_id, today)
         else:
             # No tiles today: do not keep serving an older raster as current.
             clear_latest_pointer(tenant_id, metric)

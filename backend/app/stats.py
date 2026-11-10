@@ -89,25 +89,30 @@ def label_metrics(tenant_id: str, stats: dict[str, Any]) -> None:
     """Add, in place, labels saying what each raster-derived number is.
 
     Additive only: no existing key changes. Scalar fallbacks and error entries
-    are left alone. The balance window comes from the sidecar the COG job wrote
-    for that raster date; if absent or for another date the dates are null.
+    are left alone. The labels come from the sidecar the COG job wrote for that
+    raster date; if it is absent or for another date, no label is added.
+    Blocking (MinIO): call it off the event loop.
     """
     metrics = stats.get("metrics") or {}
     eto = metrics.get("eto")
     if isinstance(eto, dict) and "error" not in eto and "fallback" not in eto:
-        eto["kind"] = "forecast_running_day"
-        eto["method"] = "FAO-56 PM daily"
+        meta = get_window_meta(tenant_id, "eto") or {}
+        # Only a raster built by the current code has a sidecar for its date;
+        # an older raster (different method) gets no label rather than a wrong one.
+        if meta.get("date") == stats.get("date") and meta.get("method"):
+            eto["kind"] = "forecast_running_day"
+            eto["method"] = meta["method"]
     wb = metrics.get("water_balance")
     if isinstance(wb, dict) and "error" not in wb and "fallback" not in wb:
         meta = get_window_meta(tenant_id, "water_balance") or {}
-        known = meta.get("date") == stats.get("date")
-        wb["kind"] = "closed_days"
-        wb["window_start"] = meta.get("window_start") if known else None
-        wb["window_end"] = meta.get("window_end") if known else None
-        wb["days"] = 5
-        # The raster (eto) is FAO-56 PM per pixel; the balance sums the
-        # provider's own ET0 for the parcel: not the same definition.
-        wb["et0_source"] = BALANCE_ET0_SOURCE
+        if meta.get("date") == stats.get("date"):
+            wb["kind"] = "closed_days"
+            wb["window_start"] = meta.get("window_start")
+            wb["window_end"] = meta.get("window_end")
+            wb["days"] = 5
+            # The raster (eto) is FAO-56 PM per pixel; the balance sums the
+            # provider's own ET0 for the parcel: not the same definition.
+            wb["et0_source"] = BALANCE_ET0_SOURCE
 
 
 def needs_scalar_fallback(stats: dict[str, Any]) -> list[str]:

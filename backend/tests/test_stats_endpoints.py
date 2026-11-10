@@ -224,6 +224,13 @@ WEATHER = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _no_minio_sidecar():
+    """label_metrics reads sidecars from MinIO; default to none (tests override)."""
+    with patch("app.stats.get_window_meta", return_value=None):
+        yield
+
+
 def _get(client, metrics, **extra):
     return client.get(
         "/api/weather-map/stats/demo-field-1",
@@ -273,7 +280,7 @@ class TestStatsLabelsAndScalarFallback:
     @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats")
     @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
-    def test_water_balance_window_not_invented_when_unrecorded(
+    def test_water_balance_has_no_label_when_sidecar_is_another_date(
         self, mock_fetch, mock_stats, mock_weather, mock_meta, client
     ):
         mock_fetch.return_value = SAMPLE_PARCEL
@@ -286,22 +293,66 @@ class TestStatsLabelsAndScalarFallback:
             "date": "2026-06-01", "window_start": "2026-05-27", "window_end": "2026-05-31",
         }
         wb = _get(client, "water_balance").json()["metrics"]["water_balance"]
-        assert wb["kind"] == "closed_days" and wb["days"] == 5
-        assert wb["window_start"] is None and wb["window_end"] is None
+        for key in ("kind", "window_start", "window_end", "days", "et0_source"):
+            assert key not in wb
+        assert wb["mean"] == -7.0
 
+    @patch("app.stats.get_window_meta")
     @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats", return_value=SAMPLE_STATS)
     @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
-    def test_eto_payload_labels_method(
-        self, mock_fetch, mock_stats, mock_weather, client
+    def test_eto_payload_labels_method_when_sidecar_matches(
+        self, mock_fetch, mock_stats, mock_weather, mock_meta, client
     ):
+        import copy
         mock_fetch.return_value = SAMPLE_PARCEL
+        mock_stats.return_value = copy.deepcopy(SAMPLE_STATS)  # label_metrics mutates
+        mock_meta.return_value = {"date": "2026-06-13", "method": "FAO-56 PM daily"}
         data = _get(client, "eto").json()
         eto = data["metrics"]["eto"]
         assert eto["kind"] == "forecast_running_day"
         assert eto["method"] == "FAO-56 PM daily"
         assert eto["mean"] == 4.2
         assert data["kind"] == "forecast_snapshot"
+
+    @pytest.mark.parametrize("meta", [
+        None,
+        {"date": "2026-06-01", "method": "FAO-56 PM daily"},
+    ])
+    @patch("app.stats.get_window_meta")
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
+    @patch("app.tiles.compute_zonal_stats", return_value=SAMPLE_STATS)
+    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
+    def test_eto_has_no_label_for_a_raster_not_built_by_the_new_code(
+        self, mock_fetch, mock_stats, mock_weather, mock_meta, meta, client
+    ):
+        import copy
+        mock_fetch.return_value = SAMPLE_PARCEL
+        mock_stats.return_value = copy.deepcopy(SAMPLE_STATS)  # label_metrics mutates
+        mock_meta.return_value = meta
+        eto = _get(client, "eto").json()["metrics"]["eto"]
+        assert "kind" not in eto and "method" not in eto
+        assert eto["mean"] == 4.2
+
+    @patch("app.stats.get_window_meta", return_value=None)
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
+    @patch("app.tiles.compute_zonal_stats", return_value=SAMPLE_STATS)
+    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
+    def test_label_metrics_runs_off_the_event_loop(
+        self, mock_fetch, mock_stats, mock_weather, mock_meta, client
+    ):
+        import asyncio as _asyncio
+        mock_fetch.return_value = SAMPLE_PARCEL
+        real = _asyncio.to_thread
+        seen = []
+
+        async def _spy(fn, *a, **k):
+            seen.append(fn.__name__)
+            return await real(fn, *a, **k)
+
+        with patch("app.tiles.asyncio.to_thread", _spy):
+            _get(client, "eto")
+        assert "label_metrics" in seen
 
     @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats")

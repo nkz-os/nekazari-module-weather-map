@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 from datetime import datetime, timezone
@@ -328,7 +329,7 @@ async def parcel_zonal_stats(
                 stats["metrics"].update(resolved)
 
     # 3d. Say what each raster-derived number is (additive keys only).
-    label_metrics(tenant_id, stats)
+    await asyncio.to_thread(label_metrics, tenant_id, stats)
 
     # 4. Read phenology params from Orion-LD (if crop+stage provided)
     phenology = None
