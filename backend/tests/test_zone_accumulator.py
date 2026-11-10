@@ -50,7 +50,7 @@ def test_gradient_flat_surface():
 #
 # Mismos dos invariantes que `generate_cog_for_tile`: sin meteo no se
 # fabrica nada, y la corrección de altitud va contra `reference_altitude_m`
-# (location[2] de WeatherObserved), nunca contra el grid del DEM.
+# (altitud de referencia de /daily), nunca contra el grid del DEM.
 # ======================================================================
 
 import logging  # noqa: E402
@@ -61,12 +61,14 @@ import pytest  # noqa: E402
 PARCEL = {"id": "urn:ngsi-ld:AgriParcel:p1", "lon": -1.65, "lat": 42.8}
 
 WEATHER = {
+    "date": "2026-09-02",
+    "doy": 245,
     "t_min": 17.3,
     "t_max": 32.2,
-    "rh_avg": 60.0,
-    "wind_speed_ms": 2.5,
-    "solar_rad_w_m2": 229.4,
-    "reference_altitude_m": 572.8,
+    "ea_kpa": 1.4,
+    "u2_ms": 2.5,
+    "rs_mj": 19.8,
+    "elevation_ref_m": 572.8,
 }
 
 DEM_BASE_ELEVATION = 1200.0
@@ -104,7 +106,7 @@ def zone_env(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_absent_observation_yields_no_zone_entities(zone_env, monkeypatch):
-    monkeypatch.setattr(zone_env, "fetch_parcel_weather", AsyncMock(return_value=None))
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=None))
     assert await zone_env.process_parcel("t", PARCEL, "2026-09-02") == []
 
 
@@ -116,7 +118,7 @@ async def test_incomplete_weather_publishes_nothing_and_computes_nothing(
     incomplete = {k: v for k, v in WEATHER.items() if k != "t_max"}
 
     monkeypatch.setattr(
-        zone_env, "fetch_parcel_weather", AsyncMock(return_value=incomplete),
+        zone_env, "fetch_parcel_daily", AsyncMock(return_value=incomplete),
     )
     monkeypatch.setattr(
         zone_env, "correct_temperature", lambda *a: physics_calls.append(a),
@@ -139,7 +141,7 @@ async def test_zone_correction_uses_the_observation_altitude(zone_env, monkeypat
         return np.asarray(pixel_elevations, dtype=float) * 0.0 + t_base
 
     monkeypatch.setattr(
-        zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)),
+        zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)),
     )
     monkeypatch.setattr(zone_env, "correct_temperature", _spy)
 
@@ -198,7 +200,7 @@ def test_assign_zone_ranks_stays_contiguous_with_duplicate_ids(caplog):
 @pytest.mark.asyncio
 async def test_colliding_zone_ids_yield_distinct_entities(zone_env, monkeypatch):
     monkeypatch.setattr(
-        zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)),
+        zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)),
     )
     monkeypatch.setattr(zone_env.geohash2, "encode", lambda *a, **k: "samecel")
     monkeypatch.setattr(zone_env.settings, "zones_elevation_band_m", 100000.0)
@@ -232,7 +234,7 @@ def _stats(mean_sr, mean_fr):
 
 @pytest.mark.asyncio
 async def test_zone_gets_radiation_and_frost_from_cog(zone_env, monkeypatch):
-    monkeypatch.setattr(zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
     calls = []
 
     def _fake(tenant, geom, metrics, date=None):
@@ -251,7 +253,7 @@ async def test_zone_gets_radiation_and_frost_from_cog(zone_env, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_frost_published_when_solar_cog_is_missing(zone_env, monkeypatch):
-    monkeypatch.setattr(zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
 
     def _fake(tenant, geom, metrics, date=None):
         if metrics[0] == "solar_radiation":
@@ -268,7 +270,7 @@ async def test_frost_published_when_solar_cog_is_missing(zone_env, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_zone_radiation_absent_without_cog(zone_env, monkeypatch):
-    monkeypatch.setattr(zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
     monkeypatch.setattr(
         zone_env, "compute_zonal_stats",
         lambda *a, **k: {"error": "No COG data available", "metrics": {}},
@@ -281,7 +283,7 @@ async def test_zone_radiation_absent_without_cog(zone_env, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_zone_stats_failure_is_isolated(zone_env, monkeypatch, caplog):
-    monkeypatch.setattr(zone_env, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
 
     def _boom(*a, **k):
         raise RuntimeError("minio down")
@@ -302,3 +304,36 @@ async def test_zone_without_geometry_skips_stats_no_parcel_fallback():
     with patch.object(za, "compute_zonal_stats") as m:
         assert await za._zone_cog_metrics("t", {"id": "z1"}) == ({}, set())
     m.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_zone_eto_uses_daily_inputs(zone_env, monkeypatch):
+    """Each zone's ET0 is compute_eto on the /daily running-day inputs, with the
+    running day's doy (not today's) and the zone's Tmin/Tmax."""
+    seen: list = []
+    real = zone_env.compute_eto
+
+    def _spy(t_min, t_max, ea, u2, rs_h, rs_s, z, lat, doy):
+        seen.append({"ea": ea, "u2": u2, "rs_h": rs_h, "doy": doy,
+                     "t_min": float(t_min[0]), "t_max": float(t_max[0])})
+        return real(t_min, t_max, ea, u2, rs_h, rs_s, z, lat, doy)
+
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
+    monkeypatch.setattr(zone_env, "compute_eto", _spy)
+    entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
+
+    assert entities and len(seen) == len(entities)
+    for call in seen:
+        assert call["ea"] == 1.4
+        assert call["u2"] == 2.5
+        assert call["rs_h"] == 19.8
+        assert call["doy"] == 245
+
+
+@pytest.mark.asyncio
+async def test_zone_missing_vapour_pressure_publishes_nothing(zone_env, monkeypatch, caplog):
+    no_ea = {k: v for k, v in WEATHER.items() if k != "ea_kpa"}
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=no_ea))
+    with caplog.at_level(logging.ERROR):
+        assert await zone_env.process_parcel("t", PARCEL, "2026-09-02") == []
+    assert "ea_kpa" in caplog.text

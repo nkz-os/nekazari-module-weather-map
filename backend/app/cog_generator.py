@@ -1,6 +1,6 @@
 """COG generator — weather raster computation and MinIO upload.
 
-Runs periodically (every 5 days) to produce per-pixel weather rasters
+Runs daily to produce per-pixel weather rasters
 for each tenant's parcels.  Each raster is written as a Cloud-Optimized
 GeoTIFF (COG) and uploaded to MinIO under
 ``cogs/{tenant}/{metric}/{date}/{z}/{x}/{y}.tif``.
@@ -26,16 +26,20 @@ from app.downscaler import (
     correct_temperature,
     correct_solar_radiation,
     compute_eto,
+    clamp_ea_to_es,
     compute_water_balance,
     compute_frost_risk,
     compute_soil_moisture,
 )
-from app.minio_io import clear_latest_pointer, set_latest_date, upload_cog
+from app.minio_io import (
+    clear_latest_pointer, set_latest_date, set_window_meta, upload_cog,
+)
 from app.records import build_agri_parcel_record, guard_frozen_metrics
 from app.sources import (
     MissingWeatherInput,
     fetch_parcel_hydraulics,
     fetch_dem_tile,
+    fetch_parcel_daily,
     fetch_parcel_weather,
     require,
     upsert_record,
@@ -228,6 +232,127 @@ def _nearest_parcel(
     return best
 
 
+# eto and water_balance read /daily and give every pixel the weather of the
+# parcel that contains it. Pixels in no parcel are nodata.
+_DAILY_METRICS = frozenset({"eto", "water_balance"})
+
+
+def _parcel_pixel_labels(
+    parcels: list[dict[str, Any]], transform: Any, rows: int, cols: int,
+) -> np.ndarray:
+    """Index of the parcel each pixel belongs to, -1 where there is none.
+
+    A pixel centre inside a parcel polygon takes that parcel. Pixels left over
+    inside the ~20 m clip margin of a parcel take it too, so a small parcel is
+    never left without a pixel; the exact polygon always wins over a margin.
+    """
+    from shapely.geometry import shape
+
+    polys: list[Any] = []
+    for parcel in parcels:
+        geom = _parcel_geometry(parcel)
+        poly = None
+        if geom is not None:
+            try:
+                poly = shape(geom)
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+            except Exception:
+                poly = None
+        polys.append(poly)
+
+    labels = np.full((rows, cols), -1, dtype=int)
+    for pass_margin in (0.0, _CLIP_MARGIN_DEG):
+        for idx, poly in enumerate(polys):
+            if poly is None or poly.is_empty:
+                continue
+            shape_i = poly.buffer(pass_margin) if pass_margin else poly
+            inside = geometry_mask(
+                [shape_i], out_shape=(rows, cols), transform=transform, invert=True,
+            )
+            labels[(labels < 0) & inside] = idx
+    return labels
+
+
+async def _daily_metric_raster(
+    tenant_id: str,
+    metric: str,
+    parcels: list[dict[str, Any]],
+    labels: np.ndarray,
+    weather_cache: dict[str, dict | None],
+    elevations: np.ndarray,
+    pixel_lats: np.ndarray,
+    slope: np.ndarray,
+    aspect: np.ndarray,
+    z: int, x: int, y: int,
+) -> np.ndarray | None:
+    """eto / water_balance raster, one parcel at a time; None if no pixel is valid."""
+    result = np.full(elevations.shape, np.nan, dtype=float)
+    for idx in sorted(int(i) for i in np.unique(labels) if i >= 0):
+        parcel_id = parcels[idx]["id"]
+        key = f"daily:{parcel_id}"
+        if key in weather_cache:
+            daily = weather_cache[key]
+        else:
+            daily = await fetch_parcel_daily(tenant_id, parcel_id)
+            weather_cache[key] = daily
+        if daily is None:
+            logger.warning(
+                "No /daily weather for parcel %s (tile %d/%d/%d, tenant=%s, metric=%s)",
+                parcel_id, z, x, y, tenant_id, metric,
+            )
+            continue
+        mask = labels == idx
+
+        if metric == "water_balance":
+            closed5 = daily.get("closed5")
+            if not closed5:
+                logger.warning(
+                    "Skipping water_balance for parcel %s (tenant=%s): fewer than "
+                    "5 closed days",
+                    parcel_id, tenant_id,
+                )
+                continue
+            result[mask] = compute_water_balance(
+                float(closed5["precip_mm"]), float(closed5["et0_mm"]),
+            )
+            continue
+
+        try:
+            t_min = require(daily, "t_min")
+            t_max = require(daily, "t_max")
+            ea_kpa = require(daily, "ea_kpa")
+            u2_ms = require(daily, "u2_ms")
+            rs_mj = require(daily, "rs_mj")
+            # The altitude the running-day temperatures refer to; the
+            # per-pixel correction is RELATIVE to it, never to the DEM grid.
+            ref_elevation = require(daily, "elevation_ref_m")
+            doy = int(require(daily, "doy"))
+        except MissingWeatherInput as exc:
+            logger.error(
+                "Skipping eto for parcel %s (tile %d/%d/%d, tenant=%s): missing "
+                "weather input, tried %s",
+                parcel_id, z, x, y, tenant_id, exc.keys,
+            )
+            continue
+
+        t_min_px = correct_temperature(t_min, ref_elevation, elevations)
+        t_max_px = correct_temperature(t_max, ref_elevation, elevations)
+        # Horizontal Rs for net shortwave and cloudiness, as zone_accumulator
+        # does: the slope/aspect correction is not validated for daily ET0
+        # (P5 brings a validated model), so it is not applied.
+        eto = compute_eto(
+            t_min_px, t_max_px, clamp_ea_to_es(ea_kpa, t_min_px, t_max_px), u2_ms,
+            rs_mj, np.full(elevations.shape, rs_mj, dtype=float),
+            elevations, pixel_lats, doy,
+        )
+        result[mask] = eto[mask]
+
+    if not np.any(np.isfinite(result)):
+        return None
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Per-tile COG computation
 # ---------------------------------------------------------------------------
@@ -260,10 +385,13 @@ async def generate_cog_for_tile(
         Date range (``"YYYY-MM-DD"``).
     tile_center_lat, tile_center_lon : float
         Centre of the tile — used to pick the nearest parcel (weather base)
-        and, for ``soil_moisture``, the matching soil hydraulics.
+        and, for ``soil_moisture``, the matching soil hydraulics. Not used
+        for ``eto`` / ``water_balance``, which read the containing parcel.
     parcels : list[dict]
-        Tenant's parcels. The tile's weather (and soil) comes from the
-        parcel NEAREST to the tile centre, never ``parcels[0]``.
+        Tenant's parcels. For the metrics other than ``eto`` / ``water_balance``
+        the tile's weather (and soil) comes from the parcel NEAREST to the tile
+        centre, never ``parcels[0]``; ``eto`` / ``water_balance`` use, per
+        pixel, the parcel that contains it.
     weather_cache : dict or None
         Per-run cache, keyed by parcel id. The weather is identical for all
         seven metrics and for every tile sharing the same nearest parcel, so
@@ -320,60 +448,7 @@ async def generate_cog_for_tile(
     aspect = aspect_degrees(elevations, pixel_size_deg)
 
     # ------------------------------------------------------------------
-    # 3. Nearest parcel → its weather from the broker (no defaults)
-    # ------------------------------------------------------------------
-    nearest_parcel = _nearest_parcel(parcels, tile_center_lat, tile_center_lon)
-    if nearest_parcel is None:
-        logger.warning(
-            "No parcel with usable coordinates for tile %d/%d/%d (tenant=%s)",
-            z, x, y, tenant_id,
-        )
-        return None
-    parcel_id = nearest_parcel["id"]
-    parcel_geom = _parcel_geometry(nearest_parcel)
-
-    if weather_cache is None:
-        weather_cache = {}
-    if parcel_id in weather_cache:
-        weather = weather_cache[parcel_id]
-    else:
-        # A missing observation is cached too — re-asking Orion once per tile
-        # for a parcel that has no weather is the expensive half of the bug.
-        weather = await fetch_parcel_weather(tenant_id, parcel_id)
-        weather_cache[parcel_id] = weather
-    if weather is None:
-        logger.warning(
-            "No weather observation for parcel %s (tile %d/%d/%d, tenant=%s)",
-            parcel_id, z, x, y, tenant_id,
-        )
-        return None
-
-    try:
-        t_avg = require(weather, "t_avg", "temperature_avg")
-        t_min = require(weather, "t_min", "temperature_min")
-        t_max = require(weather, "t_max", "temperature_max")
-        rh_avg = require(weather, "rh_avg", "humidity")
-        wind_speed_ms = require(weather, "wind_speed_ms", "wind_speed")
-        solar_rad_w_m2 = require(weather, "solar_rad_w_m2", "solar_radiation")
-        precip_mm = require(weather, "precip_mm", "precipitation")
-        # The altitude the readings are already downscaled to — the per-pixel
-        # correction below is RELATIVE to this, never to the DEM tile's own grid.
-        station_elevation = require(weather, "reference_altitude_m")
-    except MissingWeatherInput as exc:
-        logger.error(
-            "Skipping tile %d/%d/%d (tenant=%s, parcel=%s): missing weather input, tried %s",
-            z, x, y, tenant_id, parcel_id, exc.keys,
-        )
-        return None
-
-    doy = (
-        int(weather["doy"])
-        if "doy" in weather
-        else _date_to_doy(date_from)
-    )
-
-    # ------------------------------------------------------------------
-    # 4. Pixel coordinate grids
+    # 3. Pixel coordinate grids and raster transform
     # ------------------------------------------------------------------
     lon_grid = np.linspace(
         origin_lon, origin_lon + pixel_size_deg * cols, cols,
@@ -382,113 +457,6 @@ async def generate_cog_for_tile(
         origin_lat, origin_lat + pixel_size_deg * rows, rows,
     )
     pixel_lons, pixel_lats = np.meshgrid(lon_grid, lat_grid)
-
-    # ------------------------------------------------------------------
-    # 5. Dispatch to downscaler
-    # ------------------------------------------------------------------
-    if metric == "temperature_avg":
-        result = correct_temperature(t_avg, station_elevation, elevations)
-
-    elif metric == "temperature_min":
-        result = correct_temperature(t_min, station_elevation, elevations)
-
-    elif metric == "solar_radiation":
-        result = correct_solar_radiation(
-            solar_rad_w_m2, pixel_lats, aspect, slope, doy,
-        )
-
-    elif metric == "eto":
-        t_avg_corrected = correct_temperature(
-            t_avg, station_elevation, elevations,
-        )
-        t_min_corrected = correct_temperature(
-            t_min, station_elevation, elevations,
-        )
-        t_max_corrected = correct_temperature(
-            t_max, station_elevation, elevations,
-        )
-        rad_corrected = correct_solar_radiation(
-            solar_rad_w_m2, pixel_lats, aspect, slope, doy,
-        )
-        result = compute_eto(
-            t_avg_corrected, t_min_corrected, t_max_corrected,
-            rad_corrected, wind_speed_ms, rh_avg, elevations,
-        )
-
-    elif metric == "water_balance":
-        t_avg_corrected = correct_temperature(
-            t_avg, station_elevation, elevations,
-        )
-        t_min_corrected = correct_temperature(
-            t_min, station_elevation, elevations,
-        )
-        t_max_corrected = correct_temperature(
-            t_max, station_elevation, elevations,
-        )
-        rad_corrected = correct_solar_radiation(
-            solar_rad_w_m2, pixel_lats, aspect, slope, doy,
-        )
-        eto_daily = compute_eto(
-            t_avg_corrected, t_min_corrected, t_max_corrected,
-            rad_corrected, wind_speed_ms, rh_avg, elevations,
-        )
-        # Aggregate ET₀ to a single mean scalar × 5 days
-        eto_5d = float(np.nanmean(eto_daily)) * 5
-        result = compute_water_balance(
-            precip_mm * 5, np.full_like(elevations, eto_5d),
-        )
-
-    elif metric == "frost_risk":
-        t_min_corrected = correct_temperature(
-            t_min, station_elevation, elevations,
-        )
-        result = compute_frost_risk(t_min_corrected, elevations)
-
-    elif metric == "soil_moisture":
-        ptf = await fetch_parcel_hydraulics(tenant_id, parcel_id)
-        if ptf is None:
-            logger.warning(
-                "No soil hydraulics for parcel %s (tile %d/%d/%d, tenant=%s): "
-                "soil_moisture unavailable",
-                parcel_id, z, x, y, tenant_id,
-            )
-            return None
-
-        t_avg_corrected = correct_temperature(
-            t_avg, station_elevation, elevations,
-        )
-        t_min_corrected = correct_temperature(
-            t_min, station_elevation, elevations,
-        )
-        t_max_corrected = correct_temperature(
-            t_max, station_elevation, elevations,
-        )
-        rad_corrected = correct_solar_radiation(
-            solar_rad_w_m2, pixel_lats, aspect, slope, doy,
-        )
-        eto_daily = compute_eto(
-            t_avg_corrected, t_min_corrected, t_max_corrected,
-            rad_corrected, wind_speed_ms, rh_avg, elevations,
-        )
-        eto_5d = float(np.nanmean(eto_daily)) * 5
-
-        soil_moisture = compute_soil_moisture(
-            ptf["awc"], ptf["field_capacity"], ptf["wilting_point"],
-            precip_mm * 5, eto_5d,
-        )
-        # Broadcast the scalar moisture to match the tile array shape
-        result = np.full_like(elevations, soil_moisture)
-
-    else:
-        logger.warning(
-            "Unknown metric '%s' for tile %d/%d/%d",
-            metric, z, x, y,
-        )
-        return None
-
-    # ------------------------------------------------------------------
-    # 6. Write COG to in-memory bytes buffer
-    # ------------------------------------------------------------------
     transform = from_bounds(
         origin_lon, origin_lat,
         origin_lon + pixel_size_deg * cols,
@@ -496,6 +464,130 @@ async def generate_cog_for_tile(
         cols, rows,
     )
 
+    if weather_cache is None:
+        weather_cache = {}
+
+    parcel_geom = None
+    if metric in _DAILY_METRICS:
+        # ET0 and the 5-day balance: every pixel takes the /daily weather of
+        # the parcel that contains it (no nearest-parcel guess).
+        labels = _parcel_pixel_labels(parcels, transform, rows, cols)
+        result = await _daily_metric_raster(
+            tenant_id, metric, parcels, labels, weather_cache,
+            elevations, pixel_lats, slope, aspect, z, x, y,
+        )
+        if result is None:
+            logger.warning(
+                "No valid pixel for %s in tile %d/%d/%d (tenant=%s)",
+                metric, z, x, y, tenant_id,
+            )
+            return None
+    else:
+        # --------------------------------------------------------------
+        # 4. Nearest parcel -> its weather from the broker (no defaults)
+        # --------------------------------------------------------------
+        nearest_parcel = _nearest_parcel(parcels, tile_center_lat, tile_center_lon)
+        if nearest_parcel is None:
+            logger.warning(
+                "No parcel with usable coordinates for tile %d/%d/%d (tenant=%s)",
+                z, x, y, tenant_id,
+            )
+            return None
+        parcel_id = nearest_parcel["id"]
+        parcel_geom = _parcel_geometry(nearest_parcel)
+
+        if parcel_id in weather_cache:
+            weather = weather_cache[parcel_id]
+        else:
+            # A missing observation is cached too — re-asking Orion once per
+            # tile for a parcel that has no weather is the expensive half of
+            # the bug.
+            weather = await fetch_parcel_weather(tenant_id, parcel_id)
+            weather_cache[parcel_id] = weather
+        if weather is None:
+            logger.warning(
+                "No weather observation for parcel %s (tile %d/%d/%d, tenant=%s)",
+                parcel_id, z, x, y, tenant_id,
+            )
+            return None
+
+        try:
+            t_avg = require(weather, "t_avg", "temperature_avg")
+            t_min = require(weather, "t_min", "temperature_min")
+            solar_rad_w_m2 = require(weather, "solar_rad_w_m2", "solar_radiation")
+            # The altitude the readings are already downscaled to — the
+            # per-pixel correction below is RELATIVE to this, never to the DEM
+            # tile's own grid.
+            station_elevation = require(weather, "reference_altitude_m")
+        except MissingWeatherInput as exc:
+            logger.error(
+                "Skipping tile %d/%d/%d (tenant=%s, parcel=%s): missing weather input, tried %s",
+                z, x, y, tenant_id, parcel_id, exc.keys,
+            )
+            return None
+
+        # The run's own day (UTC), not the start of a look-back window.
+        doy = _date_to_doy(date_to)
+
+        # --------------------------------------------------------------
+        # 5. Dispatch to downscaler
+        # --------------------------------------------------------------
+        if metric == "temperature_avg":
+            result = correct_temperature(t_avg, station_elevation, elevations)
+
+        elif metric == "temperature_min":
+            result = correct_temperature(t_min, station_elevation, elevations)
+
+        elif metric == "solar_radiation":
+            result = correct_solar_radiation(
+                solar_rad_w_m2, pixel_lats, aspect, slope, doy,
+            )
+
+        elif metric == "frost_risk":
+            t_min_corrected = correct_temperature(
+                t_min, station_elevation, elevations,
+            )
+            result = compute_frost_risk(t_min_corrected, elevations)
+
+        elif metric == "soil_moisture":
+            ptf = await fetch_parcel_hydraulics(tenant_id, parcel_id)
+            if ptf is None:
+                logger.warning(
+                    "No soil hydraulics for parcel %s (tile %d/%d/%d, tenant=%s): "
+                    "soil_moisture unavailable",
+                    parcel_id, z, x, y, tenant_id,
+                )
+                return None
+            # The 5-day input comes from the same closed days as the balance.
+            key = f"daily:{parcel_id}"
+            if key not in weather_cache:
+                weather_cache[key] = await fetch_parcel_daily(tenant_id, parcel_id)
+            daily = weather_cache[key]
+            closed5 = (daily or {}).get("closed5")
+            if not closed5:
+                logger.warning(
+                    "No 5 closed days for parcel %s (tile %d/%d/%d, tenant=%s): "
+                    "soil_moisture unavailable",
+                    parcel_id, z, x, y, tenant_id,
+                )
+                return None
+            soil_moisture = compute_soil_moisture(
+                ptf["awc"], ptf["field_capacity"], ptf["wilting_point"],
+                float(closed5["precip_mm"]), float(closed5["et0_mm"]),
+            )
+            # Broadcast the scalar moisture to match the tile array shape
+            result = np.full_like(elevations, soil_moisture)
+
+        else:
+            logger.warning(
+                "Unknown metric '%s' for tile %d/%d/%d",
+                metric, z, x, y,
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    # 6. Write COG to in-memory bytes buffer
+    # ------------------------------------------------------------------
     # Clip the raster to the parcel polygon plus a small margin: a hard clip
     # on the exact boundary leaves edge pixels out and the raster does not
     # cover the whole parcel. ~20 m of slack (as the other raster modules do)
@@ -544,6 +636,42 @@ def _clear_all_pointers(tenant_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Orchestrator helpers
 # ---------------------------------------------------------------------------
+
+
+def _record_balance_window(
+    tenant_id: str, today: str, weather_cache: dict[str, dict | None],
+) -> None:
+    """Record the closed-day window the water_balance raster was built from.
+
+    Read from the same /daily responses the raster used. Parcels normally share
+    one window; if they differ the sidecar spans them (earliest start, latest
+    end). No parcel with a window: nothing is written, so /stats leaves the
+    dates null instead of guessing.
+    """
+    windows = [
+        d["closed5"] for k, d in weather_cache.items()
+        if k.startswith("daily:") and d and d.get("closed5")
+    ]
+    if not windows:
+        return
+    set_window_meta(tenant_id, "water_balance", {
+        "date": today,
+        "window_start": min(w["start"] for w in windows),
+        "window_end": max(w["end"] for w in windows),
+        "days": windows[0]["days"],
+    })
+
+
+ETO_METHOD = "FAO-56 PM daily"
+
+
+def _record_eto_method(tenant_id: str, today: str) -> None:
+    """Mark the eto raster of *today* as built by the FAO-56 daily path.
+
+    /stats labels an eto raster only when this sidecar carries the raster's
+    date, so rasters from the previous method are never mislabelled.
+    """
+    set_window_meta(tenant_id, "eto", {"date": today, "method": ETO_METHOD})
 
 
 async def _generate_and_upload_cogs(
@@ -652,6 +780,10 @@ async def _generate_and_upload_cogs(
 
         if success_count > 0:
             set_latest_date(tenant_id, metric, today)
+            if metric == "water_balance":
+                _record_balance_window(tenant_id, today, weather_cache)
+            elif metric == "eto":
+                _record_eto_method(tenant_id, today)
         else:
             # No tiles today: do not keep serving an older raster as current.
             clear_latest_pointer(tenant_id, metric)

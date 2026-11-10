@@ -4,7 +4,11 @@ Contains NumPy-based functions that operate on 2D arrays (256 × 256 grids).
 Each function takes one or more arrays and returns a corrected / derived array.
 """
 
+import logging
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -152,99 +156,137 @@ def correct_solar_radiation(
 # 3. Reference evapotranspiration (FAO Penman–Monteith)
 # ---------------------------------------------------------------------------
 
+def _saturation_vapour_pressure(t_c: np.ndarray) -> np.ndarray:
+    """FAO-56 eq. 11: saturation vapour pressure e°(T) in kPa."""
+    return 0.6108 * np.exp(17.27 * t_c / (t_c + 237.3))
+
+
+def extraterrestrial_radiation(lat_deg: np.ndarray, doy: int) -> np.ndarray:
+    """Daily extraterrestrial radiation Ra (MJ m-2 d-1), FAO-56 eq. 21-25."""
+    phi = np.radians(np.asarray(lat_deg, dtype=float))
+    dr = 1.0 + 0.033 * np.cos(2.0 * np.pi * doy / 365.0)
+    decl = 0.409 * np.sin(2.0 * np.pi * doy / 365.0 - 1.39)
+    # Sunset hour angle; the clip handles polar day/night (arccos domain).
+    ws = np.arccos(np.clip(-np.tan(phi) * np.tan(decl), -1.0, 1.0))
+    return (24.0 * 60.0 / np.pi) * 0.0820 * dr * (
+        ws * np.sin(phi) * np.sin(decl)
+        + np.cos(phi) * np.cos(decl) * np.sin(ws)
+    )
+
+
+def clear_sky_radiation(ra: np.ndarray, elevation_m: np.ndarray) -> np.ndarray:
+    """Clear-sky radiation Rso (MJ m-2 d-1), FAO-56 eq. 37: (0.75 + 2e-5 z) Ra."""
+    return (0.75 + 2e-5 * np.asarray(elevation_m, dtype=float)) * ra
+
+
+def clamp_ea_to_es(ea_kpa, t_min, t_max):
+    """Bound actual vapour pressure by the mean saturation pressure, per pixel.
+
+    Physical bound VPD >= 0: ea <= es_px, with es_px = (e0(Tmax_px) + e0(Tmin_px)) / 2
+    (FAO-56 eq. 12). A scalar ea from the parcel reference can exceed es_px on
+    pixels corrected to a colder temperature (supersaturation). The stricter
+    ea <= e0(Tmin) bound was rejected: dew point is often above Tmin, so it
+    biased ET0 upward-of-truth on a fifth of the validation days.
+    Returns an array; logs at DEBUG when it clamps.
+    """
+    t_min = np.asarray(t_min, dtype=float)
+    t_max = np.asarray(t_max, dtype=float)
+    bound = (_saturation_vapour_pressure(t_max) + _saturation_vapour_pressure(t_min)) / 2.0
+    ea = np.broadcast_to(np.asarray(ea_kpa, dtype=float), bound.shape)
+    clamped = ea > bound
+    if np.any(clamped):
+        logger.debug(
+            "ea clamped to es on %d of %d pixels",
+            int(np.sum(clamped)), int(clamped.size),
+        )
+    return np.minimum(ea, bound)
+
+
 def compute_eto(
-    t_avg: np.ndarray,
     t_min: np.ndarray,
     t_max: np.ndarray,
-    solar_rad: np.ndarray,
-    wind_speed: float,
-    rh: float,
+    ea_kpa: np.ndarray | float,
+    u2_ms: float,
+    rs_mj_horizontal: float,
+    rs_mj_surface: np.ndarray,
     elevation_m: np.ndarray,
+    lat_deg: np.ndarray,
+    doy: int,
 ) -> np.ndarray:
-    """FAO Penman–Monteith reference evapotranspiration per pixel.
+    """FAO-56 Penman-Monteith daily reference evapotranspiration per pixel.
 
     Parameters
     ----------
-    t_avg : np.ndarray
-        Mean daily air temperature (°C).
-    t_min : np.ndarray
-        Minimum daily air temperature (°C).
-    t_max : np.ndarray
-        Maximum daily air temperature (°C).
-    solar_rad : np.ndarray
-        Solar radiation at the surface (W m⁻²).
-    wind_speed : float
-        Wind speed at 2 m height (m s⁻¹).
-    rh : float
-        Relative humidity (%).
-    elevation_m : np.ndarray
-        Elevation (m).
+    t_min, t_max : np.ndarray
+        Daily minimum / maximum air temperature (°C). Tmean = (Tmax + Tmin) / 2.
+    ea_kpa : np.ndarray or float
+        Actual vapour pressure (kPa); scalar or per-pixel (broadcast).
+    u2_ms : float
+        Wind speed at 2 m height (m s-1).
+    rs_mj_horizontal : float
+        Incoming solar radiation on a horizontal surface (MJ m-2 d-1); used
+        for the cloudiness ratio Rs/Rso in net longwave.
+    rs_mj_surface : np.ndarray
+        Solar radiation used for net shortwave (MJ m-2 d-1). Callers pass the
+        horizontal value: no validated daily slope model exists yet (planned
+        in the downscaling plan, P5), so no slope/aspect correction is applied.
+    elevation_m, lat_deg : np.ndarray
+        Pixel elevation (m) and latitude (degrees).
+    doy : int
+        Day of year.
 
     Returns
     -------
     np.ndarray
-        Reference evapotranspiration (mm day⁻¹), clipped to [0, 15].
+        ET0 (mm d-1), >= 0. Capped at 15 only as a sanity guard (logged).
+
+    Notes
+    -----
+    Rs/Rso is clipped to [0.3, 1.0], the bounds of the ASCE-EWRI (2005)
+    standardized reference ET equation (1.0 is clear sky). This also avoids a
+    division by zero where Rso -> 0 (polar winter). G = 0 for daily steps.
+    (0.25 is Rs/Ra under a fully overcast sky, not Rs/Rso.)
     """
-    # --- 1. Atmospheric pressure (kPa) ---
-    P = 101.3 * ((293.0 - 0.0065 * elevation_m) / 293.0) ** 5.26
+    t_min = np.asarray(t_min, dtype=float)
+    t_max = np.asarray(t_max, dtype=float)
+    z = np.asarray(elevation_m, dtype=float)
 
-    # --- 2. Psychrometric constant (kPa °C⁻¹) ---
-    gamma = 0.665e-3 * P
+    t_mean = (t_max + t_min) / 2.0
+    pressure = 101.3 * ((293.0 - 0.0065 * z) / 293.0) ** 5.26  # eq. 7
+    gamma = 0.665e-3 * pressure  # eq. 8
+    delta = 4098.0 * _saturation_vapour_pressure(t_mean) / (t_mean + 237.3) ** 2  # eq. 13
+    es = (_saturation_vapour_pressure(t_max) + _saturation_vapour_pressure(t_min)) / 2.0  # eq. 12
 
-    # --- 3. Saturation vapour pressure (kPa) ---
-    es_tmin = 0.6108 * np.exp(17.27 * t_min / (t_min + 237.3))
-    es_tmax = 0.6108 * np.exp(17.27 * t_max / (t_max + 237.3))
-    es = (es_tmin + es_tmax) / 2.0
+    ra = extraterrestrial_radiation(lat_deg, doy)
+    rso = clear_sky_radiation(ra, z)
+    ratio = np.where(
+        rso > 1e-6, rs_mj_horizontal / np.maximum(rso, 1e-6), 0.3,
+    )
+    ratio = np.clip(ratio, 0.3, 1.0)
 
-    # --- 4. Actual vapour pressure (kPa) ---
-    ea = es * (rh / 100.0)
+    rns = 0.77 * np.asarray(rs_mj_surface, dtype=float)  # eq. 38, albedo 0.23
+    sigma = 4.903e-9  # MJ K-4 m-2 d-1
+    rnl = (
+        sigma
+        * ((t_max + 273.16) ** 4 + (t_min + 273.16) ** 4) / 2.0
+        * (0.34 - 0.14 * np.sqrt(ea_kpa))
+        * (1.35 * ratio - 0.35)
+    )  # eq. 39
+    rn = rns - rnl
 
-    # --- 5. Slope of saturation vapour pressure curve (kPa °C⁻¹) ---
-    #  es(T_avg) — use the mean-temperature saturation
-    es_tavg = 0.6108 * np.exp(17.27 * t_avg / (t_avg + 237.3))
-    delta = 4098.0 * es_tavg / (t_avg + 237.3) ** 2
+    numerator = (
+        0.408 * delta * rn  # G = 0
+        + gamma * 900.0 / (t_mean + 273.0) * u2_ms * (es - ea_kpa)
+    )
+    denominator = delta + gamma * (1.0 + 0.34 * u2_ms)
+    eto = np.maximum(numerator / denominator, 0.0)
 
-    # --- 6. Net radiation (MJ m⁻² day⁻¹) ---
-    # Convert solar_rad from W m⁻² to MJ m⁻² day⁻¹
-    Rs = solar_rad / 11.6  # MJ m⁻² day⁻¹
-
-    # Net shortwave: Rn_s = (1 - α) * Rs, α = 0.23 for grass
-    Rn_s = 0.77 * Rs
-
-    # Net longwave: Stefan–Boltzmann
-    sigma = 4.903e-9  # MJ m⁻² day⁻¹ K⁻⁴
-    t_avg_k = t_avg + 273.16
-    # KNOWN LIMITATION (documented 2026-07-18, not fixed): the cloudiness term is
-    # degenerate. Rs_rel is Rs divided by itself, i.e. identically 1.0 — equivalent
-    # to permanently clear sky, so net longwave loss is always at its maximum and
-    # ET0 is biased low on overcast days. FAO-56 wants Rs/Rso with Rso ≈ 0.75·Ra
-    # (Ra = extraterrestrial radiation, computable from latitude and day of year).
-    # Fixing it changes ET0 for every downstream consumer (water balance, crop
-    # stress, yield projection) and needs its own validation — hence not done here.
-    Rs_max = np.maximum(Rs, 1e-10)
-    Rs_rel = Rs / Rs_max
-    Rn_l = sigma * t_avg_k ** 4 * (0.34 - 0.14 * np.sqrt(ea)) * (1.35 * Rs_rel - 0.35)
-
-    Rn = Rn_s - Rn_l
-    Rn = np.maximum(Rn, 0.0)
-
-    # --- 7. Soil heat flux (negligible for daily) ---
-    G = 0.0
-
-    # --- 9. FAO-56 Eq. 6 ---
-    # Numerator term 1: radiation
-    term1 = 0.408 * delta * (Rn - G)
-    # Numerator term 2: aerodynamic
-    term2 = gamma * (900.0 / (t_avg + 273.0)) * wind_speed * (es - ea)
-    # Denominator
-    denom = delta + gamma * (1.0 + 0.34 * wind_speed)
-
-    ET0 = np.where(denom > 1e-10, (term1 + term2) / denom, 0.0)
-
-    # --- 10. Clip ---
-    ET0 = np.clip(ET0, 0.0, 15.0)
-
-    return ET0
+    if np.any(eto > 15.0):
+        logger.warning(
+            "ET0 above 15 mm/d capped (max=%.2f, pixels=%d)",
+            float(np.nanmax(eto)), int(np.sum(eto > 15.0)),
+        )
+    return np.minimum(eto, 15.0)
 
 
 # ---------------------------------------------------------------------------
@@ -253,16 +295,17 @@ def compute_eto(
 
 def compute_water_balance(
     precip_5d_mm: float,
-    eto_5d_mm: np.ndarray,
-) -> np.ndarray:
+    eto_5d_mm: np.ndarray | float,
+) -> np.ndarray | float:
     """Compute a simple water balance (precip − ET₀).
 
     Parameters
     ----------
     precip_5d_mm : float
-        5‑day cumulative precipitation (mm).
-    eto_5d_mm : np.ndarray
-        5‑day cumulative reference evapotranspiration (mm).
+        5-day cumulative precipitation (mm).
+    eto_5d_mm : float or np.ndarray
+        5-day cumulative reference evapotranspiration (mm); a scalar in the
+        COG path (parcel value broadcast to its pixels).
 
     Returns
     -------

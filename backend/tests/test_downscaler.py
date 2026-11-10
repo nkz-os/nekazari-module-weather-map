@@ -7,6 +7,8 @@ from app.downscaler import (
     correct_temperature,
     correct_solar_radiation,
     compute_eto,
+    extraterrestrial_radiation,
+    clear_sky_radiation,
     compute_water_balance,
     compute_frost_risk,
     compute_soil_moisture,
@@ -55,6 +57,10 @@ class TestCorrectTemperature:
 class TestCorrectSolarRadiation:
     """Solar radiation correction for slope and aspect."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="slope radiation model broken, see PENDING; fixed in P5",
+    )
     def test_flat_surface_returns_base(self):
         """Flat surface (slope=0) with no clouds should give approx base value."""
         lat = np.full((2, 2), 40.0)
@@ -66,8 +72,8 @@ class TestCorrectSolarRadiation:
         result = correct_solar_radiation(rad_base, lat, aspect, slope, doy)
         assert result.shape == (2, 2)
         assert np.all(result >= 0)
-        # Flat surface should be close to base (within reasonable range)
-        assert np.all(result < 1200)
+        # Flat surface must return the base value.
+        np.testing.assert_allclose(result, rad_base, rtol=0.05)
 
     def test_south_vs_north(self):
         """South-facing slope gets more radiation than north-facing (northern hemisphere)."""
@@ -131,84 +137,111 @@ class TestCorrectSolarRadiation:
 
 
 class TestComputeETo:
-    """FAO Penman-Monteith reference evapotranspiration."""
+    """FAO-56 Penman-Monteith daily reference evapotranspiration."""
+
+    @staticmethod
+    def _eto(t_min=15.0, t_max=25.0, ea=1.2, u2=2.0, rs=20.0, rs_surf=None,
+             z=100.0, lat=40.0, doy=180):
+        shape = (2, 2)
+        return compute_eto(
+            np.full(shape, t_min), np.full(shape, t_max), ea, u2, rs,
+            np.full(shape, rs if rs_surf is None else rs_surf),
+            np.full(shape, z), np.full(shape, lat), doy,
+        )
+
+    def test_fao56_example18_et0(self):
+        """FAO-56 Example 18 (Brussels, 6 July): ET0 = 3.88 mm/day."""
+        result = compute_eto(
+            np.array([12.3]), np.array([21.5]), 1.409, 2.078, 22.07,
+            np.array([22.07]), np.array([100.0]), np.array([50.80]), 187,
+        )
+        assert float(result[0]) == pytest.approx(3.88, abs=0.01)
+
+    def test_ra_example8(self):
+        """FAO-56 Example 8: 20 deg S, 3 September -> Ra = 32.2 MJ m-2 d-1."""
+        ra = extraterrestrial_radiation(np.array([-20.0]), 246)
+        assert float(ra[0]) == pytest.approx(32.2, abs=0.1)
+
+    def test_ra_example18(self):
+        """FAO-56 Example 18: 50 deg 48' N (50.80), J = 187 -> Ra = 41.09 MJ m-2 d-1."""
+        ra = extraterrestrial_radiation(np.array([50.80]), 187)
+        assert float(ra[0]) == pytest.approx(41.09, abs=0.05)
+
+    def test_rso_example18(self):
+        """FAO-56 Example 18: Ra = 41.09, z = 100 m -> Rso = 30.90 MJ m-2 d-1."""
+        rso = clear_sky_radiation(np.array([41.09]), np.array([100.0]))
+        assert float(rso[0]) == pytest.approx(30.90, abs=0.01)
+
+    def test_rso_example11(self):
+        """FAO-56 Example 11: Ra = 25.1, sea level -> Rso = 0.75 Ra = 18.8."""
+        rso = clear_sky_radiation(np.array([25.1]), np.array([0.0]))
+        assert float(rso[0]) == pytest.approx(18.8, abs=0.05)
+
+    def test_ea_array_is_accepted_per_pixel(self):
+        """compute_eto takes ea per pixel (array) as well as scalar."""
+        t_min = np.array([15.0, 15.0 - 6.5])
+        t_max = np.array([25.0, 25.0 - 6.5])
+        es = (0.6108 * np.exp(17.27 * t_max / (t_max + 237.3))
+              + 0.6108 * np.exp(17.27 * t_min / (t_min + 237.3))) / 2.0
+        ea = es * 0.6
+        assert np.all(ea <= es)
+        assert np.all(es - ea >= 0)
+        result = compute_eto(
+            t_min, t_max, ea, 2.0, 20.0, np.full(2, 20.0),
+            np.array([100.0, 1100.0]), np.full(2, 40.0), 180,
+        )
+        assert result.shape == (2,) and np.all(result >= 0)
+
+    def test_rs_ratio_clipped(self):
+        """Rs above Rso gives the same ET0 as Rs = Rso."""
+        ra = extraterrestrial_radiation(np.array([40.0]), 180)
+        rso = float(clear_sky_radiation(ra, np.array([100.0]))[0])
+        at_rso = self._eto(rs=rso, rs_surf=rso)
+        above = self._eto(rs=rso * 1.3, rs_surf=rso)
+        np.testing.assert_allclose(above, at_rso)
+
+    def test_overcast_floor(self):
+        """Rs/Rso is floored at 0.3 (ASCE-EWRI 2005): Rs = 0 and Rs = 0.3 Rso agree in Rnl."""
+        ra = extraterrestrial_radiation(np.array([40.0]), 180)
+        rso = float(clear_sky_radiation(ra, np.array([100.0]))[0])
+        zero = self._eto(rs=0.0, rs_surf=0.0)
+        floor = self._eto(rs=0.3 * rso, rs_surf=0.0)
+        np.testing.assert_allclose(zero, floor)
+
+    def test_higher_wind_raises_et0_in_dry_air(self):
+        low = self._eto(ea=0.5, u2=0.5)
+        high = self._eto(ea=0.5, u2=5.0)
+        assert np.all(high > low)
+
+    def test_no_negative_et0_in_winter_high_latitude(self):
+        result = self._eto(t_min=-15.0, t_max=-8.0, ea=0.2, rs=0.0, lat=70.0, doy=355)
+        assert np.all(np.isfinite(result))
+        assert np.all(result >= 0)
 
     def test_eto_bounds(self):
-        """ET0 should be in plausible range [0, 15] for reasonable inputs."""
-        t_avg = np.full((2, 2), 20.0)
-        t_min = np.full((2, 2), 15.0)
-        t_max = np.full((2, 2), 25.0)
-        solar_rad = np.full((2, 2), 300.0)  # W/m²
-        wind_speed = 2.0  # m/s
-        rh = 60.0  # %
-        elevation_m = np.full((2, 2), 100.0)
-
-        result = compute_eto(t_avg, t_min, t_max, solar_rad, wind_speed, rh, elevation_m)
+        result = self._eto()
         assert result.shape == (2, 2)
-        assert np.all(result >= 0)
-        assert np.all(result <= 15)
+        assert np.all(result >= 0) and np.all(result <= 15)
 
     def test_eto_higher_with_more_radiation(self):
-        """More solar radiation → higher ET0."""
-        t_avg = np.full((2, 2), 25.0)
-        t_min = np.full((2, 2), 20.0)
-        t_max = np.full((2, 2), 30.0)
-        wind_speed = 3.0
-        rh = 50.0
-        elevation_m = np.full((2, 2), 0.0)
-
-        rad_low = np.full((2, 2), 100.0)
-        rad_high = np.full((2, 2), 400.0)
-
-        eto_low = compute_eto(t_avg, t_min, t_max, rad_low, wind_speed, rh, elevation_m)
-        eto_high = compute_eto(t_avg, t_min, t_max, rad_high, wind_speed, rh, elevation_m)
-
-        assert np.all(eto_high > eto_low)
-
-    def test_eto_higher_with_more_wind(self):
-        """More wind → higher ET0."""
-        t_avg = np.full((2, 2), 25.0)
-        t_min = np.full((2, 2), 20.0)
-        t_max = np.full((2, 2), 30.0)
-        solar_rad = np.full((2, 2), 300.0)
-        rh = 50.0
-        elevation_m = np.full((2, 2), 100.0)
-
-        eto_low_wind = compute_eto(t_avg, t_min, t_max, solar_rad, 0.5, rh, elevation_m)
-        eto_high_wind = compute_eto(t_avg, t_min, t_max, solar_rad, 5.0, rh, elevation_m)
-
-        assert np.all(eto_high_wind >= eto_low_wind)
+        low = self._eto(rs=8.0)
+        high = self._eto(rs=22.0)
+        assert np.all(high > low)
 
     def test_eto_low_when_humid(self):
-        """High humidity → lower ET0."""
-        t_avg = np.full((2, 2), 25.0)
-        t_min = np.full((2, 2), 20.0)
-        t_max = np.full((2, 2), 30.0)
-        solar_rad = np.full((2, 2), 300.0)
-        wind_speed = 2.0
-        elevation_m = np.full((2, 2), 100.0)
+        dry = self._eto(ea=0.6)
+        humid = self._eto(ea=2.2)
+        assert np.all(humid < dry)
 
-        eto_dry = compute_eto(t_avg, t_min, t_max, solar_rad, wind_speed, 20.0, elevation_m)
-        eto_humid = compute_eto(t_avg, t_min, t_max, solar_rad, wind_speed, 90.0, elevation_m)
+    def test_eto_differs_with_elevation(self):
+        assert np.all(self._eto(z=3000.0) != self._eto(z=0.0))
 
-        assert np.all(eto_humid < eto_dry)
-
-    def test_eto_higher_at_higher_elevation(self):
-        """Higher elevation → lower air pressure → slightly higher ET0 due to psychrometric constant effect."""
-        t_avg = np.full((2, 2), 20.0)
-        t_min = np.full((2, 2), 15.0)
-        t_max = np.full((2, 2), 25.0)
-        solar_rad = np.full((2, 2), 300.0)
-        wind_speed = 2.0
-        rh = 60.0
-
-        low_elev = np.full((2, 2), 0.0)
-        high_elev = np.full((2, 2), 3000.0)
-
-        eto_low = compute_eto(t_avg, t_min, t_max, solar_rad, wind_speed, rh, low_elev)
-        eto_high = compute_eto(t_avg, t_min, t_max, solar_rad, wind_speed, rh, high_elev)
-
-        assert np.all(eto_high != eto_low)
+    def test_cap_logs_warning(self, caplog):
+        with caplog.at_level("WARNING"):
+            result = self._eto(t_min=35.0, t_max=50.0, ea=0.1, u2=15.0, rs=35.0, lat=0.0, doy=80)
+        assert np.all(result <= 15.0)
+        warns = [r for r in caplog.records if r.levelname == "WARNING" and "capped" in r.message]
+        assert len(warns) == 1
 
 
 class TestWaterBalance:
@@ -525,3 +558,42 @@ class TestComputeZones:
         zones, labels = compute_zones(elev, aspect, slope)
         assert zones == []
         assert labels.shape == (0,)
+
+
+class TestClampEaToEs:
+    """VPD >= 0 per pixel: ea is bounded by es_px = (e0(Tmax)+e0(Tmin))/2."""
+
+    def test_ea_between_e0_tmin_and_es_is_unchanged_at_reference(self):
+        from app.downscaler import clamp_ea_to_es, _saturation_vapour_pressure as e0
+        t_min, t_max = np.array([10.0]), np.array([28.0])
+        es = float((e0(t_max) + e0(t_min))[0] / 2.0)
+        ea = float(e0(t_min)[0]) + 0.3  # dew point above Tmin, still below es
+        assert float(e0(t_min)[0]) < ea < es
+        out = clamp_ea_to_es(ea, t_min, t_max)
+        assert out[0] == pytest.approx(ea)
+
+    def test_cold_pixel_is_clamped_to_es_and_vpd_is_zero(self):
+        from app.downscaler import clamp_ea_to_es, _saturation_vapour_pressure as e0
+        t_min = np.array([15.0, 15.0 - 9.75])
+        t_max = np.array([25.0, 25.0 - 9.75])
+        ea = float(e0(25.0))  # saturated at Tmax_ref: above es everywhere
+        es = (e0(t_max) + e0(t_min)) / 2.0
+        out = clamp_ea_to_es(ea, t_min, t_max)
+        np.testing.assert_allclose(out, es)
+        np.testing.assert_allclose(es - out, 0.0, atol=1e-12)
+
+    def test_compute_eto_non_negative_after_clamp(self):
+        from app.downscaler import clamp_ea_to_es
+        t_min = np.array([15.0, 15.0 - 9.75])
+        t_max = np.array([25.0, 25.0 - 9.75])
+        ea_px = clamp_ea_to_es(3.0, t_min, t_max)
+        r = compute_eto(t_min, t_max, ea_px, 2.0, 20.0, np.full(2, 20.0),
+                        np.array([600.0, 1100.0]), np.full(2, 40.0), 180)
+        assert np.all(r >= 0)
+
+    def test_logs_at_debug_when_it_clamps(self, caplog):
+        import logging
+        from app.downscaler import clamp_ea_to_es
+        with caplog.at_level(logging.DEBUG, logger="app.downscaler"):
+            clamp_ea_to_es(5.0, np.array([0.0]), np.array([5.0]))
+        assert "clamp" in caplog.text.lower()

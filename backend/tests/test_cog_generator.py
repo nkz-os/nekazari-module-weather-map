@@ -321,7 +321,14 @@ class TestSoilMoistureWithoutSoil:
             cg, "fetch_parcel_hydraulics",
             AsyncMock(return_value={"field_capacity": 30.0, "wilting_point": 15.0, "awc": 15.0}),
         )
+        five = {"precip_mm": 4.0, "et0_mm": 20.0, "days": 5, "start": "2026-08-27", "end": "2026-08-31"}
+        monkeypatch.setattr(
+            cg, "fetch_parcel_daily", AsyncMock(return_value={"closed5": five}),
+        )
         assert await _tile(cg, "soil_moisture") is not None
+
+        monkeypatch.setattr(cg, "fetch_parcel_daily", AsyncMock(return_value={}))
+        assert await _tile(cg, "soil_moisture") is None
 
     @pytest.mark.asyncio
     async def test_no_usable_geometry_clears_all_pointers(self, monkeypatch, caplog):
@@ -394,3 +401,286 @@ class TestSoilMoistureWithoutSoil:
             "tenant-a", [PARCEL], "2026-09-01", "2026-09-02", 14, "2026-09-02",
         )
         assert cleared == [("tenant-a", "soil_moisture")]
+
+
+# ======================================================================
+# eto / water_balance: inputs from /daily, each pixel from its own parcel
+# ======================================================================
+
+from rasterio import MemoryFile  # noqa: E402
+
+PX = 0.0001
+ORIGIN_LON, ORIGIN_LAT = -1.65, 42.8
+
+
+def _wide_dem(rows: int = 10, cols: int = 24) -> dict:
+    return {
+        "elevations": [[500.0 + r + c * 0.1 for c in range(cols)] for r in range(rows)],
+        "origin_lon": ORIGIN_LON,
+        "origin_lat": ORIGIN_LAT,
+        "pixel_size_deg": PX,
+        "rows": rows,
+        "cols": cols,
+    }
+
+
+def _box(col0: int, col1: int, rows: int = 10) -> dict:
+    """Polygon covering pixel columns [col0, col1) of the wide DEM, full height."""
+    w = ORIGIN_LON + col0 * PX
+    e = ORIGIN_LON + col1 * PX
+    s = ORIGIN_LAT
+    n = ORIGIN_LAT + rows * PX
+    return {"type": "Polygon", "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]}
+
+
+PARCEL_A = {"id": "urn:ngsi-ld:AgriParcel:a", "location": _box(0, 5)}
+PARCEL_B = {"id": "urn:ngsi-ld:AgriParcel:b", "location": _box(19, 24)}
+
+
+def _daily(t_max=30.0, closed5=None, **over) -> dict:
+    d = {
+        "date": "2026-07-06", "doy": 187, "t_min": 15.0, "t_max": t_max,
+        "ea_kpa": 1.3, "u2_ms": 2.0, "rs_mj": 22.0, "elevation_ref_m": 500.0,
+    }
+    if closed5 is not None:
+        d["closed5"] = closed5
+    d.update(over)
+    return d
+
+
+def _c5(precip, et0):
+    return {"precip_mm": precip, "et0_mm": et0, "days": 5, "start": "2026-07-01", "end": "2026-07-05"}
+
+
+def _read(cog: bytes) -> np.ndarray:
+    with MemoryFile(cog) as mf, mf.open() as ds:
+        return ds.read(1)
+
+
+async def _daily_tile(cg, monkeypatch, metric, by_parcel, parcels=(PARCEL_A, PARCEL_B)):
+    async def _fetch(tenant_id, parcel_id):
+        return by_parcel.get(parcel_id)
+
+    monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=_wide_dem()))
+    monkeypatch.setattr(cg, "fetch_parcel_daily", _fetch)
+    return await cg.generate_cog_for_tile(
+        "demo-coop", metric, 14, 8117, 6038,
+        "2026-07-06", "2026-07-06", 42.8, -1.65, parcels=list(parcels),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pixel_takes_containing_parcel_weather(monkeypatch):
+    from app import cog_generator as cg
+
+    cog = await _daily_tile(cg, monkeypatch, "eto", {
+        PARCEL_A["id"]: _daily(t_max=20.0),
+        PARCEL_B["id"]: _daily(t_max=36.0),
+    })
+    arr = _read(cog)
+    cool = arr[:, 0:5]
+    hot = arr[:, 19:24]
+    assert np.all(np.isfinite(cool)) and np.all(np.isfinite(hot))
+    assert hot.mean() > cool.mean() + 0.5
+
+
+@pytest.mark.asyncio
+async def test_pixels_outside_parcels_are_nodata(monkeypatch):
+    from app import cog_generator as cg
+
+    cog = await _daily_tile(cg, monkeypatch, "eto", {
+        PARCEL_A["id"]: _daily(), PARCEL_B["id"]: _daily(),
+    })
+    arr = _read(cog)
+    # columns 8..15 are more than the clip margin away from both parcels
+    assert np.all(np.isnan(arr[:, 8:16]))
+    assert np.all(np.isfinite(arr[:, 0:5]))
+
+
+@pytest.mark.asyncio
+async def test_eto_parcel_missing_an_input_is_skipped_not_filled(monkeypatch, caplog):
+    from app import cog_generator as cg
+
+    no_ea = {k: v for k, v in _daily().items() if k != "ea_kpa"}
+    with caplog.at_level(logging.ERROR):
+        cog = await _daily_tile(cg, monkeypatch, "eto", {
+            PARCEL_A["id"]: no_ea, PARCEL_B["id"]: _daily(),
+        })
+    arr = _read(cog)
+    assert np.all(np.isnan(arr[:, 0:5]))
+    assert np.all(np.isfinite(arr[:, 19:24]))
+    assert "ea_kpa" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_eto_with_every_parcel_skipped_yields_no_tile(monkeypatch):
+    from app import cog_generator as cg
+
+    no_ea = {k: v for k, v in _daily().items() if k != "ea_kpa"}
+    assert await _daily_tile(cg, monkeypatch, "eto", {
+        PARCEL_A["id"]: no_ea, PARCEL_B["id"]: no_ea,
+    }) is None
+    # weather-api unreachable: same
+    assert await _daily_tile(cg, monkeypatch, "eto", {}) is None
+
+
+@pytest.mark.asyncio
+async def test_doy_comes_from_the_running_day(monkeypatch):
+    from app import cog_generator as cg
+
+    seen: list = []
+    real = cg.compute_eto
+
+    def _spy(*args):
+        seen.append(args[-1])
+        return real(*args)
+
+    monkeypatch.setattr(cg, "compute_eto", _spy)
+    await _daily_tile(cg, monkeypatch, "eto", {PARCEL_A["id"]: _daily(doy=187)}, parcels=[PARCEL_A])
+    assert seen == [187]
+
+
+@pytest.mark.asyncio
+async def test_water_balance_is_closed_5day_sum(monkeypatch):
+    from app import cog_generator as cg
+
+    cog = await _daily_tile(cg, monkeypatch, "water_balance", {
+        PARCEL_A["id"]: _daily(closed5=_c5(10.0, 25.0)),
+        PARCEL_B["id"]: _daily(closed5=_c5(2.0, 12.0)),
+    })
+    arr = _read(cog)
+    assert np.allclose(arr[:, 0:5], -15.0)
+    assert np.allclose(arr[:, 19:24], -10.0)
+
+
+@pytest.mark.asyncio
+async def test_water_balance_absent_when_window_incomplete(monkeypatch):
+    from app import cog_generator as cg
+
+    cog = await _daily_tile(cg, monkeypatch, "water_balance", {
+        PARCEL_A["id"]: _daily(closed5=_c5(10.0, 25.0)),
+        PARCEL_B["id"]: _daily(),            # fewer than 5 closed days: no closed5
+    })
+    arr = _read(cog)
+    assert np.allclose(arr[:, 0:5], -15.0)
+    assert np.all(np.isnan(arr[:, 19:24]))
+
+
+@pytest.mark.asyncio
+async def test_raster_ea_is_clamped_to_pixel_es(monkeypatch):
+    """A humid-day ea saturated at the reference Tmax exceeds es_px on pixels that
+    are colder; the clamp must bring it to es_px (VPD >= 0)."""
+    from app import cog_generator as cg
+    from app.downscaler import _saturation_vapour_pressure as e0
+
+    seen: dict = {}
+    real = cg.compute_eto
+
+    def _spy(t_min, t_max, ea, *rest):
+        seen["t_min"], seen["t_max"], seen["ea"] = (
+            np.asarray(t_min), np.asarray(t_max), np.asarray(ea))
+        return real(t_min, t_max, ea, *rest)
+
+    monkeypatch.setattr(cg, "compute_eto", _spy)
+    humid = _daily(elevation_ref_m=100.0, ea_kpa=float(e0(30.0)))
+    cog = await _daily_tile(cg, monkeypatch, "eto", {PARCEL_A["id"]: humid}, parcels=[PARCEL_A])
+    assert cog is not None
+    es_px = (e0(seen["t_min"]) + e0(seen["t_max"])) / 2.0
+    assert np.any(humid["ea_kpa"] > es_px), "the clamp must be exercised"
+    assert np.all(seen["ea"] <= es_px + 1e-12)
+
+
+@pytest.mark.asyncio
+async def test_flat_pixel_at_reference_equals_compute_eto_horizontal(monkeypatch):
+    """Horizontal Rs for both Rns and Rnl: at the reference elevation the raster
+    value is exactly compute_eto with rs_surface = rs_horizontal."""
+    from app import cog_generator as cg
+    from app.downscaler import compute_eto, clamp_ea_to_es
+
+    seen: dict = {}
+    real = cg.compute_eto
+
+    def _spy(t_min, t_max, ea, u2, rs_h, rs_s, z, lat, doy):
+        seen.update(rs_h=rs_h, rs_s=np.asarray(rs_s))
+        return real(t_min, t_max, ea, u2, rs_h, rs_s, z, lat, doy)
+
+    monkeypatch.setattr(cg, "compute_eto", _spy)
+    d = _daily(elevation_ref_m=500.0)
+    cog = await _daily_tile(cg, monkeypatch, "eto", {PARCEL_A["id"]: d}, parcels=[PARCEL_A])
+    assert np.all(seen["rs_s"] == d["rs_mj"]) and seen["rs_h"] == d["rs_mj"]
+    arr = _read(cog)
+    # pixel (row 0, col 0): elevation 500.0 == reference
+    t_min = np.array([d["t_min"]])
+    t_max = np.array([d["t_max"]])
+    expected = compute_eto(
+        t_min, t_max, clamp_ea_to_es(d["ea_kpa"], t_min, t_max), d["u2_ms"],
+        d["rs_mj"], np.array([d["rs_mj"]]), np.array([500.0]),
+        np.array([ORIGIN_LAT + PX / 2]), d["doy"],
+    )[0]
+    assert arr[-1, 0] == pytest.approx(expected, abs=0.05)
+
+
+@pytest.mark.asyncio
+async def test_eto_raster_independent_of_aspect(monkeypatch):
+    """Two pixels at the same elevation with different slope/aspect: same ET0."""
+    from app import cog_generator as cg
+
+    rows, cols = 10, 24
+    flat = np.full((rows, cols), 500.0)
+    monkeypatch.setattr(cg, "slope_degrees", lambda e, px: np.where(np.arange(cols) < 3, 0.0, 5.0)[None, :].repeat(rows, 0))
+    monkeypatch.setattr(cg, "aspect_degrees", lambda e, px: np.where(np.arange(cols) < 3, 0.0, 180.0)[None, :].repeat(rows, 0))
+    dem = _wide_dem()
+    dem["elevations"] = flat.tolist()
+    async def _fetch(t, pid):
+        return _daily(elevation_ref_m=500.0)
+    monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=dem))
+    monkeypatch.setattr(cg, "fetch_parcel_daily", _fetch)
+    cog = await cg.generate_cog_for_tile(
+        "demo-coop", "eto", 14, 8117, 6038, "2026-07-06", "2026-07-06",
+        42.8, -1.65, parcels=[PARCEL_A],
+    )
+    arr = _read(cog)
+    assert np.isfinite(arr[5, 1]) and np.isfinite(arr[5, 4])
+    assert arr[5, 1] == pytest.approx(arr[5, 4], abs=1e-4)
+
+
+def test_margin_pixels_take_the_parcel_and_exact_polygon_beats_neighbour_margin():
+    from app.cog_generator import _parcel_pixel_labels
+    from rasterio.transform import from_bounds
+
+    rows, cols = 4, 24
+    tr = from_bounds(ORIGIN_LON, ORIGIN_LAT, ORIGIN_LON + cols * PX, ORIGIN_LAT + rows * PX, cols, rows)
+    a = {"id": "a", "location": _box(0, 5, rows)}
+    b = {"id": "b", "location": _box(6, 12, rows)}  # 1 pixel gap, inside both margins
+    labels = _parcel_pixel_labels([a, b], tr, rows, cols)
+    assert np.all(labels[:, 0:5] == 0) and np.all(labels[:, 6:12] == 1)
+    # column 5 is in neither polygon: it takes a parcel from the margin pass
+    assert np.all(labels[:, 5] >= 0)
+    # b's exact pixels next to a are not stolen by a's margin
+    assert np.all(labels[:, 6] == 1)
+    # far from every parcel: nodata
+    assert np.all(labels[:, 18:24] == -1)
+    # the margin does not stretch beyond ~20 m (2 pixels): column 14+ is free
+    assert np.all(labels[:, 14] == -1)
+
+
+def test_record_balance_window_from_daily_cache(monkeypatch):
+    import app.cog_generator as cg
+    written = []
+    monkeypatch.setattr(cg, "set_window_meta", lambda t, m, meta: written.append((t, m, meta)))
+    c5 = {"start": "2026-06-08", "end": "2026-06-12", "days": 5}
+    cg._record_balance_window("t1", "2026-06-13", {"daily:a": {"closed5": c5}, "daily:b": None, "x": {}})
+    assert written == [("t1", "water_balance", {
+        "date": "2026-06-13", "window_start": "2026-06-08",
+        "window_end": "2026-06-12", "days": 5})]
+    written.clear()
+    cg._record_balance_window("t1", "2026-06-13", {"daily:a": {}})
+    assert written == []
+
+
+def test_record_eto_method_writes_date_and_method(monkeypatch):
+    import app.cog_generator as cg
+    written = []
+    monkeypatch.setattr(cg, "set_window_meta", lambda t, m, meta: written.append((t, m, meta)))
+    cg._record_eto_method("t1", "2026-06-13")
+    assert written == [("t1", "eto", {"date": "2026-06-13", "method": "FAO-56 PM daily"})]

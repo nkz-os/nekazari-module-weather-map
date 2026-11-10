@@ -176,3 +176,13 @@ def test_ptf_requires_organic_matter_explicitly():
     import inspect
     from app.downscaler import saxton_rawls_ptf
     assert inspect.signature(saxton_rawls_ptf).parameters["om_pct"].default is inspect.Parameter.empty
+
+
+def test_eto_inputs_come_from_daily_not_from_stand_ins():
+    """ET0 inputs are the /daily running day's: no RH-derived ea, no look-back doy,
+    no look-back doy (the x5 extrapolation is covered by the water_balance tests)."""
+    for name in ("cog_generator.py", "zone_accumulator.py"):
+        text = (APP / name).read_text()
+        assert "ea_from_rh" not in text, name
+        assert "rh_avg" not in text, name
+        assert "_date_to_doy(date_from)" not in text, name

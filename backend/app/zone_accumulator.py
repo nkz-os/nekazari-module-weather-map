@@ -16,14 +16,14 @@ import geohash2
 import numpy as np
 
 from app.config import settings
-from app.downscaler import compute_zones, correct_temperature, compute_eto
+from app.downscaler import compute_zones, correct_temperature, compute_eto, clamp_ea_to_es
 from app.records import build_agri_parcel_zone
 from app.stats import compute_zonal_stats
 from nkz_platform_sdk import OrionClient
 from app.sources import (
     MissingWeatherInput,
     fetch_dem_tile,
-    fetch_parcel_weather,
+    fetch_parcel_daily,
     fetch_tenant_parcels,
     find_nearby_sensors,
     require,
@@ -261,21 +261,23 @@ async def process_parcel(
     zones_all = _dedupe_zone_ids(zones_all)
     zone_ranks = _assign_zone_ranks(zones_all)
 
-    # 4. Fetch weather from the broker (no defaults — see app.sources.require)
-    weather = await fetch_parcel_weather(tenant_id, parcel_id)
+    # 4. Fetch the running day's weather from weather-api /daily (no defaults —
+    # see app.sources.require)
+    weather = await fetch_parcel_daily(tenant_id, parcel_id)
     if weather is None:
-        logger.warning("No weather observation for parcel %s", parcel_id)
+        logger.warning("No /daily weather for parcel %s", parcel_id)
         return []
 
     try:
-        t_min = require(weather, "t_min", "temperature_min")
-        t_max = require(weather, "t_max", "temperature_max")
-        rh = require(weather, "rh_avg", "humidity")
-        wind = require(weather, "wind_speed_ms", "wind_speed")
-        solar = require(weather, "solar_rad_w_m2", "solar_radiation")
+        t_min = require(weather, "t_min")
+        t_max = require(weather, "t_max")
+        ea_kpa = require(weather, "ea_kpa")
+        u2_ms = require(weather, "u2_ms")
+        rs_mj = require(weather, "rs_mj")
+        doy = int(require(weather, "doy"))
         # The altitude the readings are already downscaled to — the per-zone
         # correction below is RELATIVE to this, never to the DEM tile's own grid.
-        station_elev = require(weather, "reference_altitude_m")
+        station_elev = require(weather, "elevation_ref_m")
     except MissingWeatherInput as exc:
         logger.error(
             "Skipping parcel %s (tenant=%s): missing weather input, tried %s",
@@ -290,10 +292,12 @@ async def process_parcel(
         elev_mean = zd["elevationMean"]
         t_min_z = float(correct_temperature(t_min, station_elev, np.array([elev_mean]))[0])
         t_max_z = float(correct_temperature(t_max, station_elev, np.array([elev_mean]))[0])
-        t_avg_z = (t_min_z + t_max_z) / 2.0
         eto = compute_eto(
-            np.array([t_avg_z]), np.array([t_min_z]), np.array([t_max_z]),
-            np.array([solar]), wind, rh, np.array([elev_mean]),
+            np.array([t_min_z]), np.array([t_max_z]),
+            clamp_ea_to_es(ea_kpa, np.array([t_min_z]), np.array([t_max_z])), u2_ms,
+            rs_mj, np.array([rs_mj]),
+            np.array([elev_mean]), np.array([zd["centroid"][1]]),
+            doy,
         )
         metrics = {
             "tMin": round(t_min_z, 1),

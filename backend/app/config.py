@@ -19,6 +19,9 @@ class Settings:
     
     elevation_service_url: str = os.getenv("ELEVATION_SERVICE_URL", "http://elevation-api-service:80")
     weather_api_url: str = os.getenv("WEATHER_API_URL", "http://weather-api-service:8000")
+    # Signs module-to-module calls (X-Auth-Signature). Empty = calls to
+    # weather-api are refused locally, never sent unsigned.
+    hmac_secret: str = os.getenv("HMAC_SECRET", "")
     orion_url: str = os.getenv("ORION_URL", "http://orion-ld-service:1026")
     context_url: str = os.getenv("CONTEXT_URL", "")
     postgres_url: str = os.getenv("POSTGRES_URL", "")
