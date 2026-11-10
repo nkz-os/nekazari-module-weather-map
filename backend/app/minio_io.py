@@ -8,6 +8,7 @@ return ``None`` (or ``False``) on error.
 from __future__ import annotations
 
 import io
+import json
 import logging
 
 from minio import Minio
@@ -205,6 +206,56 @@ def set_latest_date(tenant_id: str, metric: str, date: str) -> bool:
             metric,
         )
         return False
+
+
+def window_meta_path(tenant_id: str, metric: str) -> str:
+    """Object path of the metadata sidecar written with the latest pointer.
+
+    Pattern: ``cogs/{tenant}/{metric}/window.json``
+    """
+    return f"cogs/{tenant_id}/{metric}/window.json"
+
+
+def set_window_meta(tenant_id: str, metric: str, meta: dict) -> bool:
+    """Write the sidecar describing the input window of the latest raster."""
+    try:
+        client = _get_client()
+        data_bytes = json.dumps(meta).encode("utf-8")
+        client.put_object(
+            bucket_name=settings.minio_bucket,
+            object_name=window_meta_path(tenant_id, metric),
+            data=io.BytesIO(data_bytes),
+            length=len(data_bytes),
+            content_type="application/json",
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "set_window_meta(tenant=%s, metric=%s) failed", tenant_id, metric,
+        )
+        return False
+
+
+def get_window_meta(tenant_id: str, metric: str) -> dict | None:
+    """Read the window sidecar; ``None`` when absent or unreadable."""
+    try:
+        client = _get_client()
+        response = client.get_object(
+            bucket_name=settings.minio_bucket,
+            object_name=window_meta_path(tenant_id, metric),
+        )
+        try:
+            meta = json.loads(response.read().decode("utf-8"))
+        finally:
+            response.close()
+            response.release_conn()
+        return meta if isinstance(meta, dict) else None
+    except Exception:
+        # Absent for every raster written before the sidecar existed.
+        logger.debug(
+            "get_window_meta(tenant=%s, metric=%s): none", tenant_id, metric,
+        )
+        return None
 
 
 def clear_latest_pointer(tenant_id: str, metric: str) -> None:

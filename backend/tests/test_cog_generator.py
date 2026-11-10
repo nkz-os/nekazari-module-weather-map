@@ -608,3 +608,17 @@ def test_margin_pixels_take_the_parcel_and_exact_polygon_beats_neighbour_margin(
     assert np.all(labels[:, 18:24] == -1)
     # the margin does not stretch beyond ~20 m (2 pixels): column 14+ is free
     assert np.all(labels[:, 14] == -1)
+
+
+def test_record_balance_window_from_daily_cache(monkeypatch):
+    import app.cog_generator as cg
+    written = []
+    monkeypatch.setattr(cg, "set_window_meta", lambda t, m, meta: written.append((t, m, meta)))
+    c5 = {"start": "2026-06-08", "end": "2026-06-12", "days": 5}
+    cg._record_balance_window("t1", "2026-06-13", {"daily:a": {"closed5": c5}, "daily:b": None, "x": {}})
+    assert written == [("t1", "water_balance", {
+        "date": "2026-06-13", "window_start": "2026-06-08",
+        "window_end": "2026-06-12", "days": 5})]
+    written.clear()
+    cg._record_balance_window("t1", "2026-06-13", {"daily:a": {}})
+    assert written == []

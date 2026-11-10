@@ -24,6 +24,7 @@ from app.stats import (
     NO_DATA_ERROR,
     compute_zonal_stats,
     fallback_sources,
+    label_metrics,
     needs_scalar_fallback,
     scalar_fallback,
 )
@@ -325,6 +326,9 @@ async def parcel_zonal_stats(
                 }
             elif not no_raster:
                 stats["metrics"].update(resolved)
+
+    # 3d. Say what each raster-derived number is (additive keys only).
+    label_metrics(tenant_id, stats)
 
     # 4. Read phenology params from Orion-LD (if crop+stage provided)
     phenology = None

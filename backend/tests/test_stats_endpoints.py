@@ -246,6 +246,63 @@ class TestStatsLabelsAndScalarFallback:
         assert data["kind"] == "forecast_snapshot"
         assert data["metrics"]["eto"]["mean"] == 4.2
 
+    @patch("app.stats.get_window_meta")
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
+    @patch("app.tiles.compute_zonal_stats")
+    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
+    def test_water_balance_payload_labels_window(
+        self, mock_fetch, mock_stats, mock_weather, mock_meta, client
+    ):
+        mock_fetch.return_value = SAMPLE_PARCEL
+        mock_stats.return_value = {
+            "parcel_geojson": SAMPLE_GEOM, "date": "2026-06-13",
+            "metrics": {"water_balance": {"mean": -7.0, "deficit_area_pct": 100.0}},
+        }
+        mock_meta.return_value = {
+            "date": "2026-06-13", "window_start": "2026-06-08", "window_end": "2026-06-12",
+        }
+        wb = _get(client, "water_balance").json()["metrics"]["water_balance"]
+        assert wb["kind"] == "closed_days"
+        assert wb["window_start"] == "2026-06-08"
+        assert wb["window_end"] == "2026-06-12"
+        assert wb["days"] == 5
+        assert wb["et0_source"] == "weather-api daily (provider)"
+        assert wb["mean"] == -7.0 and wb["deficit_area_pct"] == 100.0
+
+    @patch("app.stats.get_window_meta")
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
+    @patch("app.tiles.compute_zonal_stats")
+    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
+    def test_water_balance_window_not_invented_when_unrecorded(
+        self, mock_fetch, mock_stats, mock_weather, mock_meta, client
+    ):
+        mock_fetch.return_value = SAMPLE_PARCEL
+        mock_stats.return_value = {
+            "parcel_geojson": SAMPLE_GEOM, "date": "2026-06-13",
+            "metrics": {"water_balance": {"mean": -7.0}},
+        }
+        # Metadata of another raster date must not be attributed to this one.
+        mock_meta.return_value = {
+            "date": "2026-06-01", "window_start": "2026-05-27", "window_end": "2026-05-31",
+        }
+        wb = _get(client, "water_balance").json()["metrics"]["water_balance"]
+        assert wb["kind"] == "closed_days" and wb["days"] == 5
+        assert wb["window_start"] is None and wb["window_end"] is None
+
+    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
+    @patch("app.tiles.compute_zonal_stats", return_value=SAMPLE_STATS)
+    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
+    def test_eto_payload_labels_method(
+        self, mock_fetch, mock_stats, mock_weather, client
+    ):
+        mock_fetch.return_value = SAMPLE_PARCEL
+        data = _get(client, "eto").json()
+        eto = data["metrics"]["eto"]
+        assert eto["kind"] == "forecast_running_day"
+        assert eto["method"] == "FAO-56 PM daily"
+        assert eto["mean"] == 4.2
+        assert data["kind"] == "forecast_snapshot"
+
     @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats")
     @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)

@@ -18,7 +18,7 @@ import rasterio
 from rasterio import mask as rio_mask
 
 from app.config import settings
-from app.minio_io import download_cog, get_latest_date
+from app.minio_io import download_cog, get_latest_date, get_window_meta
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,34 @@ def scalar_fallback(metric: str, scalars: dict[str, Any] | None) -> dict[str, An
         "valid_date": stamp[:10] if stamp else None,
         "observed_at": stamp,
     }
+
+
+BALANCE_ET0_SOURCE = "weather-api daily (provider)"
+
+
+def label_metrics(tenant_id: str, stats: dict[str, Any]) -> None:
+    """Add, in place, labels saying what each raster-derived number is.
+
+    Additive only: no existing key changes. Scalar fallbacks and error entries
+    are left alone. The balance window comes from the sidecar the COG job wrote
+    for that raster date; if absent or for another date the dates are null.
+    """
+    metrics = stats.get("metrics") or {}
+    eto = metrics.get("eto")
+    if isinstance(eto, dict) and "error" not in eto and "fallback" not in eto:
+        eto["kind"] = "forecast_running_day"
+        eto["method"] = "FAO-56 PM daily"
+    wb = metrics.get("water_balance")
+    if isinstance(wb, dict) and "error" not in wb and "fallback" not in wb:
+        meta = get_window_meta(tenant_id, "water_balance") or {}
+        known = meta.get("date") == stats.get("date")
+        wb["kind"] = "closed_days"
+        wb["window_start"] = meta.get("window_start") if known else None
+        wb["window_end"] = meta.get("window_end") if known else None
+        wb["days"] = 5
+        # The raster (eto) is FAO-56 PM per pixel; the balance sums the
+        # provider's own ET0 for the parcel: not the same definition.
+        wb["et0_source"] = BALANCE_ET0_SOURCE
 
 
 def needs_scalar_fallback(stats: dict[str, Any]) -> list[str]:
@@ -239,6 +267,14 @@ def compute_zonal_stats(
     -------
     dict
         ``{"parcel_geojson": …, "date": …, "metrics": {metric: {…}}}``.
+
+    Notes
+    -----
+    ``water_balance`` is a single parcel-level value (sum of precipitation
+    minus provider ET0 over the last 5 closed days) painted on every pixel of
+    the parcel. Hence ``deficit_area_pct`` and ``severe_deficit_pct`` are now
+    0 or 100 per parcel; keys and meaning (share of parcel pixels at or below
+    the threshold) are unchanged, as bioorch reads ``deficit_area_pct``.
     """
     unavailable = {
         m: {"error": NO_DATA_ERROR, "reason": UNAVAILABLE_METRICS[m]}

@@ -31,7 +31,9 @@ from app.downscaler import (
     compute_frost_risk,
     compute_soil_moisture,
 )
-from app.minio_io import clear_latest_pointer, set_latest_date, upload_cog
+from app.minio_io import (
+    clear_latest_pointer, set_latest_date, set_window_meta, upload_cog,
+)
 from app.records import build_agri_parcel_record, guard_frozen_metrics
 from app.sources import (
     MissingWeatherInput,
@@ -636,6 +638,30 @@ def _clear_all_pointers(tenant_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _record_balance_window(
+    tenant_id: str, today: str, weather_cache: dict[str, dict | None],
+) -> None:
+    """Record the closed-day window the water_balance raster was built from.
+
+    Read from the same /daily responses the raster used. Parcels normally share
+    one window; if they differ the sidecar spans them (earliest start, latest
+    end). No parcel with a window: nothing is written, so /stats leaves the
+    dates null instead of guessing.
+    """
+    windows = [
+        d["closed5"] for k, d in weather_cache.items()
+        if k.startswith("daily:") and d and d.get("closed5")
+    ]
+    if not windows:
+        return
+    set_window_meta(tenant_id, "water_balance", {
+        "date": today,
+        "window_start": min(w["start"] for w in windows),
+        "window_end": max(w["end"] for w in windows),
+        "days": windows[0]["days"],
+    })
+
+
 async def _generate_and_upload_cogs(
     tenant_id: str,
     parcels: list[dict[str, Any]],
@@ -742,6 +768,8 @@ async def _generate_and_upload_cogs(
 
         if success_count > 0:
             set_latest_date(tenant_id, metric, today)
+            if metric == "water_balance":
+                _record_balance_window(tenant_id, today, weather_cache)
         else:
             # No tiles today: do not keep serving an older raster as current.
             clear_latest_pointer(tenant_id, metric)
