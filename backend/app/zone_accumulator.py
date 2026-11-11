@@ -18,6 +18,7 @@ import numpy as np
 from app.config import settings
 from app.dem_grid import dem_transform, pixel_center_grids
 from nkz_platform_sdk.gis.terrain import aspect_degrees, slope_degrees
+from rasterio.features import geometry_mask
 from app.downscaler import compute_zones, discretize_aspect, correct_temperature, compute_eto, clamp_ea_to_es
 from app.records import build_agri_parcel_zone
 from app.stats import compute_zonal_stats
@@ -76,6 +77,39 @@ def _assign_zone_ranks(zones: list[dict[str, Any]]) -> dict[str, int]:
 def _compute_area_ha(pixel_count: int) -> float:
     """Convert pixel count to hectares (10m resolution → 0.01 ha/pixel)."""
     return pixel_count * PIXEL_AREA_HA
+
+
+# Smoothing window (pixels) for zoning terrain. IGN serves whole metres, so a
+# gentle ramp is a staircase of 1 m steps; Horn on it gives > 2 deg at every
+# step and the zones become stripes. A 7x7 mean spreads a step over ~70 m and
+# leaves a true linear slope unchanged.
+_TERRAIN_SMOOTH_PX = 7
+
+
+def _terrain(elev: np.ndarray, pixel_size_deg: float) -> tuple[np.ndarray, np.ndarray]:
+    """Slope and aspect (degrees, Horn 1981 in metres) of the smoothed DEM; rows north first."""
+    from scipy.ndimage import uniform_filter
+    smooth = uniform_filter(elev.astype(float), size=_TERRAIN_SMOOTH_PX, mode="nearest")
+    return slope_degrees(smooth, pixel_size_deg), aspect_degrees(smooth, pixel_size_deg)
+
+
+def _repair_geometry(geometry: dict[str, Any]) -> dict[str, Any] | None:
+    """Valid polygonal parcel geometry, or None when nothing polygonal is left."""
+    from shapely.geometry import mapping, shape
+    from shapely.validation import make_valid
+    try:
+        geom = shape(geometry)
+        if not geom.is_valid:
+            geom = make_valid(geom)
+            if geom.geom_type == "GeometryCollection":
+                from shapely.ops import unary_union
+                geom = unary_union([g for g in geom.geoms if g.geom_type in ("Polygon", "MultiPolygon")])
+    except Exception:
+        logger.exception("Parcel geometry could not be read")
+        return None
+    if geom.is_empty or geom.geom_type not in ("Polygon", "MultiPolygon"):
+        return None
+    return mapping(geom)
 
 
 def _geom_geojson_bbox(geometry: dict) -> tuple[float, float, float, float]:
@@ -150,16 +184,22 @@ async def process_parcel(
     parcel: dict[str, Any],
     date_from: str,
 ) -> list[dict]:
-    """Compute zones for a single parcel and return AgriParcelZone entities."""
+    """Compute zones for a single parcel and return AgriParcelZone entities.
+
+    ``[]`` = computed, the parcel has no zones (its old zones go).
+    ``None`` = undecided (no geometry, DEM or weather): its zones are kept.
+    """
     parcel_id = parcel["id"]
     geometry = _parcel_geometry(parcel)
+    if geometry is not None:
+        geometry = _repair_geometry(geometry)
     if geometry is None:
         logger.warning("No geometry for parcel %s, skipping", parcel_id)
-        return []
+        return None
 
     lonlat = _parcel_lonlat(parcel)
     if lonlat is None:
-        return []
+        return None
 
     # 1. Tiles covering the parcel
     min_lon, min_lat, max_lon, max_lat = _geom_geojson_bbox(geometry)
@@ -175,9 +215,7 @@ async def process_parcel(
         if elev.size == 0:
             continue
         pixel_size = float(dem.get("pixel_size_deg", 0.0001))
-        # Horn (1981) in metres; the grid rows run north to south (see app.dem_grid).
-        slope = slope_degrees(elev, pixel_size)
-        aspect = aspect_degrees(elev, pixel_size)
+        slope, aspect = _terrain(elev, pixel_size)
         tile_data.append({
             "elev": elev,
             "slope": slope,
@@ -192,7 +230,7 @@ async def process_parcel(
 
     if not tile_data:
         logger.warning("No DEM data for parcel %s", parcel_id)
-        return []
+        return None
 
     # 3. Zones per tile
     zones_all: list[dict] = []
@@ -211,12 +249,18 @@ async def process_parcel(
         )
 
         tile_transform = dem_transform(grid)
+        # Zone statistics describe the part inside the parcel, not the tile-wide zone.
+        in_parcel = geometry_mask(
+            [geometry], out_shape=tile_labels.shape, transform=tile_transform,
+            invert=True, all_touched=True,
+        )
 
         for label in range(1, tile_labels.max() + 1):
-            mask = (tile_labels == label)
-            if np.sum(mask) == 0:
+            tile_mask = (tile_labels == label)
+            mask = tile_mask & in_parcel
+            if not mask.any():
                 continue
-            zone_geom = _zone_geometry(mask, tile_transform, geometry, td["pixel_size"])
+            zone_geom = _zone_geometry(tile_mask, tile_transform, geometry, td["pixel_size"])
             if not zone_geom:
                 continue
             zone_lon = float(np.mean(lon_g[mask]))
@@ -258,7 +302,7 @@ async def process_parcel(
     weather = await fetch_parcel_daily(tenant_id, parcel_id)
     if weather is None:
         logger.warning("No /daily weather for parcel %s", parcel_id)
-        return []
+        return None
 
     try:
         t_min = require(weather, "t_min")
@@ -275,7 +319,7 @@ async def process_parcel(
             "Skipping parcel %s (tenant=%s): missing weather input, tried %s",
             parcel_id, tenant_id, exc.keys,
         )
-        return []
+        return None
 
     # 5. Compute metrics per zone, build entities
     observed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -409,14 +453,15 @@ async def run_for_tenant(tenant_id: str) -> None:
 
     for parcel in parcels:
         entities = await process_parcel(tenant_id, parcel, today)
-        if entities:
-            all_entities.extend(entities)
-            keep_ids = set()
-            for e in entities:
-                zid = (e.get("nkz:zoneId") or {}).get("value")
-                if zid:
-                    keep_ids.add(str(zid))
-            parcel_keep_ids[parcel["id"]] = keep_ids
+        if entities is None:
+            continue  # undecided: keep whatever the parcel has
+        all_entities.extend(entities)
+        keep_ids = set()
+        for e in entities:
+            zid = (e.get("nkz:zoneId") or {}).get("value")
+            if zid:
+                keep_ids.add(str(zid))
+        parcel_keep_ids[parcel["id"]] = keep_ids
 
     if all_entities:
         await upsert_agri_parcel_zones(tenant_id, all_entities)

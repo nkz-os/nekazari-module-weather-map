@@ -26,3 +26,12 @@ def test_transform_maps_row0_to_north():
     lon, lat = dem_transform(_dem()) * (0.5, 0.5)
     assert lon == pytest.approx(-0.9995, abs=1e-9)
     assert lat == pytest.approx(42.0095, abs=1e-9)
+
+
+def test_row_height_comes_from_declared_bounds():
+    """eu-elevation's pixel_size_deg is the column width; rows span north_lat-origin_lat."""
+    d = _dem(north_lat=42.012)  # 10 rows over 0.012 deg: rows are 0.0012 tall
+    _, lat_g = pixel_center_grids(d)
+    assert lat_g[-1, 0] == pytest.approx(42.0006, abs=1e-9)
+    _, south = dem_transform(d) * (0, 10)
+    assert south == pytest.approx(42.0, abs=1e-9)
