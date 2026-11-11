@@ -19,9 +19,9 @@ import rasterio
 from nkz_platform_sdk.gis.terrain import aspect_degrees, slope_degrees
 from rasterio.crs import CRS
 from rasterio.features import geometry_mask
-from rasterio.transform import from_bounds
 
 from app.config import settings
+from app.dem_grid import dem_transform, pixel_center_grids
 from app.downscaler import (
     correct_temperature,
     correct_solar_radiation,
@@ -450,19 +450,14 @@ async def generate_cog_for_tile(
     # ------------------------------------------------------------------
     # 3. Pixel coordinate grids and raster transform
     # ------------------------------------------------------------------
-    lon_grid = np.linspace(
-        origin_lon, origin_lon + pixel_size_deg * cols, cols,
-    )
-    lat_grid = np.linspace(
-        origin_lat, origin_lat + pixel_size_deg * rows, rows,
-    )
-    pixel_lons, pixel_lats = np.meshgrid(lon_grid, lat_grid)
-    transform = from_bounds(
-        origin_lon, origin_lat,
-        origin_lon + pixel_size_deg * cols,
-        origin_lat + pixel_size_deg * rows,
-        cols, rows,
-    )
+    # Rows run north to south (eu-elevation /raster): see app.dem_grid.
+    grid = {
+        "origin_lon": origin_lon, "origin_lat": origin_lat,
+        "north_lat": dem_data.get("north_lat"), "pixel_size_deg": pixel_size_deg,
+        "rows": rows, "cols": cols,
+    }
+    pixel_lons, pixel_lats = pixel_center_grids(grid)
+    transform = dem_transform(grid)
 
     if weather_cache is None:
         weather_cache = {}

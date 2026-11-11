@@ -684,3 +684,29 @@ def test_record_eto_method_writes_date_and_method(monkeypatch):
     monkeypatch.setattr(cg, "set_window_meta", lambda t, m, meta: written.append((t, m, meta)))
     cg._record_eto_method("t1", "2026-06-13")
     assert written == [("t1", "eto", {"date": "2026-06-13", "method": "FAO-56 PM daily"})]
+
+
+@pytest.mark.asyncio
+async def test_pixel_latitudes_decrease_down_the_rows(monkeypatch):
+    """eu-elevation rows run north to south: latitudes and the transform agree."""
+    from app import cog_generator as cg
+
+    seen: dict = {}
+    real_labels = cg._parcel_pixel_labels
+
+    def _labels(parcels, transform, rows, cols):
+        seen["transform"] = transform
+        return real_labels(parcels, transform, rows, cols)
+
+    async def _raster(tenant_id, metric, parcels, labels, weather_cache, elevations, pixel_lats, *a, **k):
+        seen["lats"] = pixel_lats
+        return None
+
+    monkeypatch.setattr(cg, "_parcel_pixel_labels", _labels)
+    monkeypatch.setattr(cg, "_daily_metric_raster", _raster)
+    await _daily_tile(cg, monkeypatch, "eto", {PARCEL_A["id"]: _daily()})
+
+    lats = seen["lats"]
+    assert lats[0, 0] > lats[-1, 0]
+    _, lat00 = seen["transform"] * (0.5, 0.5)
+    assert lat00 == pytest.approx(lats[0, 0], abs=1e-9)

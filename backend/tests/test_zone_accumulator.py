@@ -35,14 +35,67 @@ def test_geom_geojson_bbox_empty():
     assert _geom_geojson_bbox({}) == (0.0, 0.0, 0.0, 0.0)
 
 
-def test_gradient_flat_surface():
-    from app.zone_accumulator import _gradient
-    elev = np.ones((10, 10), dtype=float)
-    dzdx, dzdy = _gradient(elev, 0.0001)
-    assert dzdx.shape == (10, 10)
-    assert dzdy.shape == (10, 10)
-    assert np.all(dzdx[1:-1, 1:-1] == 0.0)
-    assert np.all(dzdy[1:-1, 1:-1] == 0.0)
+def _synthetic_dem(origin_lat=42.0, size=0.001, n=10):
+    return {"origin_lon": -1.0, "origin_lat": origin_lat, "pixel_size_deg": size,
+            "rows": n, "cols": n}
+
+
+def test_zone_geometry_north_rows_land_north():
+    from shapely.geometry import shape
+    from app.dem_grid import dem_transform
+    from app.zone_accumulator import _zone_geometry
+    mask = np.zeros((10, 10), dtype=bool)
+    mask[0:5, :] = True
+    geom = _zone_geometry(mask, dem_transform(_synthetic_dem()), None, 0.001)
+    assert shape(geom).bounds[1] >= 42.005 - 1e-6
+
+
+def test_zone_geometry_two_tiles_do_not_swap():
+    from shapely.geometry import shape
+    from app.dem_grid import dem_transform
+    from app.zone_accumulator import _zone_geometry
+    mask = np.ones((10, 10), dtype=bool)
+    south = shape(_zone_geometry(mask, dem_transform(_synthetic_dem(42.0)), None, 0.001))
+    north = shape(_zone_geometry(mask, dem_transform(_synthetic_dem(42.01)), None, 0.001))
+    assert 42.0 - 1e-6 <= south.bounds[1] and south.bounds[3] <= 42.01 + 1e-6
+    assert 42.01 - 1e-6 <= north.bounds[1] and north.bounds[3] <= 42.02 + 1e-6
+
+
+def test_zone_geometry_is_clipped_and_valid():
+    from shapely.geometry import Polygon, mapping, shape
+    from app.dem_grid import dem_transform
+    from app.zone_accumulator import _zone_geometry
+    parcel = Polygon([(-0.998, 42.001), (-0.991, 42.002), (-0.995, 42.009)])
+    mask = np.ones((10, 10), dtype=bool)
+    geom = shape(_zone_geometry(mask, dem_transform(_synthetic_dem()), mapping(parcel), 0.001))
+    assert geom.is_valid
+    assert geom.within(parcel.buffer(1e-9))
+    assert geom.area >= 0.99 * parcel.area
+
+
+def _sectors_for_north_south_drop(drop_m):
+    from nkz_platform_sdk.gis.terrain import aspect_degrees, slope_degrees
+    from app.downscaler import discretize_aspect
+    size = 0.0001
+    elev = np.repeat(np.linspace(drop_m, 0.0, 10)[:, None], 10, axis=1)  # row 0 = north, highest
+    return discretize_aspect(aspect_degrees(elev, size), slope_degrees(elev, size))[1:-1, 1:-1]
+
+
+def test_gentle_slope_is_flat_sector():
+    assert np.all(_sectors_for_north_south_drop(0.5) == 0)
+
+
+def test_south_facing_slope_is_S_sector():
+    assert np.all(_sectors_for_north_south_drop(30.0) == 5)
+
+
+def test_terrain_slope_is_metric():
+    """30 m drop over 30 rows of ~11 m: ~5 deg, not the ~90 deg of metres over degrees."""
+    from app import zone_accumulator as za
+    assert not hasattr(za, "_gradient")
+    elev = np.repeat(np.linspace(30.0, 0.0, 30)[:, None], 30, axis=1)
+    slope, _ = za._terrain(elev, 0.0001)
+    assert 3.0 < float(np.median(slope[5:-5, 5:-5])) < 8.0
 
 
 # ======================================================================
@@ -107,7 +160,7 @@ def zone_env(monkeypatch):
 @pytest.mark.asyncio
 async def test_absent_observation_yields_no_zone_entities(zone_env, monkeypatch):
     monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=None))
-    assert await zone_env.process_parcel("t", PARCEL, "2026-09-02") == []
+    assert await zone_env.process_parcel("t", PARCEL, "2026-09-02") is None
 
 
 @pytest.mark.asyncio
@@ -127,7 +180,7 @@ async def test_incomplete_weather_publishes_nothing_and_computes_nothing(
     with caplog.at_level(logging.ERROR):
         entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
 
-    assert entities == []
+    assert entities is None
     assert physics_calls == []
     assert "t_max" in caplog.text
 
@@ -217,7 +270,8 @@ async def test_colliding_zone_ids_yield_distinct_entities(zone_env, monkeypatch)
         lambda *a, **k: {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]},
     )
 
-    entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
+    # Both labelled halves must lie inside the parcel: zone stats are parcel-masked.
+    entities = await zone_env.process_parcel("t", _covering(), "2026-09-02")
 
     ids = [e["id"] for e in entities]
     assert len(ids) == len(set(ids))
@@ -335,5 +389,125 @@ async def test_zone_missing_vapour_pressure_publishes_nothing(zone_env, monkeypa
     no_ea = {k: v for k, v in WEATHER.items() if k != "ea_kpa"}
     monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=no_ea))
     with caplog.at_level(logging.ERROR):
-        assert await zone_env.process_parcel("t", PARCEL, "2026-09-02") == []
+        assert await zone_env.process_parcel("t", PARCEL, "2026-09-02") is None
     assert "ea_kpa" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_sloped_north_half_zone_lies_north(zone_env, monkeypatch):
+    """Rows 0-5 (north) fall to the south, rows 6-11 are flat: the S zone is the northern one."""
+    dem = _dem()
+    dem["elevations"] = [
+        [DEM_BASE_ELEVATION + (5 - r) * 3.0 if r <= 5 else DEM_BASE_ELEVATION for _ in range(12)]
+        for r in range(12)
+    ]
+    monkeypatch.setattr(zone_env, "fetch_dem_tile", AsyncMock(return_value=dem))
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=WEATHER))
+
+    covering = {**PARCEL, "location": {"type": "Polygon", "coordinates": [[
+        [-1.65, 42.8], [-1.6488, 42.8], [-1.6488, 42.8012], [-1.65, 42.8012], [-1.65, 42.8],
+    ]]}}
+    entities = await zone_env.process_parcel("t", covering, "2026-09-02")
+
+    def _val(e, key):
+        v = e.get(f"nkz:{key}")
+        return v.get("value") if isinstance(v, dict) else v
+
+    by_sector = {_val(e, "aspectSector"): _val(e, "centroid") for e in entities}
+    assert "S" in by_sector and "flat" in by_sector
+    assert by_sector["S"][1] > 42.8006  # centre of the 12-row grid: the S zone is north of it
+
+
+def test_integer_dem_gentle_ramps_stay_flat():
+    """IGN serves whole metres: a gentle ramp must not become 1 m stripes."""
+    from app.downscaler import discretize_aspect
+    from app.zone_accumulator import _terrain
+    size = 8.97e-5  # ~10 m
+    for degrees in (0.5, 1.0, 1.5):
+        drop_per_row = np.tan(np.radians(degrees)) * size * 111_320.0
+        elev = np.round(np.repeat((np.arange(60)[::-1] * drop_per_row)[:, None], 60, axis=1))
+        slope, aspect = _terrain(elev, size)
+        sectors = discretize_aspect(aspect, slope)[3:-3, 3:-3]
+        assert np.all(sectors == 0), degrees
+
+
+def test_integer_dem_real_slope_keeps_its_aspect():
+    from app.downscaler import discretize_aspect
+    from app.zone_accumulator import _terrain
+    size = 8.97e-5
+    drop_per_row = np.tan(np.radians(5.0)) * size * 111_320.0
+    elev = np.round(np.repeat((np.arange(60)[::-1] * drop_per_row)[:, None], 60, axis=1))
+    slope, aspect = _terrain(elev, size)
+    assert np.all(discretize_aspect(aspect, slope)[3:-3, 3:-3] == 5)
+
+
+def _covering(lat_top=42.8012):
+    return {**PARCEL, "location": {"type": "Polygon", "coordinates": [[
+        [-1.65, 42.8], [-1.6488, 42.8], [-1.6488, lat_top], [-1.65, lat_top], [-1.65, 42.8],
+    ]]}}
+
+
+@pytest.mark.asyncio
+async def test_zone_stats_describe_only_the_parcel_part(zone_env, monkeypatch):
+    """A tile-wide zone clipped to the south half: centroid and pixels of that half only."""
+    dem = _dem()
+    dem["elevations"] = [[DEM_BASE_ELEVATION] * 12 for _ in range(12)]
+    monkeypatch.setattr(zone_env, "fetch_dem_tile", AsyncMock(return_value=dem))
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=WEATHER))
+
+    entities = await zone_env.process_parcel("t", _covering(lat_top=42.8006), "2026-09-02")
+
+    assert len(entities) == 1
+    centroid = entities[0]["nkz:centroid"]["value"]
+    assert centroid[1] < 42.8006
+    assert entities[0]["nkz:pixelCount"]["value"] <= 72
+
+
+@pytest.mark.asyncio
+async def test_invalid_parcel_geometry_is_repaired(zone_env, monkeypatch):
+    dem = _dem()
+    dem["elevations"] = [[DEM_BASE_ELEVATION] * 12 for _ in range(12)]
+    monkeypatch.setattr(zone_env, "fetch_dem_tile", AsyncMock(return_value=dem))
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=WEATHER))
+    bowtie = {**PARCEL, "location": {"type": "Polygon", "coordinates": [[
+        [-1.65, 42.8], [-1.6488, 42.8012], [-1.6488, 42.8], [-1.65, 42.8012], [-1.65, 42.8],
+    ]]}}
+    assert await zone_env.process_parcel("t", bowtie, "2026-09-02")
+
+
+@pytest.mark.asyncio
+async def test_missing_weather_is_undecided_not_empty(zone_env, monkeypatch):
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=None))
+    assert await zone_env.process_parcel("t", _covering(), "2026-09-02") is None
+
+
+@pytest.mark.asyncio
+async def test_parcel_without_zones_drops_its_stale_zones(zone_env, monkeypatch):
+    from app import zone_accumulator as za
+    deleted: dict = {}
+
+    async def _delete(tenant_id, parcel_id, keep_ids):
+        deleted[parcel_id] = keep_ids
+
+    monkeypatch.setattr(za, "fetch_tenant_parcels", AsyncMock(return_value=[PARCEL]))
+    monkeypatch.setattr(za, "process_parcel", AsyncMock(return_value=[]))
+    monkeypatch.setattr(za, "upsert_agri_parcel_zones", AsyncMock())
+    monkeypatch.setattr(za, "_delete_stale_zones", _delete)
+    await za.run_for_tenant("t")
+    assert deleted == {PARCEL["id"]: set()}
+
+
+@pytest.mark.asyncio
+async def test_undecided_parcel_keeps_its_zones(zone_env, monkeypatch):
+    from app import zone_accumulator as za
+    deleted: dict = {}
+
+    async def _delete(tenant_id, parcel_id, keep_ids):
+        deleted[parcel_id] = keep_ids
+
+    monkeypatch.setattr(za, "fetch_tenant_parcels", AsyncMock(return_value=[PARCEL]))
+    monkeypatch.setattr(za, "process_parcel", AsyncMock(return_value=None))
+    monkeypatch.setattr(za, "upsert_agri_parcel_zones", AsyncMock())
+    monkeypatch.setattr(za, "_delete_stale_zones", _delete)
+    await za.run_for_tenant("t")
+    assert deleted == {}
