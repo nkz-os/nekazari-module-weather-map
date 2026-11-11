@@ -7,7 +7,7 @@ from typing import Any
 
 import asyncpg
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from nkz_platform_sdk import OrionClient
 
 from app.auth import require_tenant
@@ -153,7 +153,22 @@ async def get_zones(
     return {"parcel_id": pid, "zones": zones}
 
 
-@router.get("/gdd")
+def _mark_deprecated(
+    request: Request,
+    response: Response,
+    tenant_id: str = Depends(require_tenant),
+) -> None:
+    """Add `Deprecation: true` and log one WARNING line per call."""
+    response.headers["Deprecation"] = "true"
+    logger.warning(
+        "deprecated_endpoint tenant=%s path=%s user_agent=%r",
+        tenant_id,
+        request.url.path,
+        (request.headers.get("user-agent") or "-")[:200],
+    )
+
+
+@router.get("/gdd", dependencies=[Depends(_mark_deprecated)])
 async def get_gdd(
     parcel_id: str = Query(..., description="Parcel URN"),
     season_start: str = Query(..., description="Season start date (YYYY-MM-DD)"),

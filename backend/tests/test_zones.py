@@ -91,3 +91,41 @@ def test_gdd_uses_tenant_scoped_parcel(client):
     assert resp.json()["source"] == "regional_knn"
     mock_conn.fetch.assert_awaited_once()
     assert mock_conn.fetch.await_args.args[1] == "urn:ngsi-ld:AgriParcel:p1"
+
+
+def _gdd_ok_patches():
+    fake_parcel = {"id": "urn:ngsi-ld:AgriParcel:demo-coop:p1"}
+    mock_conn = AsyncMock()
+    mock_conn.fetch = AsyncMock(return_value=[])
+    mock_conn.close = AsyncMock()
+    return (
+        patch("app.zones.fetch_agri_parcel", new=AsyncMock(return_value=fake_parcel)),
+        patch.object(settings, "postgres_url", "postgres://test"),
+        patch("app.zones.asyncpg.connect", new=AsyncMock(return_value=mock_conn)),
+    )
+
+
+def test_gdd_endpoint_marks_deprecation_header(client):
+    p1, p2, p3 = _gdd_ok_patches()
+    with p1, p2, p3:
+        resp = client.get(
+            "/api/weather-map/gdd?parcel_id=p1&season_start=2026-01-01",
+            headers=AUTH_HEADERS,
+        )
+    assert resp.status_code == 200
+    assert resp.headers.get("Deprecation") == "true"
+    assert resp.json()["source"] == "regional_knn"
+
+
+def test_gdd_endpoint_logs_caller(client, caplog):
+    p1, p2, p3 = _gdd_ok_patches()
+    with p1, p2, p3, caplog.at_level("WARNING", logger="app.zones"):
+        client.get(
+            "/api/weather-map/gdd?parcel_id=p1&season_start=2026-01-01",
+            headers={**AUTH_HEADERS, "User-Agent": "probe-agent/1.0"},
+        )
+    lines = [r.getMessage() for r in caplog.records if "deprecated_endpoint" in r.getMessage()]
+    assert len(lines) == 1
+    assert "tenant=demo-coop" in lines[0]
+    assert "path=/api/weather-map/gdd" in lines[0]
+    assert "probe-agent/1.0" in lines[0]
