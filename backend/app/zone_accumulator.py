@@ -16,7 +16,9 @@ import geohash2
 import numpy as np
 
 from app.config import settings
-from app.downscaler import compute_zones, correct_temperature, compute_eto, clamp_ea_to_es
+from app.dem_grid import dem_transform, pixel_center_grids
+from nkz_platform_sdk.gis.terrain import aspect_degrees, slope_degrees
+from app.downscaler import compute_zones, discretize_aspect, correct_temperature, compute_eto, clamp_ea_to_es
 from app.records import build_agri_parcel_zone
 from app.stats import compute_zonal_stats
 from nkz_platform_sdk import OrionClient
@@ -76,18 +78,6 @@ def _compute_area_ha(pixel_count: int) -> float:
     return pixel_count * PIXEL_AREA_HA
 
 
-def _gradient(elev: np.ndarray, resolution: float) -> tuple[np.ndarray, np.ndarray]:
-    """Compute dz/dx and dz/dy (central differences) of a 2-D elevation array."""
-    dzdx = np.zeros_like(elev, dtype=float)
-    dzdy = np.zeros_like(elev, dtype=float)
-    if elev.shape[0] < 3 or elev.shape[1] < 3:
-        return dzdx, dzdy
-    scale = 2.0 * resolution
-    dzdx[1:-1, 1:-1] = (elev[1:-1, 2:] - elev[1:-1, :-2]) / scale
-    dzdy[1:-1, 1:-1] = (elev[2:, 1:-1] - elev[:-2, 1:-1]) / scale
-    return dzdx, dzdy
-
-
 def _geom_geojson_bbox(geometry: dict) -> tuple[float, float, float, float]:
     """Return (min_lon, min_lat, max_lon, max_lat) from a GeoJSON geometry."""
     try:
@@ -134,15 +124,22 @@ def _zone_geometry(
     if merged.is_empty:
         return {}
 
+    # Smooth the pixel staircase first (topology kept: no spikes), then clip so
+    # the zone follows the parcel boundary exactly.
+    merged = merged.simplify(tolerance=simplify_tol / 2.0, preserve_topology=True)
+
     if parcel_geom and parcel_geom.get("type") in ("Polygon", "MultiPolygon"):
         try:
             merged = merged.intersection(_shp_shape(parcel_geom))
         except Exception:
-            pass
+            logger.exception("Zone clip to parcel failed")
+            return {}
         if merged.is_empty:
             return {}
 
-    merged = merged.simplify(tolerance=simplify_tol, preserve_topology=False)
+    if merged.geom_type == "GeometryCollection":
+        parts = [g for g in merged.geoms if g.geom_type in ("Polygon", "MultiPolygon")]
+        merged = _union(parts) if parts else merged
     if merged.is_empty or merged.geom_type not in ("Polygon", "MultiPolygon"):
         return {}
     return _shp_mapping(merged)
@@ -178,18 +175,16 @@ async def process_parcel(
         if elev.size == 0:
             continue
         pixel_size = float(dem.get("pixel_size_deg", 0.0001))
-        dzdx, dzdy = _gradient(elev, pixel_size)
-        slope = np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2)))
-        aspect = np.degrees(np.arctan2(-dzdx, dzdy))
-        aspect = np.where(aspect < 0, aspect + 360, aspect)
-        np.nan_to_num(slope, nan=0.0, copy=False)
-        np.nan_to_num(aspect, nan=0.0, copy=False)
+        # Horn (1981) in metres; the grid rows run north to south (see app.dem_grid).
+        slope = slope_degrees(elev, pixel_size)
+        aspect = aspect_degrees(elev, pixel_size)
         tile_data.append({
             "elev": elev,
             "slope": slope,
             "aspect": aspect,
             "origin_lon": float(dem.get("origin_lon", 0)),
             "origin_lat": float(dem.get("origin_lat", 0)),
+            "north_lat": dem.get("north_lat"),
             "pixel_size": pixel_size,
             "rows": int(dem.get("rows", elev.shape[0])),
             "cols": int(dem.get("cols", elev.shape[1])),
@@ -202,10 +197,12 @@ async def process_parcel(
     # 3. Zones per tile
     zones_all: list[dict] = []
     for td in tile_data:
-        rows, cols = td["rows"], td["cols"]
-        lon = np.linspace(td["origin_lon"], td["origin_lon"] + td["pixel_size"] * cols, cols)
-        lat = np.linspace(td["origin_lat"], td["origin_lat"] + td["pixel_size"] * rows, rows)
-        lon_g, lat_g = np.meshgrid(lon, lat)
+        grid = {
+            "origin_lon": td["origin_lon"], "origin_lat": td["origin_lat"],
+            "north_lat": td["north_lat"], "pixel_size_deg": td["pixel_size"],
+            "rows": td["rows"], "cols": td["cols"],
+        }
+        lon_g, lat_g = pixel_center_grids(grid)
 
         _, tile_labels = compute_zones(
             td["elev"], td["aspect"], td["slope"],
@@ -213,13 +210,7 @@ async def process_parcel(
             elevation_band_m=settings.zones_elevation_band_m,
         )
 
-        from rasterio.transform import Affine
-        # Pixel (row, col) -> (lon, lat): col 0 = origin_lon (west), row 0 =
-        # origin_lat (south) per the lon/lat linspaces above.
-        tile_transform = Affine(
-            td["pixel_size"], 0.0, td["origin_lon"],
-            0.0, td["pixel_size"], td["origin_lat"],
-        )
+        tile_transform = dem_transform(grid)
 
         for label in range(1, tile_labels.max() + 1):
             mask = (tile_labels == label)
@@ -232,9 +223,10 @@ async def process_parcel(
             zone_lat = float(np.mean(lat_g[mask]))
             elev_mean = float(np.mean(td["elev"][mask]))
             elev_band = int(elev_mean / settings.zones_elevation_band_m)
-            sector_idx = int(np.round(np.mean(td["aspect"][mask]) / 45)) % 8 + 1
-            if sector_idx < 0 or sector_idx >= len(_SECTOR_NAMES):
-                sector_idx = 0
+            # Dominant discretised sector (flat below 2 deg), not the mean angle:
+            # a flat zone has no aspect and averaging angles wraps at north.
+            sectors = discretize_aspect(td["aspect"][mask], td["slope"][mask])
+            sector_idx = int(np.bincount(sectors.astype(int), minlength=len(_SECTOR_NAMES)).argmax())
             gh = geohash2.encode(zone_lat, zone_lon, precision=7)
             zone_id = f"z{gh}-e{elev_band}-{_SECTOR_NAMES[sector_idx]}"
 
