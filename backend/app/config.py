@@ -35,6 +35,9 @@ class Settings:
     # Zone generation
     zones_min_pixels: int = int(os.getenv("ZONES_MIN_PIXELS", "50"))
     zones_max_count: int = int(os.getenv("ZONES_MAX_COUNT", "20"))
+    # A zone is published for a parcel only if its part inside the parcel is
+    # at least this large: edges of zones that merely graze the parcel are not zones.
+    zones_min_parcel_ha: float = float(os.getenv("ZONES_MIN_PARCEL_HA", "0.1"))
     zones_elevation_band_m: float = float(os.getenv("ZONES_ELEVATION_BAND_M", "50.0"))
     zones_cog_ttl_days: int = int(os.getenv("ZONES_COG_TTL_DAYS", "30"))
     monitored_tenants: str = os.getenv("MONITORED_TENANTS", "")

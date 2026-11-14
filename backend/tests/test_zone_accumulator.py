@@ -511,3 +511,31 @@ async def test_undecided_parcel_keeps_its_zones(zone_env, monkeypatch):
     monkeypatch.setattr(za, "_delete_stale_zones", _delete)
     await za.run_for_tenant("t")
     assert deleted == {}
+
+
+@pytest.mark.asyncio
+async def test_zone_with_a_sliver_inside_the_parcel_is_dropped(zone_env, monkeypatch):
+    """A zone that only grazes the parcel edge is not published as a zone of it."""
+    dem = _dem()
+    dem["elevations"] = [[DEM_BASE_ELEVATION] * 12 for _ in range(12)]
+    monkeypatch.setattr(zone_env, "fetch_dem_tile", AsyncMock(return_value=dem))
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=WEATHER))
+    monkeypatch.setattr(zone_env.settings, "zones_min_parcel_ha", 0.1)
+
+    def _two_labels(elev, aspect, slope, **kwargs):
+        labels = np.full(elev.shape, 1, dtype=int)
+        labels[0:2, -1] = 2  # two pixels in the north-east corner: ~0.02 ha inside the parcel
+        return [], labels
+
+    monkeypatch.setattr(zone_env, "compute_zones", _two_labels)
+    entities = await zone_env.process_parcel("t", _covering(), "2026-09-02")
+    assert len(entities) == 1
+
+
+def test_zone_area_ha_of_the_clipped_geometry():
+    from app.zone_accumulator import _geometry_area_ha
+    square = {"type": "Polygon", "coordinates": [[
+        [-1.65, 42.8], [-1.6488, 42.8], [-1.6488, 42.8009], [-1.65, 42.8009], [-1.65, 42.8],
+    ]]}
+    # ~98 m (E-W at 42.8 N) x ~100 m (N-S) ~= 0.98 ha
+    assert _geometry_area_ha(square) == pytest.approx(0.98, rel=0.03)
