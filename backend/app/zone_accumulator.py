@@ -22,7 +22,7 @@ from nkz_platform_sdk.gis.terrain import aspect_degrees, slope_degrees
 from rasterio.features import geometry_mask
 from app.downscaler import compute_zones, discretize_aspect, correct_temperature, compute_eto, clamp_ea_to_es
 from app.records import build_agri_parcel_zone
-from app.stats import compute_zonal_stats
+from app.slope_radiation import slope_radiation_wm2
 from nkz_platform_sdk import OrionClient
 from app.sources import (
     MissingWeatherInput,
@@ -40,6 +40,8 @@ from app.tenants import discover_tenants
 logger = logging.getLogger(__name__)
 
 _M_PER_DEG = 111_320.0  # same constant as _geometry_area_ha and the SDK terrain maths
+
+_TERRAIN_KEY = "_terrain_px"
 
 _SECTOR_NAMES = ["flat", "N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
@@ -322,6 +324,9 @@ async def process_parcel(
                 "areaHa": round(_compute_area_ha(lat_g[mask], td["pixel_size"], td["pixel_height"]), 2),
                 "centroid": [round(zone_lon, 6), round(zone_lat, 6)],
                 "geometry": zone_geom,
+                # Private (never published): the zone's own pixels for the slope
+                # radiation model; see _zone_radiation.
+                _TERRAIN_KEY: (td["slope"][mask].copy(), td["aspect"][mask].copy()),
             })
 
     if not zones_all:
@@ -381,7 +386,9 @@ async def process_parcel(
             "tMax": round(t_max_z, 1),
             "eto": round(float(eto[0]), 2),
         }
-        cog_values, cog_checked = await _zone_cog_metrics(tenant_id, zd)
+        cog_values, cog_checked = _zone_radiation(
+            zd, doy=doy, rs_mj=float(rs_mj), ea_kpa=float(ea_kpa),
+        )
         metrics.update(cog_values)
         area_ha = zd["areaHa"]
         entity = build_agri_parcel_zone(
@@ -406,43 +413,53 @@ async def process_parcel(
     return entity_list
 
 
-# TODO(Task 3): the zone value is the horizontal parcel radiation read from the
-# public raster; P5a Task 3 replaces it with the slope/aspect model ("modelled
-# from terrain"), which must stay out of every public raster and /stats.
-_COG_METRICS = (("solar_radiation", "solarRadiationWm2"),)
 # Retired metric: still reported as "checked" so a stale value is cleared from
 # zones that carry it (contract step of the expand-contract retirement).
 _RETIRED_ZONE_ATTRS = ("frostRisk",)
+_MJ_DAY_TO_WM2 = 1e6 / 86_400.0
 
 
-async def _zone_cog_metrics(tenant_id: str, zone: dict) -> tuple[dict[str, float], set[str]]:
-    """Mean solar radiation over the zone polygon, from the COG.
+def _zone_radiation(
+    zone: dict, *, doy: int, rs_mj: float, ea_kpa: float,
+) -> tuple[dict[str, float], set[str]]:
+    """Modelled daily radiation on the zone's slopes, from the horizontal parcel value.
 
-    Returns ``(values, checked)``: ``values`` holds only what the COGs actually
-    contain (nothing is fabricated); ``checked`` names the attributes whose
-    lookup completed without error (including "no data"), i.e. those a stale
-    value may safely be cleared for. A zone without its own geometry or a
-    failure yields nothing checked for the affected metric.
+    Allen, Trezza & Tasumi (2006) translation of the running day's horizontal
+    ``rs_mj`` to each zone pixel's slope and aspect, averaged over the zone.
+    Internal to the zone attribute ``nkz:solarRadiationWm2`` ("modelled from
+    terrain"); the public raster and ``/stats`` radiation stay horizontal.
+
+    Returns ``(values, checked)``: ``values`` holds only what was computed
+    (nothing is fabricated); ``checked`` names the attributes a stale value may
+    be cleared for. A zone without terrain pixels or a model failure leaves the
+    radiation unchecked, so an earlier value is kept rather than erased.
     """
-    geom = zone.get("geometry")
-    if not geom:
-        # Never fall back to the parcel geometry: that would label a parcel
-        # value as a zone value.
-        logger.debug("Zone %s has no own geometry; skipping radiation", zone.get("id"))
-        return {}, set()
-    out: dict[str, float] = {}
     checked: set[str] = set(_RETIRED_ZONE_ATTRS)
-    for metric, key in _COG_METRICS:
-        try:
-            stats = await asyncio.to_thread(compute_zonal_stats, tenant_id, geom, [metric])
-        except Exception as exc:
-            logger.warning("Zonal radiation failed for zone %s: %s", zone.get("id"), exc)
-            continue
-        checked.add(key)
-        mean = ((stats.get("metrics") or {}).get(metric) or {}).get("mean")
-        if mean is not None:
-            out[key] = round(float(mean), 1)
-    return out, checked
+    px = zone.get(_TERRAIN_KEY)
+    if px is None or len(px[0]) == 0:
+        logger.debug("Zone %s has no terrain pixels; skipping radiation", zone.get("id"))
+        return {}, checked
+    slopes, aspects = px
+    rs_wm2 = rs_mj * _MJ_DAY_TO_WM2
+    lat = float(zone["centroid"][1])
+    elev = float(zone.get("elevationMean", 0.0))
+    cache: dict[tuple[float, float], float] = {}
+    try:
+        total = 0.0
+        for s, a in zip(slopes.tolist(), aspects.tolist()):
+            # 0.5 deg bins: the model is smooth, thousands of pixels share a bin.
+            key = (round(min(max(s, 0.0), 90.0) * 2) / 2, round((a % 360.0) * 2) / 2)
+            if key not in cache:
+                cache[key] = slope_radiation_wm2(
+                    rs_wm2, lat, doy, key[0], key[1], elev, ea_kpa,
+                )
+            total += cache[key]
+        mean = total / len(slopes)
+    except Exception as exc:
+        logger.warning("Slope radiation failed for zone %s: %s", zone.get("id"), exc)
+        return {}, checked
+    checked.add("solarRadiationWm2")
+    return {"solarRadiationWm2": round(mean, 1)}, checked
 
 
 async def _delete_stale_zones(

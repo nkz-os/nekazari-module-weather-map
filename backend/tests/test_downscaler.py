@@ -5,7 +5,6 @@ import numpy as np
 
 from app.downscaler import (
     correct_temperature,
-    correct_solar_radiation,
     compute_eto,
     extraterrestrial_radiation,
     clear_sky_radiation,
@@ -51,88 +50,6 @@ class TestCorrectTemperature:
         result = correct_temperature(t_base=10.0, station_elevation_m=100.0, pixel_elevations=elev)
         expected = 10.0 - (-50.0 - 100.0) * 0.0065  # 10 + 0.975 = 10.975
         assert np.allclose(result, expected, atol=0.01)
-
-
-class TestCorrectSolarRadiation:
-    """Solar radiation correction for slope and aspect."""
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="slope radiation model broken, see PENDING; fixed in P5",
-    )
-    def test_flat_surface_returns_base(self):
-        """Flat surface (slope=0) with no clouds should give approx base value."""
-        lat = np.full((2, 2), 40.0)
-        aspect = np.full((2, 2), 0.0)
-        slope = np.full((2, 2), 0.0)
-        doy = 172  # summer solstice approximately
-        rad_base = 350.0  # W/m²
-
-        result = correct_solar_radiation(rad_base, lat, aspect, slope, doy)
-        assert result.shape == (2, 2)
-        assert np.all(result >= 0)
-        # Flat surface must return the base value.
-        np.testing.assert_allclose(result, rad_base, rtol=0.05)
-
-    def test_south_vs_north(self):
-        """South-facing slope gets more radiation than north-facing (northern hemisphere)."""
-        # 40°N latitude, 10° slope
-        lat = np.full((2,), 40.0)
-        aspect = np.array([180.0, 0.0])  # south, north
-        slope = np.full((2,), 10.0)
-        doy = 80  # spring, decent sun angle
-        rad_base = 400.0
-
-        lat_2d = lat.reshape(2, 1)
-        aspect_2d = aspect.reshape(2, 1)
-        slope_2d = slope.reshape(2, 1)
-
-        result = correct_solar_radiation(rad_base, lat_2d, aspect_2d, slope_2d, doy)
-        # South-facing should get more radiation
-        assert result[0, 0] > result[1, 0], (
-            f"South-facing ({result[0,0]:.1f}) should exceed north-facing ({result[1,0]:.1f}) in NH"
-        )
-
-    def test_winter_south_advantage(self):
-        """In winter, south advantage is more pronounced."""
-        lat = np.full((2,), 40.0)
-        aspect = np.array([180.0, 0.0])
-        slope = np.full((2,), 15.0)
-        doy = 355  # winter solstice
-        rad_base = 200.0
-
-        lat_2d = lat.reshape(2, 1)
-        aspect_2d = aspect.reshape(2, 1)
-        slope_2d = slope.reshape(2, 1)
-
-        result = correct_solar_radiation(rad_base, lat_2d, aspect_2d, slope_2d, doy)
-        assert result[0, 0] > result[1, 0]
-
-    def test_high_cloudiness_reduces_radiation(self):
-        """Very cloudy (low base rad / clear-sky ratio) should reduce corrected radiation."""
-        lat = np.full((2, 2), 40.0)
-        aspect = np.full((2, 2), 0.0)
-        slope = np.full((2, 2), 0.0)
-        doy = 172
-
-        # Very low base radiation (dense overcast)
-        result_low = correct_solar_radiation(50.0, lat, aspect, slope, doy)
-        result_high = correct_solar_radiation(400.0, lat, aspect, slope, doy)
-
-        assert np.all(result_low >= 0)
-        assert np.all(result_high >= 0)
-
-    def test_output_clipped(self):
-        """Output should be clipped to [0, 1200]."""
-        lat = np.full((2, 2), 0.0)  # equator, high potential
-        aspect = np.full((2, 2), 0.0)
-        slope = np.full((2, 2), 0.0)
-        doy = 80
-        rad_base = 1200.0  # unrealistically high
-
-        result = correct_solar_radiation(rad_base, lat, aspect, slope, doy)
-        assert np.all(result <= 1200)
-        assert np.all(result >= 0)
 
 
 class TestComputeETo:

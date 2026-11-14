@@ -171,7 +171,6 @@ def zone_env(monkeypatch):
         return list(zones)
 
     monkeypatch.setattr(za, "find_nearby_sensors", _no_sensors)
-    monkeypatch.setattr(za, "compute_zonal_stats", lambda *a, **k: {"error": "no cog", "metrics": {}})
     return za
 
 
@@ -300,76 +299,68 @@ async def test_colliding_zone_ids_yield_distinct_entities(zone_env, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_zone_gets_radiation_from_cog_and_no_frost(zone_env, monkeypatch):
+async def test_zone_gets_modelled_slope_radiation_and_no_frost(zone_env, monkeypatch):
+    """Zone radiation is the Allen et al. slope model, not the horizontal raster value."""
+    from app import slope_radiation as sr
+
     monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
     calls = []
+    real = sr.slope_radiation_wm2
 
-    def _fake(tenant, geom, metrics, date=None):
-        calls.append(tuple(metrics))
-        return {"metrics": {metrics[0]: {"mean": 200.0}}}
+    def _spy(*a, **k):
+        calls.append(a)
+        return real(*a, **k)
 
-    monkeypatch.setattr(zone_env, "compute_zonal_stats", _fake)
+    monkeypatch.setattr(zone_env, "slope_radiation_wm2", _spy)
     entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
-    assert entities
-    assert len(calls) == len(entities)
-    assert set(calls) == {("solar_radiation",)}
+    assert entities and calls
+    rs_wm2 = WEATHER["rs_mj"] * 1e6 / 86400.0
     for e in entities:
-        assert e["nkz:solarRadiationWm2"]["value"] == 200.0
+        v = e["nkz:solarRadiationWm2"]["value"]
+        assert 0.0 < v < 2.0 * rs_wm2
         assert "nkz:frostRisk" not in e
-        # the retired attribute is still cleared from zones that carry it
         assert "frostRisk" in e["_cog_checked"] and "solarRadiationWm2" in e["_cog_checked"]
+    # horizontal value goes in as the measurement, doy and ea from /daily
+    assert all(c[0] == pytest.approx(rs_wm2) and c[2] == WEATHER["doy"] and c[6] == WEATHER["ea_kpa"] for c in calls)
 
 
-@pytest.mark.asyncio
-async def test_zone_without_radiation_cog_still_clears_retired_frost(zone_env, monkeypatch):
-    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
-    monkeypatch.setattr(
-        zone_env, "compute_zonal_stats",
-        lambda *a, **k: {"error": "No COG data available", "metrics": {}},
-    )
-    entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
-    assert entities
-    for e in entities:
-        assert "nkz:solarRadiationWm2" not in e and "nkz:frostRisk" not in e
-        assert "frostRisk" in e["_cog_checked"]
+def test_zone_radiation_north_slope_below_south_slope_in_winter():
+    from app import zone_accumulator as za
+
+    def _zone(aspect):
+        return {
+            "id": "z", "centroid": [-1.65, 42.8], "elevationMean": 500.0,
+            za._TERRAIN_KEY: (np.full(50, 20.0), np.full(50, aspect)),
+        }
+
+    kw = {"doy": 355, "rs_mj": 5.0, "ea_kpa": 0.8}
+    south, _ = za._zone_radiation(_zone(180.0), **kw)
+    north, _ = za._zone_radiation(_zone(0.0), **kw)
+    flat, _ = za._zone_radiation({**_zone(0.0), za._TERRAIN_KEY: (np.zeros(50), np.zeros(50))}, **kw)
+    assert south["solarRadiationWm2"] > flat["solarRadiationWm2"] > north["solarRadiationWm2"]
+    assert flat["solarRadiationWm2"] == pytest.approx(5.0 * 1e6 / 86400.0, abs=0.1)
 
 
-@pytest.mark.asyncio
-async def test_zone_radiation_absent_without_cog(zone_env, monkeypatch):
-    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
-    monkeypatch.setattr(
-        zone_env, "compute_zonal_stats",
-        lambda *a, **k: {"error": "No COG data available", "metrics": {}},
-    )
-    entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
-    assert entities
-    for e in entities:
-        assert "nkz:solarRadiationWm2" not in e and "nkz:frostRisk" not in e
-
-
-@pytest.mark.asyncio
-async def test_zone_stats_failure_is_isolated(zone_env, monkeypatch, caplog):
-    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
+def test_zone_radiation_failure_is_isolated(monkeypatch, caplog):
+    from app import zone_accumulator as za
 
     def _boom(*a, **k):
-        raise RuntimeError("minio down")
+        raise RuntimeError("model down")
 
-    monkeypatch.setattr(zone_env, "compute_zonal_stats", _boom)
+    monkeypatch.setattr(za, "slope_radiation_wm2", _boom)
+    zone = {"id": "z", "centroid": [0.0, 42.0], za._TERRAIN_KEY: (np.ones(3), np.ones(3))}
     with caplog.at_level(logging.WARNING):
-        entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
-    assert entities and all("nkz:frostRisk" not in e for e in entities)
-    assert "Zonal radiation failed" in caplog.text
-    assert "minio down" in caplog.text
+        values, checked = za._zone_radiation(zone, doy=100, rs_mj=15.0, ea_kpa=1.0)
+    assert values == {}
+    assert "solarRadiationWm2" not in checked  # a stale value is kept, not erased
+    assert "Slope radiation failed" in caplog.text and "model down" in caplog.text
 
 
-@pytest.mark.asyncio
-async def test_zone_without_geometry_skips_stats_no_parcel_fallback():
+def test_zone_without_terrain_pixels_gives_no_radiation():
     from app import zone_accumulator as za
-    from unittest.mock import patch
-
-    with patch.object(za, "compute_zonal_stats") as m:
-        assert await za._zone_cog_metrics("t", {"id": "z1"}) == ({}, set())
-    m.assert_not_called()
+    assert za._zone_radiation({"id": "z1", "centroid": [0, 42]}, doy=100, rs_mj=15.0, ea_kpa=1.0) == (
+        {}, {"frostRisk"},
+    )
 
 
 @pytest.mark.asyncio
