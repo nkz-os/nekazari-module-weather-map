@@ -47,13 +47,6 @@ PALETTES: dict[str, list[tuple[float, int, int, int, int]]] = {
         (15,   100, 200, 180, 255),   # Cyan (surplus)
         (30,   0,   100, 200, 255),   # Blue
     ],
-    "frost_risk": [
-        (0,    50,  180, 50,  255),   # Green (safe)
-        (25,   180, 200, 50,  255),
-        (50,   220, 180, 40,  255),   # Orange
-        (75,   240, 100, 30,  255),
-        (100,  180, 0,   0,   255),   # Dark red (risk)
-    ],
     "soil_moisture": [
         (0,    120, 60,  20,  255),   # Brown (dry)
         (15,   180, 140, 60,  255),

@@ -44,3 +44,21 @@ def test_signed_token_is_bound_to_tenant_and_metric(monkeypatch):
 def test_stats_requires_tenant_header():
     r = client.get("/api/weather-map/stats/urn:ngsi-ld:AgriParcel:p1?metrics=eto")
     assert r.status_code == 401
+
+
+AUTH = {"X-Tenant-ID": "acmefarm", "X-User-ID": "test-user"}
+
+
+def test_retired_metric_latest_says_why(monkeypatch):
+    monkeypatch.setattr("app.tiles.get_latest_date", lambda t, m: None)
+    r = client.get("/api/weather-map/latest/frost_risk", headers=AUTH)
+    assert r.status_code == 404
+    assert "Retired" in r.json()["detail"]
+
+
+def test_retired_metric_has_no_tile_token(monkeypatch):
+    from app import config
+    monkeypatch.setattr(config.settings, "tile_token_secret", "test-secret")
+    r = client.get("/api/weather-map/tiles-base/frost_risk", headers=AUTH)
+    assert r.status_code == 404
+    assert "Retired" in r.json()["detail"]

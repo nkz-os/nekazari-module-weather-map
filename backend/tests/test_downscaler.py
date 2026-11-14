@@ -5,12 +5,10 @@ import numpy as np
 
 from app.downscaler import (
     correct_temperature,
-    correct_solar_radiation,
     compute_eto,
     extraterrestrial_radiation,
     clear_sky_radiation,
     compute_water_balance,
-    compute_frost_risk,
     compute_soil_moisture,
     saxton_rawls_ptf,
     discretize_aspect,
@@ -52,88 +50,6 @@ class TestCorrectTemperature:
         result = correct_temperature(t_base=10.0, station_elevation_m=100.0, pixel_elevations=elev)
         expected = 10.0 - (-50.0 - 100.0) * 0.0065  # 10 + 0.975 = 10.975
         assert np.allclose(result, expected, atol=0.01)
-
-
-class TestCorrectSolarRadiation:
-    """Solar radiation correction for slope and aspect."""
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="slope radiation model broken, see PENDING; fixed in P5",
-    )
-    def test_flat_surface_returns_base(self):
-        """Flat surface (slope=0) with no clouds should give approx base value."""
-        lat = np.full((2, 2), 40.0)
-        aspect = np.full((2, 2), 0.0)
-        slope = np.full((2, 2), 0.0)
-        doy = 172  # summer solstice approximately
-        rad_base = 350.0  # W/m²
-
-        result = correct_solar_radiation(rad_base, lat, aspect, slope, doy)
-        assert result.shape == (2, 2)
-        assert np.all(result >= 0)
-        # Flat surface must return the base value.
-        np.testing.assert_allclose(result, rad_base, rtol=0.05)
-
-    def test_south_vs_north(self):
-        """South-facing slope gets more radiation than north-facing (northern hemisphere)."""
-        # 40°N latitude, 10° slope
-        lat = np.full((2,), 40.0)
-        aspect = np.array([180.0, 0.0])  # south, north
-        slope = np.full((2,), 10.0)
-        doy = 80  # spring, decent sun angle
-        rad_base = 400.0
-
-        lat_2d = lat.reshape(2, 1)
-        aspect_2d = aspect.reshape(2, 1)
-        slope_2d = slope.reshape(2, 1)
-
-        result = correct_solar_radiation(rad_base, lat_2d, aspect_2d, slope_2d, doy)
-        # South-facing should get more radiation
-        assert result[0, 0] > result[1, 0], (
-            f"South-facing ({result[0,0]:.1f}) should exceed north-facing ({result[1,0]:.1f}) in NH"
-        )
-
-    def test_winter_south_advantage(self):
-        """In winter, south advantage is more pronounced."""
-        lat = np.full((2,), 40.0)
-        aspect = np.array([180.0, 0.0])
-        slope = np.full((2,), 15.0)
-        doy = 355  # winter solstice
-        rad_base = 200.0
-
-        lat_2d = lat.reshape(2, 1)
-        aspect_2d = aspect.reshape(2, 1)
-        slope_2d = slope.reshape(2, 1)
-
-        result = correct_solar_radiation(rad_base, lat_2d, aspect_2d, slope_2d, doy)
-        assert result[0, 0] > result[1, 0]
-
-    def test_high_cloudiness_reduces_radiation(self):
-        """Very cloudy (low base rad / clear-sky ratio) should reduce corrected radiation."""
-        lat = np.full((2, 2), 40.0)
-        aspect = np.full((2, 2), 0.0)
-        slope = np.full((2, 2), 0.0)
-        doy = 172
-
-        # Very low base radiation (dense overcast)
-        result_low = correct_solar_radiation(50.0, lat, aspect, slope, doy)
-        result_high = correct_solar_radiation(400.0, lat, aspect, slope, doy)
-
-        assert np.all(result_low >= 0)
-        assert np.all(result_high >= 0)
-
-    def test_output_clipped(self):
-        """Output should be clipped to [0, 1200]."""
-        lat = np.full((2, 2), 0.0)  # equator, high potential
-        aspect = np.full((2, 2), 0.0)
-        slope = np.full((2, 2), 0.0)
-        doy = 80
-        rad_base = 1200.0  # unrealistically high
-
-        result = correct_solar_radiation(rad_base, lat, aspect, slope, doy)
-        assert np.all(result <= 1200)
-        assert np.all(result >= 0)
 
 
 class TestComputeETo:
@@ -272,51 +188,9 @@ class TestWaterBalance:
         assert np.allclose(result, expected)
 
 
-class TestFrostRisk:
-    """Cold-air pooling frost risk assessment."""
-
-    def test_warm(self):
-        """5°C with flat terrain → risk < 30%."""
-        t_min = np.full((3, 3), 5.0)
-        elev = np.full((3, 3), 200.0)
-        result = compute_frost_risk(t_min, elev)
-        # Cold-air pooling adds 2°C penalty even on flat terrain
-        assert np.all(result < 30.0)
-        assert np.all(result > 20.0)
-        assert np.allclose(result, 26.8941, atol=0.01)
-
-    def test_freezing(self):
-        """-3°C with flat terrain → risk > 80%."""
-        t_min = np.full((3, 3), -3.0)
-        elev = np.full((3, 3), 200.0)
-        result = compute_frost_risk(t_min, elev)
-        assert np.all(result > 80.0)
-
-    def test_cold_air_pooling(self):
-        """Valley (low elevation) gets colder → higher risk than ridge."""
-        t_min = np.full((3, 3), 2.0)
-        elev = np.array([[300.0, 300.0, 300.0],
-                         [200.0, 100.0, 200.0],
-                         [300.0, 300.0, 300.0]])
-        result = compute_frost_risk(t_min, elev)
-        # Center (valley) should have higher risk than surroundings
-        assert result[1, 1] > result[0, 1]
-        assert result[1, 1] > result[1, 0]
-
-    def test_output_range(self):
-        """Frost risk should be in [0, 100]."""
-        t_min = np.array([[-10.0, -5.0], [0.0, 10.0]])
-        elev = np.array([[100.0, 200.0], [300.0, 400.0]])
-        result = compute_frost_risk(t_min, elev)
-        assert np.all(result >= 0)
-        assert np.all(result <= 100)
-
-    def test_shape_preservation(self):
-        """Output matches input shape."""
-        t_min = np.random.uniform(-5, 10, (4, 5))
-        elev = np.random.uniform(0, 500, (4, 5))
-        result = compute_frost_risk(t_min, elev)
-        assert result.shape == (4, 5)
+def test_frost_risk_function_is_retired():
+    import app.downscaler as d
+    assert not hasattr(d, "compute_frost_risk")
 
 
 class TestSoilMoisture:

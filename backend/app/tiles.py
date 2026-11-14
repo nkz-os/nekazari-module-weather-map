@@ -23,6 +23,7 @@ from app.records import build_agri_parcel_record, guard_frozen_metrics
 from app.stats import (
     FALLBACK_METRICS,
     NO_DATA_ERROR,
+    UNAVAILABLE_METRICS,
     compute_zonal_stats,
     fallback_sources,
     label_metrics,
@@ -49,6 +50,8 @@ async def latest_raster_date(
     """Return the latest COG date available for a tenant/metric pair."""
     if metric not in settings.metrics:
         raise HTTPException(status_code=404, detail=f"Unknown metric: {metric}")
+    if metric in UNAVAILABLE_METRICS:
+        raise HTTPException(status_code=404, detail=UNAVAILABLE_METRICS[metric])
     date = get_latest_date(tenant_id, metric)
     if date is None:
         raise HTTPException(status_code=404, detail="No COG data available for this metric")
@@ -65,6 +68,8 @@ async def tiles_base_url(metric: str, tenant_id: str = Depends(require_tenant)):
     """
     if metric not in settings.metrics:
         raise HTTPException(status_code=404, detail=f"Unknown metric: {metric}")
+    if metric in UNAVAILABLE_METRICS:
+        raise HTTPException(status_code=404, detail=UNAVAILABLE_METRICS[metric])
     if not settings.tile_token_secret:
         raise HTTPException(
             status_code=503, detail="Tile token secret is not configured"

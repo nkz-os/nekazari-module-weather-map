@@ -29,6 +29,7 @@ NO_DATA_ERROR = "No data for parcel at this metric/date"
 # error plus the reason, never a 400.
 UNAVAILABLE_METRICS = {
     "soil_moisture": "Not available: no stateful soil water balance in weather-map",
+    "frost_risk": "Retired: see the risk module's frost warning",
 }
 
 # Metrics a parcel-level scalar can stand in for when no raster covers the
@@ -39,7 +40,6 @@ _SCALAR_FALLBACK = {
     "temperature_avg": ("t_avg", "observed"),
     "solar_radiation": ("solar_rad_w_m2", "observed"),
     "temperature_min": ("t_min", "forecast"),
-    "frost_risk": ("t_min", "forecast"),
 }
 FALLBACK_METRICS = tuple(_SCALAR_FALLBACK)
 
@@ -55,11 +55,9 @@ def scalar_fallback(metric: str, scalars: dict[str, Any] | None) -> dict[str, An
 
     Reads the same inputs as the raster job (running WeatherObserved for
     temperature_avg and solar_radiation; WeatherForecast dayMinimum for
-    temperature_min and frost_risk). Never a default: a missing key yields None
-    and the caller keeps its error. Frost risk goes through the raster's own
-    function on a single pixel; relative elevation is then 0, i.e. the maximum
-    cold-air pooling term (2 C). The metric carries its own time: `observed_at`
-    is the source's timestamp, `valid_date` its date part.
+    temperature_min). Never a default: a missing key yields None
+    and the caller keeps its error. The metric carries its own time:
+    `observed_at` is the source's timestamp, `valid_date` its date part.
     """
     spec = _SCALAR_FALLBACK.get(metric)
     if spec is None or not scalars:
@@ -69,10 +67,6 @@ def scalar_fallback(metric: str, scalars: dict[str, Any] | None) -> dict[str, An
     if raw is None:
         return None
     value = float(raw)
-    if metric == "frost_risk":
-        from app.downscaler import compute_frost_risk
-
-        value = float(compute_frost_risk(np.array([value]), np.array([0.0]))[0])
     stamp = scalars.get("observed_at" if source == "observed" else "valid_from")
     return {
         "mean": value, "min": value, "max": value,
@@ -336,12 +330,6 @@ def compute_zonal_stats(
             severe = np.sum(pixels <= SEVERE_DEFICIT_THRESHOLD_MM)
             stats["deficit_area_pct"] = round(float(deficit / len(pixels) * 100), 2)
             stats["severe_deficit_pct"] = round(float(severe / len(pixels) * 100), 2)
-
-        elif metric == "frost_risk":
-            high_risk = np.sum(pixels >= 75.0)
-            moderate_risk = np.sum((pixels >= 50.0) & (pixels < 75.0))
-            stats["high_risk_pct"] = round(float(high_risk / len(pixels) * 100), 2)
-            stats["moderate_risk_pct"] = round(float(moderate_risk / len(pixels) * 100), 2)
 
         elif metric == "soil_moisture":
             dry = np.sum(pixels <= 15.0)
