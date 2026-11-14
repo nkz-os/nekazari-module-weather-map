@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -110,6 +111,17 @@ def _repair_geometry(geometry: dict[str, Any]) -> dict[str, Any] | None:
     if geom.is_empty or geom.geom_type not in ("Polygon", "MultiPolygon"):
         return None
     return mapping(geom)
+
+
+def _geometry_area_ha(geometry: dict[str, Any]) -> float:
+    """Area in hectares of a lon/lat GeoJSON polygon (local equirectangular, parcel scale)."""
+    from shapely.geometry import shape
+    geom = shape(geometry)
+    if geom.is_empty:
+        return 0.0
+    m_per_deg = 111_320.0
+    lat = geom.centroid.y
+    return geom.area * m_per_deg * m_per_deg * math.cos(math.radians(lat)) / 10_000.0
 
 
 def _geom_geojson_bbox(geometry: dict) -> tuple[float, float, float, float]:
@@ -261,7 +273,7 @@ async def process_parcel(
             if not mask.any():
                 continue
             zone_geom = _zone_geometry(tile_mask, tile_transform, geometry, td["pixel_size"])
-            if not zone_geom:
+            if not zone_geom or _geometry_area_ha(zone_geom) < settings.zones_min_parcel_ha:
                 continue
             zone_lon = float(np.mean(lon_g[mask]))
             zone_lat = float(np.mean(lat_g[mask]))
