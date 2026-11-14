@@ -3,11 +3,16 @@ import numpy as np
 from app.zone_accumulator import _compute_area_ha, _geom_geojson_bbox
 
 
-def test_compute_area_ha():
+def test_compute_area_ha_from_latitude():
     import pytest
-    assert _compute_area_ha(100) == 1.0
-    assert _compute_area_ha(0) == 0.0
-    assert _compute_area_ha(1520) == pytest.approx(15.2)
+    # 10 m x 10 m pixels at the equator: 0.01 ha each.
+    side = 10.0 / 111_320.0
+    assert _compute_area_ha(np.zeros(100), side, side) == pytest.approx(1.0)
+    assert _compute_area_ha(np.zeros(0), side, side) == 0.0
+    # A pixel 0.0001 deg wide and high at 42.8 N is ~8.17 m x 11.13 m.
+    expected = (0.0001 * 111_320.0 * np.cos(np.radians(42.8))) * (0.0001 * 111_320.0) / 10_000.0
+    assert _compute_area_ha(np.full(1, 42.8), 0.0001, 0.0001) == pytest.approx(expected)
+    assert _compute_area_ha(np.full(1, 42.8), 0.0001, 0.0001) < 0.0111  # not the old flat 0.01 x 1.24
 
 
 def test_geom_geojson_bbox_polygon():
@@ -78,7 +83,9 @@ def _sectors_for_north_south_drop(drop_m):
     from app.downscaler import discretize_aspect
     size = 0.0001
     elev = np.repeat(np.linspace(drop_m, 0.0, 10)[:, None], 10, axis=1)  # row 0 = north, highest
-    return discretize_aspect(aspect_degrees(elev, size), slope_degrees(elev, size))[1:-1, 1:-1]
+    return discretize_aspect(
+        aspect_degrees(elev, size, 42.8, size), slope_degrees(elev, size, 42.8, size),
+    )[1:-1, 1:-1]
 
 
 def test_gentle_slope_is_flat_sector():
@@ -94,8 +101,19 @@ def test_terrain_slope_is_metric():
     from app import zone_accumulator as za
     assert not hasattr(za, "_gradient")
     elev = np.repeat(np.linspace(30.0, 0.0, 30)[:, None], 30, axis=1)
-    slope, _ = za._terrain(elev, 0.0001)
+    slope, _ = za._terrain(elev, 0.0001, 42.8, 0.0001)
     assert 3.0 < float(np.median(slope[5:-5, 5:-5])) < 8.0
+
+
+def test_terrain_east_west_slope_uses_latitude():
+    """East-west plane at 42.8 N: a pixel is 8.17 m wide, not 11.13 m."""
+    from app import zone_accumulator as za
+    size = 0.0001
+    dx_m = size * 111_320.0 * np.cos(np.radians(42.8))
+    step = np.tan(np.radians(10.0)) * dx_m
+    elev = np.repeat((np.arange(30) * step)[None, :], 30, axis=0)
+    slope, _ = za._terrain(elev, size, 42.8, size)
+    assert float(np.median(slope[8:-8, 8:-8])) == pytest.approx(10.0, abs=0.5)
 
 
 # ======================================================================
@@ -281,45 +299,39 @@ async def test_colliding_zone_ids_yield_distinct_entities(zone_env, monkeypatch)
     assert ranks == list(range(1, len(entities) + 1))
 
 
-def _stats(mean_sr, mean_fr):
-    return {"date": "2026-09-02", "metrics": {
-        "solar_radiation": {"mean": mean_sr}, "frost_risk": {"mean": mean_fr}}}
-
-
 @pytest.mark.asyncio
-async def test_zone_gets_radiation_and_frost_from_cog(zone_env, monkeypatch):
+async def test_zone_gets_radiation_from_cog_and_no_frost(zone_env, monkeypatch):
     monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
     calls = []
 
     def _fake(tenant, geom, metrics, date=None):
         calls.append(tuple(metrics))
-        return {"metrics": {metrics[0]: {"mean": 200.0 if metrics[0] == "solar_radiation" else 30.0}}}
+        return {"metrics": {metrics[0]: {"mean": 200.0}}}
 
     monkeypatch.setattr(zone_env, "compute_zonal_stats", _fake)
     entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
     assert entities
-    assert len(calls) == 2 * len(entities)
-    assert set(calls) == {("solar_radiation",), ("frost_risk",)}
+    assert len(calls) == len(entities)
+    assert set(calls) == {("solar_radiation",)}
     for e in entities:
         assert e["nkz:solarRadiationWm2"]["value"] == 200.0
-        assert e["nkz:frostRisk"]["value"] == 30.0
+        assert "nkz:frostRisk" not in e
+        # the retired attribute is still cleared from zones that carry it
+        assert "frostRisk" in e["_cog_checked"] and "solarRadiationWm2" in e["_cog_checked"]
 
 
 @pytest.mark.asyncio
-async def test_frost_published_when_solar_cog_is_missing(zone_env, monkeypatch):
+async def test_zone_without_radiation_cog_still_clears_retired_frost(zone_env, monkeypatch):
     monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
-
-    def _fake(tenant, geom, metrics, date=None):
-        if metrics[0] == "solar_radiation":
-            return {"error": "No COG data available", "metrics": {}}
-        return {"metrics": {"frost_risk": {"mean": 42.0}}}
-
-    monkeypatch.setattr(zone_env, "compute_zonal_stats", _fake)
+    monkeypatch.setattr(
+        zone_env, "compute_zonal_stats",
+        lambda *a, **k: {"error": "No COG data available", "metrics": {}},
+    )
     entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
     assert entities
     for e in entities:
-        assert e["nkz:frostRisk"]["value"] == 42.0
-        assert "nkz:solarRadiationWm2" not in e
+        assert "nkz:solarRadiationWm2" not in e and "nkz:frostRisk" not in e
+        assert "frostRisk" in e["_cog_checked"]
 
 
 @pytest.mark.asyncio
@@ -346,7 +358,7 @@ async def test_zone_stats_failure_is_isolated(zone_env, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
     assert entities and all("nkz:frostRisk" not in e for e in entities)
-    assert "Zonal radiation/frost failed" in caplog.text
+    assert "Zonal radiation failed" in caplog.text
     assert "minio down" in caplog.text
 
 
@@ -426,7 +438,7 @@ def test_integer_dem_gentle_ramps_stay_flat():
     for degrees in (0.5, 1.0, 1.5):
         drop_per_row = np.tan(np.radians(degrees)) * size * 111_320.0
         elev = np.round(np.repeat((np.arange(60)[::-1] * drop_per_row)[:, None], 60, axis=1))
-        slope, aspect = _terrain(elev, size)
+        slope, aspect = _terrain(elev, size, 42.8, size)
         sectors = discretize_aspect(aspect, slope)[3:-3, 3:-3]
         assert np.all(sectors == 0), degrees
 
@@ -437,7 +449,7 @@ def test_integer_dem_real_slope_keeps_its_aspect():
     size = 8.97e-5
     drop_per_row = np.tan(np.radians(5.0)) * size * 111_320.0
     elev = np.round(np.repeat((np.arange(60)[::-1] * drop_per_row)[:, None], 60, axis=1))
-    slope, aspect = _terrain(elev, size)
+    slope, aspect = _terrain(elev, size, 42.8, size)
     assert np.all(discretize_aspect(aspect, slope)[3:-3, 3:-3] == 5)
 
 
@@ -539,3 +551,67 @@ def test_zone_area_ha_of_the_clipped_geometry():
     ]]}
     # ~98 m (E-W at 42.8 N) x ~100 m (N-S) ~= 0.98 ha
     assert _geometry_area_ha(square) == pytest.approx(0.98, rel=0.03)
+
+
+def _val(e, key):
+    v = e.get(f"nkz:{key}", e.get(key))
+    return v.get("value") if isinstance(v, dict) else v
+
+
+@pytest.mark.asyncio
+async def test_zone_tmin_is_the_reference_and_tmax_is_lapse_corrected(zone_env, monkeypatch):
+    """Valley/hill zones at 1200 m against a 572.8 m reference: Tmin never lapses."""
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
+    entities = await zone_env.process_parcel("t", PARCEL, "2026-09-02")
+    assert entities
+    for e in entities:
+        assert _val(e, "tMin") == round(WEATHER["t_min"], 1)
+        expected_tmax = WEATHER["t_max"] - 0.0065 * (_val(e, "elevationMean") - WEATHER["elevation_ref_m"])
+        assert _val(e, "tMax") == pytest.approx(expected_tmax, abs=0.06)
+        assert _val(e, "tMax") < WEATHER["t_max"] - 3.0
+
+
+@pytest.mark.asyncio
+async def test_zone_eto_gets_uncorrected_tmin(zone_env, monkeypatch):
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
+    seen = []
+    real = zone_env.compute_eto
+
+    def _spy(t_min, t_max, *a, **k):
+        seen.append(float(np.asarray(t_min).ravel()[0]))
+        return real(t_min, t_max, *a, **k)
+
+    monkeypatch.setattr(zone_env, "compute_eto", _spy)
+    assert await zone_env.process_parcel("t", PARCEL, "2026-09-02")
+    assert seen and set(seen) == {WEATHER["t_min"]}
+
+
+@pytest.mark.asyncio
+async def test_zone_areas_sum_to_the_parcel_area(zone_env, monkeypatch):
+    """At 42.8 N a 0.0001 deg pixel is ~0.0091 ha, not 0.01: totals match the polygon."""
+    from app.zone_accumulator import _geometry_area_ha
+    parcel = _covering()
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
+    entities = await zone_env.process_parcel("t", parcel, "2026-09-02")
+    assert entities
+    total = sum(_val(e, "areaHa") for e in entities)
+    parcel_ha = _geometry_area_ha(parcel["location"])
+    assert total == pytest.approx(parcel_ha, rel=0.03)
+
+
+@pytest.mark.asyncio
+async def test_terrain_gets_grid_latitude_and_row_height(zone_env, monkeypatch):
+    seen = {}
+    real = zone_env._terrain
+
+    def _spy(elev, size, latitude_deg, pixel_height_deg):
+        seen.update(size=size, lat=latitude_deg, h=pixel_height_deg)
+        return real(elev, size, latitude_deg, pixel_height_deg)
+
+    monkeypatch.setattr(zone_env, "_terrain", _spy)
+    monkeypatch.setattr(zone_env, "fetch_parcel_daily", AsyncMock(return_value=dict(WEATHER)))
+    await zone_env.process_parcel("t", PARCEL, "2026-09-02")
+    # grid: south edge 42.8, 12 rows of 0.0001 -> centre 42.8006
+    assert seen["lat"] == pytest.approx(42.8006, abs=1e-9)
+    assert seen["h"] == pytest.approx(0.0001)
+    assert seen["size"] == pytest.approx(0.0001)

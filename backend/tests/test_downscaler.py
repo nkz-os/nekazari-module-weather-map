@@ -10,7 +10,6 @@ from app.downscaler import (
     extraterrestrial_radiation,
     clear_sky_radiation,
     compute_water_balance,
-    compute_frost_risk,
     compute_soil_moisture,
     saxton_rawls_ptf,
     discretize_aspect,
@@ -272,51 +271,9 @@ class TestWaterBalance:
         assert np.allclose(result, expected)
 
 
-class TestFrostRisk:
-    """Cold-air pooling frost risk assessment."""
-
-    def test_warm(self):
-        """5°C with flat terrain → risk < 30%."""
-        t_min = np.full((3, 3), 5.0)
-        elev = np.full((3, 3), 200.0)
-        result = compute_frost_risk(t_min, elev)
-        # Cold-air pooling adds 2°C penalty even on flat terrain
-        assert np.all(result < 30.0)
-        assert np.all(result > 20.0)
-        assert np.allclose(result, 26.8941, atol=0.01)
-
-    def test_freezing(self):
-        """-3°C with flat terrain → risk > 80%."""
-        t_min = np.full((3, 3), -3.0)
-        elev = np.full((3, 3), 200.0)
-        result = compute_frost_risk(t_min, elev)
-        assert np.all(result > 80.0)
-
-    def test_cold_air_pooling(self):
-        """Valley (low elevation) gets colder → higher risk than ridge."""
-        t_min = np.full((3, 3), 2.0)
-        elev = np.array([[300.0, 300.0, 300.0],
-                         [200.0, 100.0, 200.0],
-                         [300.0, 300.0, 300.0]])
-        result = compute_frost_risk(t_min, elev)
-        # Center (valley) should have higher risk than surroundings
-        assert result[1, 1] > result[0, 1]
-        assert result[1, 1] > result[1, 0]
-
-    def test_output_range(self):
-        """Frost risk should be in [0, 100]."""
-        t_min = np.array([[-10.0, -5.0], [0.0, 10.0]])
-        elev = np.array([[100.0, 200.0], [300.0, 400.0]])
-        result = compute_frost_risk(t_min, elev)
-        assert np.all(result >= 0)
-        assert np.all(result <= 100)
-
-    def test_shape_preservation(self):
-        """Output matches input shape."""
-        t_min = np.random.uniform(-5, 10, (4, 5))
-        elev = np.random.uniform(0, 500, (4, 5))
-        result = compute_frost_risk(t_min, elev)
-        assert result.shape == (4, 5)
+def test_frost_risk_function_is_retired():
+    import app.downscaler as d
+    assert not hasattr(d, "compute_frost_risk")
 
 
 class TestSoilMoisture:

@@ -26,7 +26,6 @@ _ZONE_METRICS = {
     "eto": "eto",
     "waterBalance": "waterBalance",
     "solarRadiationWm2": "nkz:solarRadiationWm2",
-    "frostRisk": "nkz:frostRisk",
 }
 
 
@@ -37,7 +36,6 @@ _METRIC_TO_ATTR = {
     "relative_humidity": "relativeHumidity",
     "eto": "eto",
     "water_balance": "waterBalance",
-    "frost_risk": "frostRisk",
     "temperature_avg": "airTemperatureAvg",
     "temperature_min": "airTemperatureMin",
 }
@@ -240,7 +238,8 @@ def build_agri_parcel_zone(
     }
 
     if area_ha is None:
-        # 10 m pixels -> 0.01 ha each (zone_accumulator.PIXEL_AREA_HA)
+        # Callers pass the latitude-aware area (zone_accumulator._compute_area_ha);
+        # this is only the nominal 10 m x 10 m pixel (0.01 ha) for callers that do not.
         area_ha = round(zone.get("pixelCount", 0) * 0.01, 2)
     entity["nkz:areaHa"] = {"type": "Property", "value": area_ha}
 

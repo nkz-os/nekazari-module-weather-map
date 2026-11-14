@@ -21,14 +21,12 @@ from rasterio.crs import CRS
 from rasterio.features import geometry_mask
 
 from app.config import settings
-from app.dem_grid import dem_transform, pixel_center_grids
+from app.dem_grid import dem_transform, north_edge, pixel_center_grids, row_height
 from app.downscaler import (
     correct_temperature,
-    correct_solar_radiation,
     compute_eto,
     clamp_ea_to_es,
     compute_water_balance,
-    compute_frost_risk,
     compute_soil_moisture,
 )
 from app.minio_io import (
@@ -136,12 +134,6 @@ def _bbox_to_tiles(
 # ---------------------------------------------------------------------------
 
 
-def _date_to_doy(date_str: str) -> int:
-    """Convert a ``YYYY-MM-DD`` date string to day-of-year (1–366)."""
-    dt = datetime.strptime(date_str, "%Y-%m-%d")
-    return dt.timetuple().tm_yday
-
-
 def _parcel_geometry(parcel: dict[str, Any]) -> dict[str, Any] | None:
     """Extract or build a GeoJSON geometry from a parcel dict.
 
@@ -232,9 +224,11 @@ def _nearest_parcel(
     return best
 
 
-# eto and water_balance read /daily and give every pixel the weather of the
-# parcel that contains it. Pixels in no parcel are nodata.
-_DAILY_METRICS = frozenset({"eto", "water_balance"})
+# eto, water_balance and solar_radiation read /daily and give every pixel the
+# weather of the parcel that contains it. Pixels in no parcel are nodata.
+_DAILY_METRICS = frozenset({"eto", "water_balance", "solar_radiation"})
+
+_SECONDS_PER_DAY = 86_400.0
 
 
 def _parcel_pixel_labels(
@@ -286,7 +280,7 @@ async def _daily_metric_raster(
     aspect: np.ndarray,
     z: int, x: int, y: int,
 ) -> np.ndarray | None:
-    """eto / water_balance raster, one parcel at a time; None if no pixel is valid."""
+    """eto / water_balance / solar_radiation raster, one parcel at a time; None if no pixel is valid."""
     result = np.full(elevations.shape, np.nan, dtype=float)
     for idx in sorted(int(i) for i in np.unique(labels) if i >= 0):
         parcel_id = parcels[idx]["id"]
@@ -303,6 +297,21 @@ async def _daily_metric_raster(
             )
             continue
         mask = labels == idx
+
+        if metric == "solar_radiation":
+            # Horizontal daily-mean radiation of the running day, one value per
+            # parcel: no slope/aspect correction in any public layer.
+            try:
+                rs_mj = require(daily, "rs_mj")
+            except MissingWeatherInput as exc:
+                logger.error(
+                    "Skipping solar_radiation for parcel %s (tile %d/%d/%d, tenant=%s): "
+                    "missing weather input, tried %s",
+                    parcel_id, z, x, y, tenant_id, exc.keys,
+                )
+                continue
+            result[mask] = rs_mj * 1e6 / _SECONDS_PER_DAY  # MJ m-2 d-1 -> W m-2
+            continue
 
         if metric == "water_balance":
             closed5 = daily.get("closed5")
@@ -336,7 +345,9 @@ async def _daily_metric_raster(
             )
             continue
 
-        t_min_px = correct_temperature(t_min, ref_elevation, elevations)
+        # Altitude rule: Tmax follows the lapse rate, Tmin does not (cold air
+        # pools in hollows, so a lower pixel is not warmer at night).
+        t_min_px = np.full(elevations.shape, t_min, dtype=float)
         t_max_px = correct_temperature(t_max, ref_elevation, elevations)
         # Horizontal Rs for net shortwave and cloudiness, as zone_accumulator
         # does: the slope/aspect correction is not validated for daily ET0
@@ -442,13 +453,7 @@ async def generate_cog_for_tile(
         return None
 
     # ------------------------------------------------------------------
-    # 2. Slope & aspect (Horn 1981 — nkz_platform_sdk.gis.terrain)
-    # ------------------------------------------------------------------
-    slope = slope_degrees(elevations, pixel_size_deg)
-    aspect = aspect_degrees(elevations, pixel_size_deg)
-
-    # ------------------------------------------------------------------
-    # 3. Pixel coordinate grids and raster transform
+    # 2. Pixel coordinate grids and raster transform
     # ------------------------------------------------------------------
     # Rows run north to south (eu-elevation /raster): see app.dem_grid.
     grid = {
@@ -458,6 +463,15 @@ async def generate_cog_for_tile(
     }
     pixel_lons, pixel_lats = pixel_center_grids(grid)
     transform = dem_transform(grid)
+
+    # ------------------------------------------------------------------
+    # 3. Slope & aspect (Horn 1981 — nkz_platform_sdk.gis.terrain, in metres:
+    #    the grid's centre latitude scales the east-west cell size)
+    # ------------------------------------------------------------------
+    pixel_height_deg = row_height(grid)
+    grid_lat = north_edge(grid) - pixel_height_deg * rows / 2.0
+    slope = slope_degrees(elevations, pixel_size_deg, grid_lat, pixel_height_deg)
+    aspect = aspect_degrees(elevations, pixel_size_deg, grid_lat, pixel_height_deg)
 
     if weather_cache is None:
         weather_cache = {}
@@ -509,7 +523,6 @@ async def generate_cog_for_tile(
         try:
             t_avg = require(weather, "t_avg", "temperature_avg")
             t_min = require(weather, "t_min", "temperature_min")
-            solar_rad_w_m2 = require(weather, "solar_rad_w_m2", "solar_radiation")
             # The altitude the readings are already downscaled to — the
             # per-pixel correction below is RELATIVE to this, never to the DEM
             # tile's own grid.
@@ -521,28 +534,18 @@ async def generate_cog_for_tile(
             )
             return None
 
-        # The run's own day (UTC), not the start of a look-back window.
-        doy = _date_to_doy(date_to)
-
         # --------------------------------------------------------------
         # 5. Dispatch to downscaler
         # --------------------------------------------------------------
+        # Altitude rule: Tmin does not follow the lapse rate; Tmax does. With
+        # Tmean = (Tmin + Tmax) / 2 and Tmin fixed, the mean moves by half the
+        # Tmax lapse shift.
         if metric == "temperature_avg":
-            result = correct_temperature(t_avg, station_elevation, elevations)
+            lapse_shift = correct_temperature(t_avg, station_elevation, elevations) - t_avg
+            result = t_avg + 0.5 * lapse_shift
 
         elif metric == "temperature_min":
-            result = correct_temperature(t_min, station_elevation, elevations)
-
-        elif metric == "solar_radiation":
-            result = correct_solar_radiation(
-                solar_rad_w_m2, pixel_lats, aspect, slope, doy,
-            )
-
-        elif metric == "frost_risk":
-            t_min_corrected = correct_temperature(
-                t_min, station_elevation, elevations,
-            )
-            result = compute_frost_risk(t_min_corrected, elevations)
+            result = np.full(elevations.shape, t_min, dtype=float)
 
         elif metric == "soil_moisture":
             ptf = await fetch_parcel_hydraulics(tenant_id, parcel_id)

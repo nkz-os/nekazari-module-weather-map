@@ -378,29 +378,11 @@ class TestStatsLabelsAndScalarFallback:
     @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
     @patch("app.tiles.compute_zonal_stats")
     @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
-    def test_fallback_frost_risk_uses_same_function_as_raster(
-        self, mock_fetch, mock_stats, mock_weather, client
-    ):
-        import numpy as np
-        from app.downscaler import compute_frost_risk
-
-        mock_fetch.return_value = SAMPLE_PARCEL
-        mock_stats.return_value = _uncovered_stats(["frost_risk"])
-        mock_weather.return_value = dict(WEATHER)
-        m = _get(client, "frost_risk").json()["metrics"]["frost_risk"]
-        expected = float(compute_frost_risk(np.array([2.0]), np.array([0.0]))[0])
-        assert m["mean"] == pytest.approx(expected)
-        assert m["fallback"] == "parcel_scalar"
-        assert m["std"] is None
-
-    @patch("app.tiles.fetch_parcel_scalars", new_callable=AsyncMock)
-    @patch("app.tiles.compute_zonal_stats")
-    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
     def test_fallback_without_broker_data_keeps_error(
         self, mock_fetch, mock_stats, mock_weather, client
     ):
         mock_fetch.return_value = SAMPLE_PARCEL
-        names = ["temperature_min", "frost_risk", "solar_radiation"]
+        names = ["temperature_min", "solar_radiation"]
         mock_stats.return_value = _uncovered_stats(names)
         mock_weather.return_value = None
         m = _get(client, ",".join(names)).json()["metrics"]
@@ -515,8 +497,7 @@ class TestNoRasterAndSources:
             (["temperature_avg"], ["WeatherObserved"]),
             (["solar_radiation"], ["WeatherObserved"]),
             (["temperature_min"], ["WeatherForecast"]),
-            (["frost_risk"], ["WeatherForecast"]),
-            (["temperature_avg", "frost_risk"], ["WeatherObserved", "WeatherForecast"]),
+            (["temperature_avg", "temperature_min"], ["WeatherObserved", "WeatherForecast"]),
         ],
     )
     async def test_reads_only_what_the_metrics_need(self, metrics, expected):
@@ -554,3 +535,33 @@ class TestSoilMoistureUnavailable:
         assert entry["error"] == "No data for parcel at this metric/date"
         assert "Not available" in entry["reason"]
         assert "mean" not in entry
+
+
+class TestFrostRiskRetired:
+    """frost_risk stays accepted by name but is retired (risk owns the frost warning)."""
+
+    REASON = "Retired: see the risk module's frost warning"
+
+    @patch("app.tiles.fetch_agri_parcel", new_callable=AsyncMock)
+    def test_get_stats_frost_risk_is_unavailable_with_reason(self, mock_fetch, client):
+        mock_fetch.return_value = SAMPLE_PARCEL
+        resp = client.get(
+            "/api/weather-map/stats/demo-field-1",
+            params={"metrics": "frost_risk"},
+            headers=AUTH_HEADERS,
+        )
+        assert resp.status_code == 200
+        entry = resp.json()["metrics"]["frost_risk"]
+        assert entry["error"] == "No data for parcel at this metric/date"
+        assert entry["reason"] == self.REASON
+        assert "mean" not in entry
+        assert "high_risk_pct" not in entry
+
+    def test_no_scalar_fallback_for_frost_risk(self):
+        from app.stats import FALLBACK_METRICS, scalar_fallback
+        assert "frost_risk" not in FALLBACK_METRICS
+        assert scalar_fallback("frost_risk", {"t_min": 2.0}) is None
+
+    def test_zonal_stats_reports_it_unavailable(self):
+        from app.stats import UNAVAILABLE_METRICS
+        assert UNAVAILABLE_METRICS["frost_risk"] == self.REASON

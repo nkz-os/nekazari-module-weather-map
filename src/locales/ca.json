@@ -7,7 +7,6 @@
     "solar_radiation": "Radiació Solar",
     "eto": "ET de Referència",
     "water_balance": "Balanç Hídric",
-    "frost_risk": "Risc de Gelada",
     "soil_moisture": "Humitat del Sòl"
   },
   "controls": {

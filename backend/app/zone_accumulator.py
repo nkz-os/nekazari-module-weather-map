@@ -17,7 +17,7 @@ import geohash2
 import numpy as np
 
 from app.config import settings
-from app.dem_grid import dem_transform, pixel_center_grids
+from app.dem_grid import dem_transform, north_edge, pixel_center_grids, row_height
 from nkz_platform_sdk.gis.terrain import aspect_degrees, slope_degrees
 from rasterio.features import geometry_mask
 from app.downscaler import compute_zones, discretize_aspect, correct_temperature, compute_eto, clamp_ea_to_es
@@ -39,7 +39,7 @@ from app.tenants import discover_tenants
 
 logger = logging.getLogger(__name__)
 
-PIXEL_AREA_HA = 0.01  # ~10m x 10m per pixel at zoom 14
+_M_PER_DEG = 111_320.0  # same constant as _geometry_area_ha and the SDK terrain maths
 
 _SECTOR_NAMES = ["flat", "N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
@@ -75,9 +75,16 @@ def _assign_zone_ranks(zones: list[dict[str, Any]]) -> dict[str, int]:
     return {z["id"]: i for i, z in enumerate(ordered, start=1)}
 
 
-def _compute_area_ha(pixel_count: int) -> float:
-    """Convert pixel count to hectares (10m resolution → 0.01 ha/pixel)."""
-    return pixel_count * PIXEL_AREA_HA
+def _compute_area_ha(pixel_lats: np.ndarray, width_deg: float, height_deg: float) -> float:
+    """Hectares covered by pixels centred at *pixel_lats* (degrees).
+
+    A degree of longitude shrinks with cos(latitude), so a pixel is
+    ``width * m_per_deg * cos(lat)`` by ``height * m_per_deg`` metres.
+    """
+    lats = np.asarray(pixel_lats, dtype=float)
+    dx_m = width_deg * _M_PER_DEG * np.cos(np.radians(lats))
+    dy_m = height_deg * _M_PER_DEG
+    return float(np.sum(dx_m * dy_m) / 10_000.0)
 
 
 # Smoothing window (pixels) for zoning terrain. IGN serves whole metres, so a
@@ -87,11 +94,20 @@ def _compute_area_ha(pixel_count: int) -> float:
 _TERRAIN_SMOOTH_PX = 7
 
 
-def _terrain(elev: np.ndarray, pixel_size_deg: float) -> tuple[np.ndarray, np.ndarray]:
-    """Slope and aspect (degrees, Horn 1981 in metres) of the smoothed DEM; rows north first."""
+def _terrain(
+    elev: np.ndarray, pixel_size_deg: float, latitude_deg: float, pixel_height_deg: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Slope and aspect (degrees, Horn 1981 in metres) of the smoothed DEM; rows north first.
+
+    ``latitude_deg`` (grid centre) scales the east-west cell size;
+    ``pixel_height_deg`` is the row height (it differs from the column width).
+    """
     from scipy.ndimage import uniform_filter
     smooth = uniform_filter(elev.astype(float), size=_TERRAIN_SMOOTH_PX, mode="nearest")
-    return slope_degrees(smooth, pixel_size_deg), aspect_degrees(smooth, pixel_size_deg)
+    return (
+        slope_degrees(smooth, pixel_size_deg, latitude_deg, pixel_height_deg),
+        aspect_degrees(smooth, pixel_size_deg, latitude_deg, pixel_height_deg),
+    )
 
 
 def _repair_geometry(geometry: dict[str, Any]) -> dict[str, Any] | None:
@@ -227,7 +243,16 @@ async def process_parcel(
         if elev.size == 0:
             continue
         pixel_size = float(dem.get("pixel_size_deg", 0.0001))
-        slope, aspect = _terrain(elev, pixel_size)
+        rows_n = int(dem.get("rows", elev.shape[0]))
+        grid_meta = {
+            "origin_lon": float(dem.get("origin_lon", 0)),
+            "origin_lat": float(dem.get("origin_lat", 0)),
+            "north_lat": dem.get("north_lat"), "pixel_size_deg": pixel_size,
+            "rows": rows_n, "cols": int(dem.get("cols", elev.shape[1])),
+        }
+        height_deg = row_height(grid_meta)
+        centre_lat = north_edge(grid_meta) - height_deg * rows_n / 2.0
+        slope, aspect = _terrain(elev, pixel_size, centre_lat, height_deg)
         tile_data.append({
             "elev": elev,
             "slope": slope,
@@ -236,7 +261,8 @@ async def process_parcel(
             "origin_lat": float(dem.get("origin_lat", 0)),
             "north_lat": dem.get("north_lat"),
             "pixel_size": pixel_size,
-            "rows": int(dem.get("rows", elev.shape[0])),
+            "pixel_height": height_deg,
+            "rows": rows_n,
             "cols": int(dem.get("cols", elev.shape[1])),
         })
 
@@ -293,6 +319,7 @@ async def process_parcel(
                 "elevationMax": round(float(np.max(td["elev"][mask])), 1),
                 "aspectSector": _SECTOR_NAMES[sector_idx],
                 "pixelCount": int(np.sum(mask)),
+                "areaHa": round(_compute_area_ha(lat_g[mask], td["pixel_size"], td["pixel_height"]), 2),
                 "centroid": [round(zone_lon, 6), round(zone_lat, 6)],
                 "geometry": zone_geom,
             })
@@ -338,7 +365,9 @@ async def process_parcel(
     entity_list: list[dict] = []
     for zd in zones_all:
         elev_mean = zd["elevationMean"]
-        t_min_z = float(correct_temperature(t_min, station_elev, np.array([elev_mean]))[0])
+        # Altitude rule: Tmax follows the lapse rate, Tmin does not (cold air
+        # pools in hollows, so a lower zone is not warmer at night).
+        t_min_z = float(t_min)
         t_max_z = float(correct_temperature(t_max, station_elev, np.array([elev_mean]))[0])
         eto = compute_eto(
             np.array([t_min_z]), np.array([t_max_z]),
@@ -354,7 +383,7 @@ async def process_parcel(
         }
         cog_values, cog_checked = await _zone_cog_metrics(tenant_id, zd)
         metrics.update(cog_values)
-        area_ha = _compute_area_ha(zd["pixelCount"])
+        area_ha = zd["areaHa"]
         entity = build_agri_parcel_zone(
             tenant_id=tenant_id,
             parcel_id=parcel_id,
@@ -377,14 +406,18 @@ async def process_parcel(
     return entity_list
 
 
-_COG_METRICS = (("solar_radiation", "solarRadiationWm2"), ("frost_risk", "frostRisk"))
+# TODO(Task 3): the zone value is the horizontal parcel radiation read from the
+# public raster; P5a Task 3 replaces it with the slope/aspect model ("modelled
+# from terrain"), which must stay out of every public raster and /stats.
+_COG_METRICS = (("solar_radiation", "solarRadiationWm2"),)
+# Retired metric: still reported as "checked" so a stale value is cleared from
+# zones that carry it (contract step of the expand-contract retirement).
+_RETIRED_ZONE_ATTRS = ("frostRisk",)
 
 
 async def _zone_cog_metrics(tenant_id: str, zone: dict) -> tuple[dict[str, float], set[str]]:
-    """Mean solar radiation and frost risk over the zone polygon, from the COGs.
+    """Mean solar radiation over the zone polygon, from the COG.
 
-    Each metric is requested on its own, so one missing COG does not hide the
-    other (the helper resolves the COG date from the first metric asked).
     Returns ``(values, checked)``: ``values`` holds only what the COGs actually
     contain (nothing is fabricated); ``checked`` names the attributes whose
     lookup completed without error (including "no data"), i.e. those a stale
@@ -395,15 +428,15 @@ async def _zone_cog_metrics(tenant_id: str, zone: dict) -> tuple[dict[str, float
     if not geom:
         # Never fall back to the parcel geometry: that would label a parcel
         # value as a zone value.
-        logger.debug("Zone %s has no own geometry; skipping radiation/frost", zone.get("id"))
+        logger.debug("Zone %s has no own geometry; skipping radiation", zone.get("id"))
         return {}, set()
     out: dict[str, float] = {}
-    checked: set[str] = set()
+    checked: set[str] = set(_RETIRED_ZONE_ATTRS)
     for metric, key in _COG_METRICS:
         try:
             stats = await asyncio.to_thread(compute_zonal_stats, tenant_id, geom, [metric])
         except Exception as exc:
-            logger.warning("Zonal radiation/frost failed for zone %s: %s", zone.get("id"), exc)
+            logger.warning("Zonal radiation failed for zone %s: %s", zone.get("id"), exc)
             continue
         checked.add(key)
         mean = ((stats.get("metrics") or {}).get(metric) or {}).get("mean")

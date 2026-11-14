@@ -287,7 +287,7 @@ class TestGenerateCogForTile:
         monkeypatch.setattr(cg, "set_latest_date", lambda *a, **kw: True)
         monkeypatch.setattr(
             cg.settings, "metrics",
-            ["temperature_avg", "temperature_min", "frost_risk"],
+            ["temperature_avg", "temperature_min"],
         )
 
         await cg._generate_and_upload_cogs(
@@ -627,8 +627,8 @@ async def test_eto_raster_independent_of_aspect(monkeypatch):
 
     rows, cols = 10, 24
     flat = np.full((rows, cols), 500.0)
-    monkeypatch.setattr(cg, "slope_degrees", lambda e, px: np.where(np.arange(cols) < 3, 0.0, 5.0)[None, :].repeat(rows, 0))
-    monkeypatch.setattr(cg, "aspect_degrees", lambda e, px: np.where(np.arange(cols) < 3, 0.0, 180.0)[None, :].repeat(rows, 0))
+    monkeypatch.setattr(cg, "slope_degrees", lambda e, px, *a, **k: np.where(np.arange(cols) < 3, 0.0, 5.0)[None, :].repeat(rows, 0))
+    monkeypatch.setattr(cg, "aspect_degrees", lambda e, px, *a, **k: np.where(np.arange(cols) < 3, 0.0, 180.0)[None, :].repeat(rows, 0))
     dem = _wide_dem()
     dem["elevations"] = flat.tolist()
     async def _fetch(t, pid):
@@ -710,3 +710,147 @@ async def test_pixel_latitudes_decrease_down_the_rows(monkeypatch):
     assert lats[0, 0] > lats[-1, 0]
     _, lat00 = seen["transform"] * (0.5, 0.5)
     assert lat00 == pytest.approx(lats[0, 0], abs=1e-9)
+
+
+# ======================================================================
+# P5a Task 2: altitude rule, horizontal radiation, latitude, frost retired
+# ======================================================================
+
+
+@pytest.mark.asyncio
+async def test_eto_pixel_tmin_is_the_reference_and_tmax_is_lapse_corrected(monkeypatch):
+    """A valley pixel (below the reference) is not warmer at night; by day it is."""
+    from app import cog_generator as cg
+
+    seen: dict = {}
+    real = cg.compute_eto
+
+    def _spy(t_min, t_max, ea, u2, rs_h, rs_s, z, lat, doy):
+        seen.update(t_min=np.asarray(t_min), t_max=np.asarray(t_max), z=np.asarray(z))
+        return real(t_min, t_max, ea, u2, rs_h, rs_s, z, lat, doy)
+
+    monkeypatch.setattr(cg, "compute_eto", _spy)
+    d = _daily(elevation_ref_m=600.0)  # the DEM pixels (500-510 m) are below it
+    await _daily_tile(cg, monkeypatch, "eto", {PARCEL_A["id"]: d}, parcels=[PARCEL_A])
+
+    assert np.all(seen["z"] < 600.0)
+    assert np.all(seen["t_min"] == d["t_min"])
+    expected_tmax = d["t_max"] - 0.0065 * (seen["z"] - 600.0)
+    assert np.allclose(seen["t_max"], expected_tmax)
+    assert np.all(seen["t_max"] > d["t_max"])
+
+
+@pytest.mark.asyncio
+async def test_temperature_min_raster_is_the_reference_everywhere(monkeypatch):
+    from app import cog_generator as cg
+
+    monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=_dem()))
+    monkeypatch.setattr(cg, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+    arr = _read(await _tile(cg, "temperature_min"))
+    assert np.allclose(arr[np.isfinite(arr)], WEATHER["t_min"], atol=1e-4)
+    assert np.isfinite(arr).any()
+
+
+@pytest.mark.asyncio
+async def test_temperature_avg_shifts_by_half_the_tmax_lapse(monkeypatch):
+    """Tmean = (Tmin + Tmax)/2 with Tmin fixed: only half of the Tmax lapse reaches the mean."""
+    from app import cog_generator as cg
+
+    monkeypatch.setattr(cg, "fetch_dem_tile", AsyncMock(return_value=_dem()))
+    monkeypatch.setattr(cg, "fetch_parcel_weather", AsyncMock(return_value=dict(WEATHER)))
+    arr = _read(await _tile(cg, "temperature_avg"))
+    rr, cc = np.indices(arr.shape)
+    elev = DEM_BASE_ELEVATION + rr * 10.0 + cc  # as built by _dem()
+    expected = WEATHER["t_avg"] - 0.5 * 0.0065 * (elev - WEATHER["reference_altitude_m"])
+    ok = np.isfinite(arr)
+    assert ok.any()
+    assert np.allclose(arr[ok], expected[ok], atol=1e-3)
+
+
+@pytest.mark.asyncio
+async def test_solar_radiation_is_horizontal_and_uniform_per_parcel(monkeypatch):
+    from app import cog_generator as cg
+
+    assert not hasattr(cg, "correct_solar_radiation")
+    cols = 24
+    # Slope and aspect vary wildly across the tile: the public layer must ignore them.
+    monkeypatch.setattr(cg, "slope_degrees", lambda e, px, *a, **k: np.where(np.arange(cols) % 2 == 0, 0.0, 25.0)[None, :].repeat(10, 0))
+    monkeypatch.setattr(cg, "aspect_degrees", lambda e, px, *a, **k: np.where(np.arange(cols) % 3 == 0, 0.0, 180.0)[None, :].repeat(10, 0))
+    a = _daily(rs_mj=22.0)
+    b = _daily(rs_mj=10.0)
+    arr = _read(await _daily_tile(
+        cg, monkeypatch, "solar_radiation", {PARCEL_A["id"]: a, PARCEL_B["id"]: b},
+    ))
+    in_a, in_b = arr[:, 0:5], arr[:, 19:24]
+    assert np.allclose(in_a, 22.0e6 / 86400.0, atol=1e-3)  # MJ m-2 d-1 -> W m-2
+    assert np.allclose(in_b, 10.0e6 / 86400.0, atol=1e-3)
+    assert np.all(np.isnan(arr[:, 8:16]))  # outside every parcel
+
+
+@pytest.mark.asyncio
+async def test_solar_radiation_parcel_without_radiation_is_skipped_not_filled(monkeypatch, caplog):
+    from app import cog_generator as cg
+
+    d = {k: v for k, v in _daily().items() if k != "rs_mj"}
+    with caplog.at_level(logging.ERROR):
+        cog = await _daily_tile(
+            cg, monkeypatch, "solar_radiation", {PARCEL_A["id"]: d}, parcels=[PARCEL_A],
+        )
+    assert cog is None
+    assert "rs_mj" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_slope_and_aspect_get_grid_latitude_and_row_height(monkeypatch):
+    from app import cog_generator as cg
+
+    seen: dict = {}
+    real_slope, real_aspect = cg.slope_degrees, cg.aspect_degrees
+
+    def _slope(elev, px, latitude_deg=None, pixel_height_deg=None):
+        seen["slope"] = (px, latitude_deg, pixel_height_deg)
+        return real_slope(elev, px, latitude_deg, pixel_height_deg)
+
+    def _aspect(elev, px, latitude_deg=None, pixel_height_deg=None):
+        seen["aspect"] = (px, latitude_deg, pixel_height_deg)
+        return real_aspect(elev, px, latitude_deg, pixel_height_deg)
+
+    monkeypatch.setattr(cg, "slope_degrees", _slope)
+    monkeypatch.setattr(cg, "aspect_degrees", _aspect)
+    await _daily_tile(cg, monkeypatch, "eto", {PARCEL_A["id"]: _daily()}, parcels=[PARCEL_A])
+    centre = ORIGIN_LAT + PX * 10 / 2  # 10 rows of PX, south edge at ORIGIN_LAT
+    for key in ("slope", "aspect"):
+        px, lat, h = seen[key]
+        assert px == pytest.approx(PX)
+        assert lat == pytest.approx(centre)
+        assert h == pytest.approx(PX)
+
+
+class TestFrostRiskRetiredInJob:
+    @pytest.mark.asyncio
+    async def test_no_frost_raster_is_generated_and_pointer_is_cleared(self, monkeypatch):
+        from app import cog_generator as cg
+
+        seen: list = []
+
+        async def _fake_tile(tenant_id, metric, *a, **kw):
+            seen.append(metric)
+            return b"cog"
+
+        monkeypatch.setattr(cg, "generate_cog_for_tile", _fake_tile)
+        monkeypatch.setattr(cg, "upload_cog", lambda *a, **kw: True)
+        monkeypatch.setattr(cg, "set_latest_date", lambda *a, **kw: True)
+        cleared: list = []
+        monkeypatch.setattr(cg, "clear_latest_pointer", lambda t, m: cleared.append((t, m)))
+        monkeypatch.setattr(cg.settings, "metrics", ["temperature_avg", "frost_risk"])
+
+        await cg._generate_and_upload_cogs(
+            "tenant-a", [PARCEL], "2026-09-01", "2026-09-02", 14, "2026-09-02",
+        )
+        assert seen and set(seen) == {"temperature_avg"}
+        assert cleared == [("tenant-a", "frost_risk")]
+
+    def test_downscaler_and_palette_no_longer_know_frost_risk(self):
+        from app import color_scales, downscaler
+        assert not hasattr(downscaler, "compute_frost_risk")
+        assert "frost_risk" not in color_scales.PALETTES

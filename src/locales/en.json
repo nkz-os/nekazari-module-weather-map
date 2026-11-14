@@ -7,7 +7,6 @@
     "solar_radiation": "Solar Radiation",
     "eto": "Reference ET",
     "water_balance": "Water Balance",
-    "frost_risk": "Frost Risk",
     "soil_moisture": "Soil Moisture"
   },
   "controls": {

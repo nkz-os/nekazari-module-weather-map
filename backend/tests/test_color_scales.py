@@ -10,14 +10,17 @@ from app.color_scales import (
     _get_stops,
 )
 from app.config import settings
+from app.stats import UNAVAILABLE_METRICS
 
 
 class TestPalettes:
     """Validation of PALETTES dict structure."""
 
     def test_all_metrics_have_palettes(self):
-        """Every metric in settings.metrics must have a palette."""
+        """Every published metric in settings.metrics must have a palette."""
         for metric in settings.metrics:
+            if metric in UNAVAILABLE_METRICS:
+                continue
             assert metric in PALETTES, f"Missing palette for metric: {metric}"
 
     def test_palette_stops_ascending(self):

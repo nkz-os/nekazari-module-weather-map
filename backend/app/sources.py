@@ -986,6 +986,7 @@ _LOOKUP_OK_KEY = "_sensor_lookup_ok"
 
 # Attributes (local names) whose COG lookup succeeded for this zone this run.
 COG_CHECKED_KEY = "_cog_checked"
+# nkz:frostRisk is retired: never written, kept here only so stale values are cleared.
 _COG_ATTRS = ("nkz:solarRadiationWm2", "nkz:frostRisk")
 _PRIVATE_KEYS = (_LOOKUP_OK_KEY, COG_CHECKED_KEY)
 _ZONE_LIST_LIMIT = 1000

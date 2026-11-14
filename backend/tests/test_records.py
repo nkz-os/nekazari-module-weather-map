@@ -2,7 +2,7 @@ from app.records import build_agri_parcel_record, build_agri_parcel_zone
 
 METRICS = {
     "solar_radiation": 21.5, "soil_moisture": 0.31, "eto": 4.2,
-    "water_balance": -1.1, "frost_risk": 0.0, "temperature_avg": 18.3,
+    "water_balance": -1.1, "temperature_avg": 18.3,
 }
 
 
@@ -27,7 +27,7 @@ def test_all_historized_metrics_are_flat_scalars():
         metrics=METRICS, observed_at="2026-06-10T10:00:00Z",
     )
     for key in ("solarRadiation", "soilMoistureVwc", "eto", "waterBalance",
-                "frostRisk", "airTemperatureAvg"):
+                "airTemperatureAvg"):
         assert rec[key]["type"] == "Property"
         assert isinstance(rec[key]["value"], (int, float)), f"{key} must be scalar"
     assert "weatherStats" not in rec
@@ -154,7 +154,16 @@ def test_zone_metrics_filter_non_scalar():
     assert entity["eto"]["value"] == 4.2
 
 
-def test_zone_radiation_and_frost_attributes_and_omission():
+def test_retired_frost_risk_is_not_historized():
+    rec = build_agri_parcel_record(
+        tenant_id="t", parcel_id="urn:ngsi-ld:AgriParcel:p1",
+        geometry={"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]},
+        metrics={**METRICS, "frost_risk": 40.0}, observed_at="2026-06-10T10:00:00Z",
+    )
+    assert "frostRisk" not in rec
+
+
+def test_zone_radiation_attribute_and_omission():
     from app.records import build_agri_parcel_zone
 
     geom = {"type": "Polygon", "coordinates": [[[0, 0], [0, 1], [1, 1], [0, 0]]]}
@@ -162,6 +171,6 @@ def test_zone_radiation_and_frost_attributes_and_omission():
               zone={"id": "z1"}, geometry=geom, observed_at="2026-06-22T00:00:00Z")
     e = build_agri_parcel_zone(metrics={"solarRadiationWm2": 210.5, "frostRisk": 12.0}, **kw)
     assert e["nkz:solarRadiationWm2"]["value"] == 210.5
-    assert e["nkz:frostRisk"]["value"] == 12.0
-    e = build_agri_parcel_zone(metrics={"solarRadiationWm2": None, "frostRisk": None}, **kw)
-    assert "nkz:solarRadiationWm2" not in e and "nkz:frostRisk" not in e
+    assert "nkz:frostRisk" not in e  # retired
+    e = build_agri_parcel_zone(metrics={"solarRadiationWm2": None}, **kw)
+    assert "nkz:solarRadiationWm2" not in e

@@ -316,38 +316,6 @@ def compute_water_balance(
 
 
 # ---------------------------------------------------------------------------
-# 5. Frost risk (cold-air pooling model)
-# ---------------------------------------------------------------------------
-
-def compute_frost_risk(
-    t_min: np.ndarray,
-    elevation_m: np.ndarray,
-) -> np.ndarray:
-    """Frost risk based on minimum temperature and cold-air pooling.
-
-    Valleys (low relative elevation) experience enhanced cooling due to
-    cold‑air drainage / pooling.
-
-    Parameters
-    ----------
-    t_min : np.ndarray
-        Minimum daily air temperature (°C).
-    elevation_m : np.ndarray
-        Pixel elevation (m).
-
-    Returns
-    -------
-    np.ndarray
-        Frost risk (0–100 %), 0 = no risk, 100 = certain frost.
-    """
-    rel_elev = elevation_m - elevation_m.min()
-    pooling = np.exp(-rel_elev / 50.0) * 2.0
-    effective_t_min = t_min - pooling
-    risk = 100.0 / (1.0 + np.exp(0.5 * (effective_t_min - 1.0)))
-    return risk
-
-
-# ---------------------------------------------------------------------------
 # 6. Soil moisture (simple bucket model)
 # ---------------------------------------------------------------------------
 
