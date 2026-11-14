@@ -118,8 +118,7 @@ def test_steep_north_slope_has_two_beam_periods_in_summer_and_none_in_winter():
     """Paper Section 6: a vertical north-facing slope sees no beam in fall/winter and
     two separate beam periods per day in spring/summer (paper: doy 81-254 at 39.7/44 N)."""
     phi = math.radians(44.0)
-    g = math.radians(0.0)  # compass north -> paper gamma = 180 deg
-    g = math.radians(180.0)
+    g = math.radians(180.0)  # compass north -> paper gamma = 180 deg
     summer = sr.integration_periods(sr._declination(172), phi, math.pi / 2, g)
     winter = sr.integration_periods(sr._declination(355), phi, math.pi / 2, g)
     assert len(summer) == 2
