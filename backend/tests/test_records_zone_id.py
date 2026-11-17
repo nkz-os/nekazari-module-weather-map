@@ -59,7 +59,7 @@ def test_zone_content_attributes():
         zone={"id": "z1", "pixelCount": 250}, geometry=_GEOM, metrics={},
         observed_at="2026-06-22T00:00:00Z", zone_rank=3,
     )
-    assert e["nkz:zoneType"]["value"] == "management"
+    assert e["nkz:zoneType"]["value"] == "terrain"
     assert e["nkz:zoneVersion"]["value"] == zone_version(_GEOM)
     assert e["nkz:zoneRank"]["value"] == 3
     assert e["nkz:areaHa"]["value"] == 2.5
