@@ -227,7 +227,7 @@ def build_agri_parcel_zone(
             "value": {"@type": "DateTime", "@value": observed_at},
         },
         "nkz:zoneId": {"type": "Property", "value": zone_id},
-        "nkz:zoneType": {"type": "Property", "value": "management"},
+        "nkz:zoneType": {"type": "Property", "value": "terrain"},
         "nkz:zoneVersion": {"type": "Property", "value": zone_version(geometry)},
         "nkz:centroid": {"type": "Property", "value": centroid},
         "nkz:elevationMean": {"type": "Property", "value": zone.get("elevationMean", 0.0)},
